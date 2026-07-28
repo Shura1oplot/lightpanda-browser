@@ -96,11 +96,14 @@ pub fn saveToFile(jar: *Cookie.Jar, path: []const u8) void {
 fn _saveToFile(jar: *Cookie.Jar, path: []const u8) !void {
     jar.removeExpired(null);
 
-    const file = try std.Io.Dir.cwd().createFile(lp.io, path, .{});
-    defer file.close(lp.io);
+    var atomic_file = try std.Io.Dir.cwd().createFileAtomic(lp.io, path, .{
+        .permissions = .fromMode(0o600),
+        .replace = true,
+    });
+    defer atomic_file.deinit(lp.io);
 
     var buf: [8192]u8 = undefined;
-    var writer = file.writer(lp.io, &buf);
+    var writer = atomic_file.file.writer(lp.io, &buf);
     const w = &writer.interface;
 
     try w.writeByte('[');
@@ -127,6 +130,8 @@ fn _saveToFile(jar: *Cookie.Jar, path: []const u8) !void {
     }
     try w.writeAll("]\n");
     try writer.end();
+    try atomic_file.file.sync(lp.io);
+    try atomic_file.replace(lp.io);
 
     log.info(.app, "Cookie.saveToFile", .{ .path = path, .count = jar.cookies.items.len });
 }
@@ -162,4 +167,87 @@ test "cookies: load JSON accepts CDP SameSite casing" {
     );
 
     try std.testing.expectEqual(Cookie.SameSite.lax, parseJsonSameSite(parsed[0].sameSite));
+}
+
+test "cookies: save atomically replaces file with private permissions" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cookies.json",
+        .data = "old contents",
+    });
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const cookie_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "cookies.json" });
+    defer std.testing.allocator.free(cookie_path);
+
+    var jar = Cookie.Jar.init(std.testing.allocator, null);
+    defer jar.deinit();
+    try _saveToFile(&jar, cookie_path);
+
+    const saved = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "cookies.json",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(saved);
+    try std.testing.expectEqualStrings("[]\n", saved);
+
+    const stat = try tmp.dir.statFile(std.testing.io, "cookies.json", .{});
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o600),
+        stat.permissions.toMode() & 0o777,
+    );
+
+    var entries = tmp.dir.iterate();
+    var count: usize = 0;
+    while (try entries.next(std.testing.io)) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("cookies.json", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "cookies: save removes temporary file when replacement fails" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(std.testing.io, "cookies.json", .default_dir);
+    var target_dir = try tmp.dir.openDir(std.testing.io, "cookies.json", .{});
+    defer target_dir.close(std.testing.io);
+    try target_dir.writeFile(std.testing.io, .{
+        .sub_path = "sentinel",
+        .data = "preserved",
+    });
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const cookie_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "cookies.json" });
+    defer std.testing.allocator.free(cookie_path);
+
+    var jar = Cookie.Jar.init(std.testing.allocator, null);
+    defer jar.deinit();
+    if (_saveToFile(&jar, cookie_path)) {
+        return error.TestExpectedError;
+    } else |_| {}
+
+    const sentinel = try target_dir.readFileAlloc(
+        std.testing.io,
+        "sentinel",
+        std.testing.allocator,
+        .limited(1024),
+    );
+    defer std.testing.allocator.free(sentinel);
+    try std.testing.expectEqualStrings("preserved", sentinel);
+
+    var entries = tmp.dir.iterate();
+    var count: usize = 0;
+    while (try entries.next(std.testing.io)) |entry| {
+        count += 1;
+        try std.testing.expectEqualStrings("cookies.json", entry.name);
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
