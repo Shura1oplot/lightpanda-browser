@@ -644,7 +644,7 @@ pub fn cookieFile(self: *const Config) ?[]const u8 {
 
 pub fn cookieJarFile(self: *const Config) ?[]const u8 {
     return switch (self.mode) {
-        inline .fetch, .mcp, .agent => |opts| opts.cookie_jar,
+        inline .serve, .fetch, .mcp, .agent => |opts| opts.cookie_jar,
         else => null,
     };
 }
@@ -790,7 +790,19 @@ pub const WaitUntil = enum {
 /// Pre-formatted HTTP headers for reuse across Http and Client.
 /// Must be initialized with an allocator that outlives all HTTP connections.
 pub const HttpHeaders = struct {
-    const user_agent_base: [:0]const u8 = "Lightpanda/1.0";
+    pub const chrome_major_version: [:0]const u8 = "146";
+    pub const chrome_full_version: [:0]const u8 = "146.0.0.0";
+    pub const user_agent_base = chromeUserAgent(builtin.target.os.tag);
+
+    pub fn chromeUserAgent(comptime os_tag: std.Target.Os.Tag) [:0]const u8 {
+        return switch (os_tag) {
+            .macos => "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            .linux => "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            .windows => "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            .freebsd => "Mozilla/5.0 (X11; FreeBSD amd64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            else => "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        };
+    }
 
     const Brand = struct {
         brand: [:0]const u8,
@@ -801,7 +813,15 @@ pub const HttpHeaders = struct {
     /// HTTP header and navigator.userAgentData.brands derive from this
     /// list, so the two sides cannot drift.
     pub const brands = [_]Brand{
-        .{ .brand = "Lightpanda", .version = "1" },
+        .{ .brand = "Chromium", .version = chrome_major_version },
+        .{ .brand = "Not-A.Brand", .version = "24" },
+        .{ .brand = "Google Chrome", .version = chrome_major_version },
+    };
+
+    pub const full_version_brands = [_]Brand{
+        .{ .brand = "Chromium", .version = chrome_full_version },
+        .{ .brand = "Not-A.Brand", .version = "24.0.0.0" },
+        .{ .brand = "Google Chrome", .version = chrome_full_version },
     };
 
     pub const sec_ch_ua: [:0]const u8 = blk: {
@@ -995,6 +1015,58 @@ test "Config: blockedUrlPatterns splits comma-separated patterns" {
     try std.testing.expectEqualStrings("*doubleclick*", patterns.next().?);
     try std.testing.expectEqualStrings("*://*/*.png", patterns.next().?);
     try std.testing.expectEqual(null, patterns.next());
+}
+
+test "Config: Chrome 146 client identity" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{} });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        HttpHeaders.user_agent_base,
+        config.http_headers.user_agent,
+    );
+    const expected_header = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "User-Agent: {s}",
+        .{HttpHeaders.user_agent_base},
+    );
+    defer std.testing.allocator.free(expected_header);
+    try std.testing.expectEqualStrings(
+        expected_header,
+        config.http_headers.user_agent_header,
+    );
+    try std.testing.expectEqualStrings(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        HttpHeaders.chromeUserAgent(.macos),
+    );
+    try std.testing.expectEqualStrings(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        HttpHeaders.chromeUserAgent(.linux),
+    );
+    try std.testing.expectEqualStrings(
+        "Sec-Ch-Ua: \"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
+        HttpHeaders.sec_ch_ua,
+    );
+
+    const expected_brands = [_]HttpHeaders.Brand{
+        .{ .brand = "Chromium", .version = "146" },
+        .{ .brand = "Not-A.Brand", .version = "24" },
+        .{ .brand = "Google Chrome", .version = "146" },
+    };
+    try std.testing.expectEqual(3, HttpHeaders.brands.len);
+    for (HttpHeaders.brands, 0..) |brand, i| {
+        try std.testing.expectEqualStrings(expected_brands[i].brand, brand.brand);
+        try std.testing.expectEqualStrings(expected_brands[i].version, brand.version);
+    }
+}
+
+test "Config: serve exposes cookie jar file" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .cookie_jar = "cookies.json",
+    } });
+    defer config.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("cookies.json", config.cookieJarFile().?);
 }
 
 pub fn validateUserAgent(ua: []const u8) !void {

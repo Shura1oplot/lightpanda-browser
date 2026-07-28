@@ -687,6 +687,10 @@ pub const BrowserContext = struct {
 
         self.notification.unregisterAll(self);
 
+        if (self.cdp.app.config.cookieJarFile()) |cookie_jar_path| {
+            lp.cookies.saveToFile(&self.session.cookie_jar, cookie_jar_path);
+        }
+
         // If the session has a frame, we need to clear it first. The page
         // context is always nested inside of the isolated world context,
         // so we need to shutdown the page one first.

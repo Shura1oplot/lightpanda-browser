@@ -575,6 +575,67 @@ test "cdp.target: disposeBrowserContext" {
     }
 }
 
+test "cdp.target: disposeBrowserContext persists serve cookies" {
+    const base_testing = @import("../../testing.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+
+    const cookie_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "cookies.json" });
+    defer testing.allocator.free(cookie_path);
+
+    var config = try lp.Config.init(testing.allocator, "test", .{ .serve = .{
+        .cookie_jar = cookie_path,
+    } });
+    defer config.deinit(testing.allocator);
+
+    const original_config = base_testing.test_app.config;
+    base_testing.test_app.config = &config;
+    defer base_testing.test_app.config = original_config;
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-PERSIST" });
+    try ctx.processMessage(.{
+        .id = 10,
+        .method = "Network.setCookie",
+        .params = .{
+            .name = "sid",
+            .value = "persisted",
+            .url = "https://example.com/",
+        },
+    });
+    try ctx.expectSentResult(.{ .success = true }, .{ .id = 10 });
+
+    try ctx.processMessage(.{
+        .id = 11,
+        .method = "Target.disposeBrowserContext",
+        .params = .{ .browserContextId = "BID-PERSIST" },
+    });
+    try ctx.expectSentResult(null, .{ .id = 11 });
+
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        cookie_path,
+        testing.allocator,
+        .limited(4096),
+    );
+    defer testing.allocator.free(content);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, content, .{});
+    defer parsed.deinit();
+
+    try testing.expect(parsed.value == .array);
+    try testing.expectEqual(1, parsed.value.array.items.len);
+    const persisted = parsed.value.array.items[0].object;
+    try testing.expectEqual("sid", persisted.get("name").?.string);
+    try testing.expectEqual("persisted", persisted.get("value").?.string);
+}
+
 // Issue #2472: CDP target IDs (`FID-{d:0>10}`) must stay unique for the
 // lifetime of a CDP connection. Before the fix, `Session.frame_id_gen`
 // reset to 0 on `tearDownActivePage` AND fresh sessions also started

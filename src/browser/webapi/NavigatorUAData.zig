@@ -70,8 +70,8 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
         .bitness = uaBitness(),
         .model = "",
         .platformVersion = "",
-        .uaFullVersion = "1.0.0.0",
-        .fullVersionList = brandList(),
+        .uaFullVersion = Config.HttpHeaders.chrome_full_version,
+        .fullVersionList = fullVersionList(),
         .wow64 = false,
         .formFactor = [_][]const u8{"Desktop"},
     });
@@ -80,6 +80,19 @@ pub fn getHighEntropyValues(_: *const NavigatorUAData, hints: []const []const u8
 fn brandList() []const Brand {
     const out = comptime blk: {
         const src = &Config.HttpHeaders.brands;
+        var arr: [src.len]Brand = undefined;
+        for (src, 0..) |b, i| {
+            arr[i] = .{ .brand = b.brand, .version = b.version };
+        }
+        const final = arr;
+        break :blk final;
+    };
+    return &out;
+}
+
+fn fullVersionList() []const Brand {
+    const out = comptime blk: {
+        const src = &Config.HttpHeaders.full_version_brands;
         var arr: [src.len]Brand = undefined;
         for (src, 0..) |b, i| {
             arr[i] = .{ .brand = b.brand, .version = b.version };
