@@ -8,7 +8,9 @@
 
 2. Целевая среда для `linux/amd64` – Ubuntu 24.04 на сервере с нативной архитектурой `x86_64`.
 
-3. Интеграция после слияния с исходными репозиториями проверена на macOS arm64. Приведенный ниже путь Linux основан на ранее успешной нативной сборке проекта и действующем рецепте Linux из системы непрерывной интеграции curl-impersonate. После каждого изменения исходников его нужно заново выполнить на нативном сервере. Не называйте Linux-сборку проверенной, пока все критерии раздела 10 не выполнены в текущем запуске.
+3. Программное применение профиля Chrome 146 после слияния с исходными репозиториями проверено только на macOS arm64. Приведенный ниже путь Linux основан на ранее успешной нативной сборке проекта и действующем рецепте Linux из системы непрерывной интеграции curl-impersonate. Текущая интеграция на Linux еще не проверена. После каждого изменения исходников путь нужно заново выполнить на нативном сервере. Не называйте Linux-сборку проверенной, пока все критерии раздела 10 не выполнены в текущем запуске.
+
+4. Профиль `chrome146` в curl-impersonate содержит заголовки macOS. На Linux Lightpanda заменяет `User-Agent` и `Sec-Ch-Ua`, но сохраняет `Sec-Ch-Ua-Platform: "macOS"` из профиля. До отдельной адаптации набор заголовков Linux может оставаться смешанным. Учитывайте это ограничение при оценке сетевого отпечатка.
 
 ## 2. Почему нельзя собирать `linux/amd64` на компьютере Apple Silicon
 
@@ -16,7 +18,7 @@
 
 2. Ошибка воспроизводилась в отдельных процессах Zig `translate-c` при обработке Curl, SQLite и Isocline. Отдельный сборщик BuildKit не устранил проблему.
 
-3. Не используйте Rosetta, QEMU и другую эмуляцию процессора. Для `linux/amd64` команда `uname -m` на сервере должна вернуть `x86_64`. Для `linux/arm64` она должна вернуть `aarch64`; наличие подходящих серверов Timeweb нужно проверять отдельно.
+3. Не выполняйте сборку `linux/amd64` на Apple Silicon через Docker, OrbStack, Rosetta, QEMU или другую эмуляцию процессора. Используйте нативный сервер Timeweb с архитектурой `x86_64`; команда `uname -m` должна вернуть `x86_64`. Для `linux/arm64` она должна вернуть `aarch64`; наличие подходящих серверов Timeweb нужно проверять отдельно.
 
 ## 3. Обязательные ограничения
 
@@ -235,6 +237,7 @@
    cmake_args="-G Ninja -DCMAKE_INSTALL_PREFIX=$install_dir \
    -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
    -DCURL_IMPERSONATE_CXX_RUNTIME_LIBRARY=c++ \
+   -DCURL_IMPERSONATE_ENV_HOOK=OFF \
    -DCURL_CA_PATH=/etc/ssl/certs \
    -DCURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 
@@ -359,10 +362,26 @@
    sha256sum "$lightpanda"
    ```
 
-2. Проверьте реальный сетевой запрос профилем Chrome 146. Команда должна завершиться с кодом 0, поле `http_status` должно быть равно 200, а содержимое страницы должно включать `Example Domain`:
+2. Сначала докажите, что библиотека игнорирует встроенный обработчик переменных среды. Заведомо неверный профиль не должен мешать `curl_easy_init`; обе команды должны завершиться с кодом 0 без сетевого запроса:
 
    ```bash
-   CURL_IMPERSONATE=chrome146 "$lightpanda" fetch \
+   CURL_IMPERSONATE=lightpanda-invalid-profile \
+   CURL_IMPERSONATE_HEADERS=no \
+     "$install_dir/bin/curl-impersonate" \
+     --silent --show-error --output /dev/null file:///dev/null
+
+   CURL_IMPERSONATE=lightpanda-invalid-profile \
+   CURL_IMPERSONATE_HEADERS=no \
+     "$install_dir/bin/curl-impersonate" \
+     --impersonate chrome146 \
+     --silent --show-error --output /dev/null file:///dev/null
+   ```
+
+3. Проверьте реальный сетевой запрос без переменных среды curl-impersonate. Lightpanda программно применяет профиль Chrome 146 с заголовками браузера после каждого `curl_easy_reset`. Ошибка `curl_easy_impersonate` прекращает подготовку соединения. Обычные параметры libcurl после такой ошибки не применяются. Команда должна завершиться с кодом 0, поле `http_status` должно быть равно 200, а содержимое страницы должно включать `Example Domain`:
+
+   ```bash
+   env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
+     "$lightpanda" fetch \
      --json \
      --wait-until 'done' \
      --dump html \
@@ -372,25 +391,42 @@
      /tmp/lightpanda-example.json
    ```
 
-3. Если в проекте доступен одноразовый посторонний сертификат центра сертификации, повторите отрицательную проверку. Ожидается `PeerFailedVerification`; успешное соединение означает ошибку сборки или проверки.
+4. Обязательно проверьте отклонение недоверенного сертификата. Ожидаются поле `http_status` со значением 0 и ошибка `PeerFailedVerification`; HTTP 200 означает ошибку сборки или проверки:
+
+   ```bash
+   env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
+     "$lightpanda" fetch \
+     --json \
+     --wait-until 'done' \
+     --terminate-ms 15000 \
+     https://self-signed.badssl.com/ \
+     > /tmp/lightpanda-self-signed.json \
+     2> /tmp/lightpanda-self-signed.log
+   jq -e '.http_status == 0' /tmp/lightpanda-self-signed.json
+   grep -F 'PeerFailedVerification' /tmp/lightpanda-self-signed.log
+   ```
 
 ## 10. Критерии приемки
 
-1. Исходники соответствуют записанным полным SHA обоих репозиториев.
+01. Исходники соответствуют записанным полным SHA обоих репозиториев.
 
-2. Сервер возвращает `x86_64`, а итоговый файл является ELF64 для x86-64.
+02. Сервер возвращает `x86_64`, а итоговый файл является ELF64 для x86-64.
 
-3. Форматирование, `zig build check`, тесты, создание снимка V8 и сборка `ReleaseFast` завершились с кодом 0.
+03. Форматирование, `zig build check`, тесты, создание снимка V8 и сборка `ReleaseFast` завершились с кодом 0.
 
-4. В исполняемом файле присутствует `curl_easy_impersonate`, а `ldd` не показывает динамические `libcurl`, `libssl` и `libcrypto`.
+04. В исполняемом файле присутствует `curl_easy_impersonate`, а `ldd` не показывает динамические `libcurl`, `libssl` и `libcrypto`.
 
-5. Профиль Chrome 146 получил HTTP 200, а посторонний сертификат отклонен, если отрицательная проверка выполнялась.
+05. Неверное значение `CURL_IMPERSONATE` не влияет на инициализацию библиотеки, а явный профиль Chrome 146 продолжает применяться.
 
-6. Записаны версии Zig, Rust и Lightpanda, архитектура, размер и SHA-256 итогового файла и архива curl-impersonate.
+06. Профиль Chrome 146 без переменных `CURL_IMPERSONATE` и `CURL_IMPERSONATE_HEADERS` получил HTTP 200, а недоверенный сертификат отклонен с `PeerFailedVerification`.
 
-7. Полученный файл скопирован на macOS, и его SHA-256 совпал на сервере и локально.
+07. Записаны версии Zig, Rust и Lightpanda, архитектура, размер и SHA-256 итогового файла и архива curl-impersonate.
 
-8. Сервер и публичный адрес удалены и отсутствуют в повторных списках Timeweb.
+08. Полученный файл скопирован на macOS, и его SHA-256 совпал на сервере и локально.
+
+09. Сборка curl-impersonate выполнена с `CURL_IMPERSONATE_ENV_HOOK=OFF`.
+
+10. Сервер и публичный адрес удалены и отсутствуют в повторных списках Timeweb.
 
 ## 11. Получение файла и обязательное удаление сервера
 

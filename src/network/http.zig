@@ -29,6 +29,7 @@ const IpFilter = @import("IpFilter.zig");
 const log = @import("lightpanda").log;
 
 pub const ENABLE_DEBUG = false;
+const IMPERSONATION_TARGET: [:0]const u8 = "chrome" ++ Config.HttpHeaders.chrome_major_version;
 
 pub const WaitFd = libcurl.CurlWaitFd;
 pub const readfunc_pause = libcurl.curl_readfunc_pause;
@@ -499,6 +500,7 @@ pub const Connection = struct {
         ip_filter: ?*const IpFilter,
     ) !void {
         libcurl.curl_easy_reset(self._easy);
+        try libcurl.curl_easy_impersonate(self._easy, IMPERSONATION_TARGET, true);
         self.transport = .none;
 
         // timeouts
@@ -952,6 +954,26 @@ fn makeSockAddrV4(ip: [4]u8) libcurl.CurlSockAddr {
 }
 
 const testing = @import("../testing.zig");
+
+extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, override: c_int) c_int;
+extern fn unsetenv(name: [*:0]const u8) c_int;
+
+test "curl impersonation ignores environment and applies configured target" {
+    try testing.expect(setenv("CURL_IMPERSONATE", "lightpanda-invalid-profile", 1) == 0);
+    defer _ = unsetenv("CURL_IMPERSONATE");
+    try testing.expect(setenv("CURL_IMPERSONATE_HEADERS", "no", 1) == 0);
+    defer _ = unsetenv("CURL_IMPERSONATE_HEADERS");
+
+    const easy = libcurl.curl_easy_init() orelse return error.FailedToInitializeEasy;
+    defer libcurl.curl_easy_cleanup(easy);
+
+    libcurl.curl_easy_reset(easy);
+    try libcurl.curl_easy_impersonate(easy, IMPERSONATION_TARGET, true);
+    try testing.expectError(
+        error.BadFunctionArgument,
+        libcurl.curl_easy_impersonate(easy, "lightpanda-unknown-profile", true),
+    );
+}
 
 test "isBadPort" {
     for ([_]u16{ 1, 22, 25, 143, 6697, 10080 }) |port| {
