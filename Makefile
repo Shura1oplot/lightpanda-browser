@@ -40,6 +40,11 @@ else
 	$(error "Unhandled kernel: $(kernel)")
 endif
 
+ifeq ($(OS),macos)
+	MACOS_SDK_PATH ?= $(shell xcrun --sdk macosx --show-sdk-path)
+	MACOS_SDK_FLAGS = -Dmacos_sdk_path=$(MACOS_SDK_PATH)
+endif
+
 
 # Prebuilt V8
 # -----------
@@ -63,7 +68,7 @@ V8_CACHE   := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/$(V8_ARCHIVE)
 # release version. Override PREBUILT_V8_PATH to select a different archive.
 PREBUILT_V8_PATH ?= $(wildcard $(V8_CACHE))
 V8_FLAGS = $(if $(PREBUILT_V8_PATH),-Dprebuilt_v8_path=$(PREBUILT_V8_PATH),)
-BUILD_FLAGS = $(V8_FLAGS) $(ZIGFLAGS) $(CURL_IMPERSONATE_FLAGS)
+BUILD_FLAGS = $(V8_FLAGS) $(ZIGFLAGS) $(CURL_IMPERSONATE_FLAGS) $(MACOS_SDK_FLAGS)
 
 
 # Infos

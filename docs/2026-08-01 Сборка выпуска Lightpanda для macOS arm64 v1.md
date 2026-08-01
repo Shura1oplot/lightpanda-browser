@@ -36,7 +36,10 @@ test "$(uname -s)" = Darwin
 test "$(uname -m)" = arm64
 test "$(zig version)" = 0.16.0
 test "$(cmake --version | awk 'NR == 1 { print $3 }')" = 4.4.2
-command -v cargo cmake cmp jq make ninja nm otool shasum >/dev/null
+command -v cargo cmake cmp jq make ninja nm otool shasum xcrun >/dev/null
+macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+test -d "$macos_sdk_path/System/Library/Frameworks"
+test -d "$macos_sdk_path/usr/lib"
 
 rg -F 'curl_impersonate_archive' "$lightpanda_root/build.zig"
 rg -F 'curl_easy_impersonate(self._easy, IMPERSONATION_TARGET, true)' \
@@ -148,6 +151,7 @@ test -f "$v8_archive"
 
 build_flags=(
   -Dtarget=aarch64-macos.12.0
+  "-Dmacos_sdk_path=$macos_sdk_path"
   "-Dprebuilt_v8_path=$v8_archive"
   "-Dcurl_impersonate_archive=$curl_archive"
   "-Dcurl_impersonate_include=$curl_include"

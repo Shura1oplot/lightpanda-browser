@@ -44,6 +44,7 @@ pub fn build(b: *Build) !void {
         return error.CurlImpersonateArchiveRequired;
     const curl_impersonate_include = b.option([]const u8, "curl_impersonate_include", "Path to the curl-impersonate include directory") orelse
         return error.CurlImpersonateIncludeRequired;
+    const macos_sdk_path = b.option([]const u8, "macos_sdk_path", "Path to the macOS SDK");
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
 
@@ -88,7 +89,7 @@ pub fn build(b: *Build) !void {
         b.default_step.dependOn(fmt_step);
 
         try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path);
-        try linkCurl(b, mod, curl_impersonate_archive, curl_impersonate_include);
+        try linkCurl(b, mod, curl_impersonate_archive, curl_impersonate_include, macos_sdk_path);
         try linkHtml5Ever(b, mod);
         linkZenai(b, mod);
         linkIsocline(b, mod);
@@ -343,6 +344,7 @@ fn linkCurl(
     mod: *Build.Module,
     curl_impersonate_archive: []const u8,
     curl_impersonate_include: []const u8,
+    macos_sdk_path: ?[]const u8,
 ) !void {
     const target = mod.resolved_target.?;
 
@@ -359,7 +361,14 @@ fn linkCurl(
     switch (target.result.os.tag) {
         .macos => {
             // needed for proxying on mac
-            mod.addSystemFrameworkPath(.{ .cwd_relative = "/System/Library/Frameworks" });
+            const framework_path = if (macos_sdk_path) |sdk_path|
+                b.pathJoin(&.{ sdk_path, "System/Library/Frameworks" })
+            else
+                "/System/Library/Frameworks";
+            mod.addSystemFrameworkPath(.{ .cwd_relative = framework_path });
+            if (macos_sdk_path) |sdk_path| {
+                mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr/lib" }) });
+            }
             mod.linkFramework("CoreFoundation", .{});
             mod.linkFramework("CoreServices", .{});
             mod.linkFramework("SystemConfiguration", .{});
