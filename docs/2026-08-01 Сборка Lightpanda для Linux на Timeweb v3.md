@@ -230,6 +230,14 @@ ssh_options=(
   -o StrictHostKeyChecking=yes
 )
 
+scp_options=(
+  -i "$HOME/.ssh/id_ed25519"
+  -o IdentitiesOnly=yes
+  -P "$ssh_port"
+  -o "UserKnownHostsFile=$known_hosts_file"
+  -o StrictHostKeyChecking=yes
+)
+
 ssh "${ssh_options[@]}" "root@$server_ip" 'test "$(uname -m)" = x86_64; . /etc/os-release; test "$VERSION_ID" = 24.04'
 ```
 
@@ -441,7 +449,7 @@ remote_sha="$(
   ssh "${ssh_options[@]}" "root@$server_ip" 'sha256sum /opt/src/lightpanda/zig-out/bin/lightpanda' |
     awk '{print $1}'
 )"
-scp "${ssh_options[@]}" "root@$server_ip:/opt/src/lightpanda/zig-out/bin/lightpanda" "$local_partial"
+scp "${scp_options[@]}" "root@$server_ip:/opt/src/lightpanda/zig-out/bin/lightpanda" "$local_partial"
 
 local_sha="$(shasum -a 256 "$local_partial" | awk '{print $1}')"
 test "$remote_sha" = "$local_sha"
