@@ -6,10 +6,18 @@ BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
 
-# Extra flags forwarded to every `$(ZIG) build` invocation. Most commonly used
-# to point at a prebuilt V8 archive and skip the multi-minute source rebuild:
-#   ZIGFLAGS=-Dprebuilt_v8_path=/path/to/libc_v8.a make test
+# Extra flags forwarded to every `$(ZIG) build` invocation.
 ZIGFLAGS ?=
+
+# Lightpanda uses curl-impersonate instead of the system libcurl. The default
+# expects the consolidated repository layout, while callers can point at any
+# compatible installation prefix or override the archive and include paths.
+CURL_IMPERSONATE_PREFIX ?= ../curl-impersonate/build/install
+CURL_IMPERSONATE_ARCHIVE ?= $(CURL_IMPERSONATE_PREFIX)/lib/libcurl-impersonate-complete.a
+CURL_IMPERSONATE_INCLUDE ?= $(CURL_IMPERSONATE_PREFIX)/include
+CURL_IMPERSONATE_FLAGS := \
+	-Dcurl_impersonate_archive=$(CURL_IMPERSONATE_ARCHIVE) \
+	-Dcurl_impersonate_include=$(CURL_IMPERSONATE_INCLUDE)
 
 # OS and ARCH
 kernel = $(shell uname -ms)
@@ -51,13 +59,11 @@ ZIG_V8_TAG := $(shell awk -F\' '/^  zig-v8:/{f=1} f&&/default:/{print $$2; exit}
 V8_ARCHIVE := libc_v8_$(V8_VERSION)_$(OS)_$(ARCH).a
 V8_CACHE   := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/$(V8_ARCHIVE)
 
-# If the prebuilt archive is in place and the caller hasn't set ZIGFLAGS, point
-# the build at it rather than building V8 from source.
-ifeq ($(strip $(ZIGFLAGS)),)
-  ifneq ($(wildcard $(V8_CACHE)),)
-    ZIGFLAGS := -Dprebuilt_v8_path=$(V8_CACHE)
-  endif
-endif
+# Use the cached archive even when callers pass unrelated ZIGFLAGS such as a
+# release version. Override PREBUILT_V8_PATH to select a different archive.
+PREBUILT_V8_PATH ?= $(wildcard $(V8_CACHE))
+V8_FLAGS = $(if $(PREBUILT_V8_PATH),-Dprebuilt_v8_path=$(PREBUILT_V8_PATH),)
+BUILD_FLAGS = $(V8_FLAGS) $(ZIGFLAGS) $(CURL_IMPERSONATE_FLAGS)
 
 
 # Infos
@@ -79,7 +85,11 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-v8-snapshot build-dev download-v8 run run-release test bench data end2end clean
+.PHONY: build build-v8-snapshot build-dev check-curl-impersonate download-v8 run run-release test bench data end2end clean
+
+check-curl-impersonate:
+	@test -f "$(CURL_IMPERSONATE_ARCHIVE)" || (printf "\033[33mMissing curl-impersonate archive: %s\033[0m\n" "$(CURL_IMPERSONATE_ARCHIVE)"; exit 1)
+	@test -f "$(CURL_IMPERSONATE_INCLUDE)/curl/curl.h" || (printf "\033[33mMissing curl-impersonate headers: %s\033[0m\n" "$(CURL_IMPERSONATE_INCLUDE)"; exit 1)
 
 ## Download the prebuilt V8 archive (skips the 10+ min source build)
 download-v8:
@@ -92,21 +102,21 @@ download-v8:
 	@printf "\033[33mV8 ready: %s\033[0m\n" "$(V8_CACHE)"
 
 ## Build v8 snapshot
-build-v8-snapshot:
+build-v8-snapshot: check-curl-impersonate
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	@$(ZIG) build $(ZIGFLAGS) -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
 build: build-v8-snapshot
 	@printf "\033[36mBuilding (release fast)...\033[0m\n"
-	@$(ZIG) build $(ZIGFLAGS) -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
-build-dev:
+build-dev: check-curl-impersonate
 	@printf "\033[36mBuilding (debug)...\033[0m\n"
-	@$(ZIG) build $(ZIGFLAGS) || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build $(BUILD_FLAGS) || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Run the server in release mode
@@ -119,8 +129,8 @@ run-debug: build-dev
 	@printf "\033[36mRunning...\033[0m\n"
 	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
 
-test:
-	TEST_FILTER="${F}" $(ZIG) build $(ZIGFLAGS) test -freference-trace
+test: check-curl-impersonate
+	TEST_FILTER="${F}" $(ZIG) build $(BUILD_FLAGS) test -freference-trace
 
 ## Run demo/runner end to end tests
 end2end:
