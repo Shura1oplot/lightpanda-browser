@@ -17,19 +17,18 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
-const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
 const Frame = @import("../Frame.zig");
 
 const Node = @import("Node.zig");
+const DOMRect = @import("DOMRect.zig");
 const DocumentFragment = @import("DocumentFragment.zig");
 const AbstractRange = @import("AbstractRange.zig");
-const DOMRect = @import("DOMRect.zig");
-
-const String = lp.String;
 
 const Range = @This();
+
+pub const Proto = AbstractRange;
 
 _proto: *AbstractRange,
 
@@ -42,7 +41,7 @@ pub fn init(frame: *Frame) !*Range {
 // frame's main document.
 pub fn initIn(container: *Node, frame: *Frame) !*Range {
     const arena = try frame.getArena(.medium, "Range");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
     const range = try frame._factory.abstractRange(arena, Range{ ._proto = undefined }, frame);
     range._proto._start_container = container;
     range._proto._end_container = container;
@@ -329,7 +328,7 @@ pub fn intersectsNode(self: *const Range, node: *Node) bool {
 
 pub fn cloneRange(self: *const Range, frame: *Frame) !*Range {
     const arena = try frame.getArena(.medium, "Range.clone");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
 
     const clone = try frame._factory.abstractRange(arena, Range{ ._proto = undefined }, frame);
     clone._proto._end_offset = self._proto._end_offset;

@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
+const lp = @import("lightpanda");
 
 const Page = @import("../../Page.zig");
 const Frame = @import("../../Frame.zig");
@@ -29,10 +29,10 @@ const GenericIterator = @import("iterator.zig").Entry;
 // No need to go through a TreeWalker or add any filtering.
 const ChildNodes = @This();
 
-_arena: std.mem.Allocator,
+_arena: *lp.Arena,
 _last_index: usize,
 _last_length: ?u32,
-_last_node: ?*std.DoublyLinkedList.Node,
+_last_node: ?*Node,
 _cached_version: usize,
 _node: *Node,
 
@@ -42,7 +42,7 @@ pub const EntryIterator = GenericIterator(Iterator, null);
 
 pub fn init(node: *Node, frame: *Frame) !*ChildNodes {
     const arena = try frame.getArena(.small, "ChildNodes");
-    errdefer frame.releaseArena(arena);
+    errdefer arena.release();
 
     const self = try arena.create(ChildNodes);
     self.* = .{
@@ -56,8 +56,8 @@ pub fn init(node: *Node, frame: *Frame) !*ChildNodes {
     return self;
 }
 
-pub fn deinit(self: *const ChildNodes, page: *Page) void {
-    page.releaseArena(self._arena);
+pub fn deinit(self: *const ChildNodes, _: *Page) void {
+    self._arena.release();
 }
 
 pub fn length(self: *ChildNodes, frame: *const Frame) !u32 {
@@ -66,10 +66,12 @@ pub fn length(self: *ChildNodes, frame: *const Frame) !u32 {
             return cached_length;
         }
     }
-    const children = self._node._children orelse return 0;
-
     // O(N)
-    const len: u32 = @intCast(children.len());
+    var len: u32 = 0;
+    var it = self._node.childrenIterator();
+    while (it.next()) |_| {
+        len += 1;
+    }
     self._last_length = len;
     return len;
 }
@@ -78,7 +80,7 @@ pub fn getAtIndex(self: *ChildNodes, index: usize, frame: *const Frame) !?*Node 
     _ = self.versionCheck(frame);
 
     var current = self._last_index;
-    var node: ?*std.DoublyLinkedList.Node = null;
+    var node: ?*Node = null;
     if (index < current or self._last_node == null) {
         current = 0;
         node = self.first() orelse return null;
@@ -90,17 +92,17 @@ pub fn getAtIndex(self: *ChildNodes, index: usize, frame: *const Frame) !?*Node 
     while (node) |n| {
         if (index == current) {
             self._last_node = n;
-            return Node.linkToNode(n);
+            return n;
         }
         current += 1;
-        node = n.next;
+        node = n.nextSibling();
     }
     self._last_node = null;
     return null;
 }
 
-pub fn first(self: *const ChildNodes) ?*std.DoublyLinkedList.Node {
-    return (self._node._children orelse return null).first;
+pub fn first(self: *const ChildNodes) ?*Node {
+    return self._node.firstChild();
 }
 
 pub fn keys(self: *ChildNodes, frame: *Frame) !*KeyIterator {

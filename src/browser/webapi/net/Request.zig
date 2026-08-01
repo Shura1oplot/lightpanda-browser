@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2025  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026 Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -26,13 +26,14 @@ const URL = @import("../URL.zig");
 const Page = @import("../../Page.zig");
 const Blob = @import("../Blob.zig");
 const AbortSignal = @import("../AbortSignal.zig");
+const ContentTypeIterator = @import("../../Mime.zig").ContentTypeIterator;
 
 const Headers = @import("Headers.zig");
+const FormData = @import("FormData.zig");
 const body_init = @import("body_init.zig");
 const BodyInit = body_init.BodyInit;
 
 const Execution = js.Execution;
-const Allocator = std.mem.Allocator;
 
 const Request = @This();
 
@@ -41,7 +42,7 @@ _url: [:0]const u8,
 _method: http.Method,
 _headers: ?*Headers,
 _body: ?[]const u8,
-_arena: Allocator,
+_arena: *lp.Arena,
 _cache: Cache,
 _credentials: Credentials,
 _redirect: Redirect,
@@ -91,11 +92,11 @@ const Cache = enum {
 };
 
 pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
-    const arena = try exec.getArena(.medium, "Request");
-    errdefer exec.releaseArena(arena);
+    const arena = try exec.getPinnedArena(.medium, "Request");
+    errdefer arena.release();
 
     const url = switch (input) {
-        .url => |u| try URL.resolve(arena, exec.base(), u, .{ .encoding = exec.charset.* }),
+        .url => |u| try URL.resolve(arena.allocator(), exec.base(), u, .{ .encoding = exec.charset.* }),
         .request => |r| try arena.dupeZ(u8, r._url),
     };
 
@@ -122,7 +123,7 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
     };
 
     const body = if (opts.body) |b| blk: {
-        const extracted = try b.extract(arena);
+        const extracted = try b.extract(arena.allocator());
         // Per Fetch §6.5 step 11, the default Content-Type only applies if
         // the user has not already set one via the headers init dict.
         if (extracted.content_type) |ct| {
@@ -159,11 +160,12 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
         ._body = body,
         ._signal = signal,
     };
+    arena.report();
     return self;
 }
 
-pub fn deinit(self: *Request, page: *Page) void {
-    page.releaseArena(self._arena);
+pub fn deinit(self: *Request, _: *Page) void {
+    self._arena.release();
 }
 
 pub fn releaseRef(self: *Request, page: *Page) void {
@@ -258,7 +260,7 @@ pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
     const headers = try self.getHeaders(exec);
     const content_type = try headers.get("content-type", exec) orelse "";
 
-    const b = try Blob.initFromBytes(body, content_type, exec.page);
+    const b = try Blob.initFromBytes(body, content_type, exec);
     return local.resolvePromise(b);
 }
 
@@ -298,9 +300,52 @@ pub fn bytes(self: *Request, exec: *const Execution) !js.Promise {
     return local.resolvePromise(js.TypedArray(u8){ .values = self._body orelse "" });
 }
 
+pub fn formData(self: *Request, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| {
+        return rejected;
+    }
+
+    // Per Fetch, a null body acts as an empty byte sequence.
+    const body = self._body orelse "";
+
+    const headers = try self.getHeaders(exec);
+    const content_type = try headers.get("content-type", exec) orelse {
+        return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+    };
+    var it = ContentTypeIterator.init(content_type);
+    const essence = it.essence;
+
+    // [RFC7578]
+    // Parse bytes, using the value of the `boundary` parameter from mimeType,
+    // per the rules set forth in Returning Values from Forms: multipart/form-data.
+    if (std.ascii.eqlIgnoreCase(essence, "multipart/form-data")) {
+        const boundary = it.findBoundary();
+        if (boundary.len == 0) {
+            return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+        }
+
+        const form_data = FormData.initFromMultipart(body, boundary, exec) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
+        };
+        return local.resolvePromise(form_data);
+    }
+
+    if (std.ascii.eqlIgnoreCase(essence, "application/x-www-form-urlencoded")) {
+        const form_data = FormData.initFromUrlEncoded(body, exec) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
+        };
+        return local.resolvePromise(form_data);
+    }
+
+    return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+}
+
 pub fn clone(self: *const Request, exec: *const Execution) !*Request {
-    const arena = try exec.getArena(if (self._body) |b| b.len else 512, "Request.clone");
-    errdefer exec.releaseArena(arena);
+    const arena = try exec.getPinnedArena(if (self._body) |b| b.len else 512, "Request.clone");
+    errdefer arena.release();
 
     const request = try arena.create(Request);
     request.* = .{
@@ -314,6 +359,7 @@ pub fn clone(self: *const Request, exec: *const Execution) !*Request {
         ._body = if (self._body) |b| try arena.dupe(u8, b) else null,
         ._signal = self._signal,
     };
+    arena.report();
     return request;
 }
 
@@ -340,6 +386,7 @@ pub const JsApi = struct {
     pub const json = bridge.function(Request.json, .{});
     pub const arrayBuffer = bridge.function(Request.arrayBuffer, .{});
     pub const bytes = bridge.function(Request.bytes, .{});
+    pub const formData = bridge.function(Request.formData, .{});
     pub const clone = bridge.function(Request.clone, .{});
 };
 

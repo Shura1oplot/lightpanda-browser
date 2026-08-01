@@ -90,6 +90,70 @@ pub fn contentTypeString(mime: *const Mime) []const u8 {
     };
 }
 
+/// Parses `essence` and parameters of `Content-Type` header value.
+pub const ContentTypeIterator = struct {
+    /// Header value.
+    rest: []const u8,
+    /// Always the first.
+    essence: []const u8,
+
+    /// Initializes a `ContentTypeIterator`.
+    pub fn init(content_type: []const u8) ContentTypeIterator {
+        // Skip whitespace.
+        const trimmed = std.mem.trimStart(u8, content_type, &.{ ' ', '\t' });
+        // Find semicolon delimiter; or just use the end position.
+        const end = std.mem.indexOfScalar(u8, trimmed, ';') orelse trimmed.len;
+        const essence = std.mem.trimEnd(u8, trimmed[0..end], &.{ ' ', '\t' });
+
+        // Rest of the parameters.
+        const rest = trimmed[end..];
+        return .{ .rest = rest, .essence = essence };
+    }
+
+    pub const Parameter = struct {
+        key: []const u8,
+        /// `value` can be an empty string ("").
+        value: []const u8,
+    };
+
+    /// Returns the next parameter or null if there aren't any parameters.
+    pub fn next(self: *ContentTypeIterator) ?Parameter {
+        while (self.rest.len > 0) {
+            // `rest` always sits at the `;` that introduced this parameter.
+            var param = self.rest[1..];
+            const end = std.mem.indexOfScalar(u8, param, ';') orelse param.len;
+            self.rest = param[end..];
+            param = std.mem.trim(u8, param[0..end], " \t");
+
+            // Parameters without `=` are malformed; skip them.
+            const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+            const key = std.mem.trimEnd(u8, param[0..eq], " \t");
+            if (key.len == 0) {
+                continue;
+            }
+
+            var value = std.mem.trimStart(u8, param[eq + 1 ..], " \t");
+            if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                value = value[1 .. value.len - 1];
+            }
+            return .{ .key = key, .value = value };
+        }
+
+        return null;
+    }
+
+    /// Returns boundary string; consuming other parameters along the way.
+    /// Boundary can be an empty string.
+    pub fn findBoundary(self: *ContentTypeIterator) []const u8 {
+        while (self.next()) |p| {
+            if (std.ascii.eqlIgnoreCase(p.key, "boundary")) {
+                return p.value;
+            }
+        }
+        return "";
+    }
+};
+
 /// Returns the null-terminated charset value.
 pub fn charsetStringZ(mime: *const Mime) [:0]const u8 {
     return mime.charset[0..mime.charset_len :0];
@@ -746,8 +810,6 @@ fn trimRight(s: []const u8) []const u8 {
 
 const testing = @import("../testing.zig");
 test "Mime: invalid" {
-    defer testing.reset();
-
     const invalids = [_][]const u8{
         "",
         "text",
@@ -764,7 +826,6 @@ test "Mime: invalid" {
 }
 
 test "Mime: malformed parameters are ignored" {
-    defer testing.reset();
 
     // These should all parse successfully as text/html with malformed params ignored
     const valid_with_malformed_params = [_][]const u8{
@@ -787,8 +848,6 @@ test "Mime: malformed parameters are ignored" {
 }
 
 test "Mime: parse common" {
-    defer testing.reset();
-
     try expect(.{ .content_type = .{ .text_xml = {} } }, "text/xml");
     try expect(.{ .content_type = .{ .text_html = {} } }, "text/html");
     try expect(.{ .content_type = .{ .text_plain = {} } }, "text/plain");
@@ -824,8 +883,6 @@ test "Mime: parse common" {
 }
 
 test "Mime: parse uncommon" {
-    defer testing.reset();
-
     const text_csv = Expectation{
         .content_type = .{ .other = {} },
     };
@@ -838,8 +895,6 @@ test "Mime: parse uncommon" {
 }
 
 test "Mime: parse charset" {
-    defer testing.reset();
-
     try expect(.{
         .content_type = .{ .text_xml = {} },
         .charset = "utf-8",
@@ -872,7 +927,6 @@ test "Mime: parse charset" {
 }
 
 test "Mime: parse charset (WHATWG parameter semantics)" {
-    defer testing.reset();
 
     // First charset wins (not last).
     try expect(.{ .content_type = .{ .text_html = {} }, .charset = "gbk" }, "text/html;charset=gbk;charset=utf-8");
@@ -895,8 +949,6 @@ test "Mime: parse charset (WHATWG parameter semantics)" {
 }
 
 test "Mime: isHTML" {
-    defer testing.reset();
-
     const assert = struct {
         fn assert(expected: bool, input: []const u8) !void {
             const mutable_input = try testing.arena_allocator.dupe(u8, input);
@@ -913,8 +965,6 @@ test "Mime: isHTML" {
 }
 
 test "Mime: isXML" {
-    defer testing.reset();
-
     const assert = struct {
         fn assert(expected: bool, input: []const u8) !void {
             const mutable_input = try testing.arena_allocator.dupe(u8, input);
@@ -1041,7 +1091,6 @@ fn expect(expected: Expectation, input: []const u8) !void {
 }
 
 test "Mime: serialize" {
-    defer testing.reset();
     const arena = testing.arena_allocator;
 
     const expectSerialize = struct {

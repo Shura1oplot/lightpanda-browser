@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026 Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -26,9 +26,12 @@ const Transfer = @import("../../../network/HttpClient.zig").Transfer;
 
 const Blob = @import("../Blob.zig");
 const ReadableStream = @import("../streams/ReadableStream.zig");
+const FormData = @import("FormData.zig");
 
 const Headers = @import("Headers.zig");
 const body_init = @import("body_init.zig");
+
+const ContentTypeIterator = @import("../../Mime.zig").ContentTypeIterator;
 
 const Execution = js.Execution;
 const Allocator = std.mem.Allocator;
@@ -46,7 +49,7 @@ pub const Type = enum {
 
 _rc: lp.RC = .{},
 _status: u16,
-_arena: Allocator,
+_arena: *lp.Arena,
 _headers: *Headers,
 _body: Body = .empty,
 _type: Type,
@@ -72,9 +75,30 @@ pub const BodyInit = body_init.BodyInit;
 
 pub fn init(body_: ?BodyInit, opts_: ?InitOpts, exec: *const Execution) !*Response {
     const session = exec.session;
-    const arena = try session.getArena(.large, "Response");
-    errdefer session.releaseArena(arena);
 
+    const bucket: lp.ArenaPool.BucketSize = blk: {
+        const body = body_ orelse break :blk .small;
+        if (body == .stream) {
+            // A stream body is referenced below, never copied into the arena.
+            break :blk .small;
+        }
+        const hint = body.sizeHint() orelse break :blk .large;
+        break :blk session.arena_pool.bucketFor(hint + 512);
+    };
+
+    const arena = try session.getPinnedArena(bucket, "Response");
+    errdefer arena.release();
+    return initWithArena(arena, body_, opts_, exec);
+}
+
+// fetch()'s response shell.
+pub fn initPending(exec: *const Execution) !*Response {
+    const arena = try exec.session.getPinnedArena(.large, "Response.pending");
+    errdefer arena.release();
+    return initWithArena(arena, null, .{ .status = 0 }, exec);
+}
+
+fn initWithArena(arena: *lp.Arena, body_: ?BodyInit, opts_: ?InitOpts, exec: *const Execution) !*Response {
     const opts = opts_ orelse InitOpts{};
     const status_text = if (opts.statusText) |st| try arena.dupe(u8, st) else "";
 
@@ -84,7 +108,7 @@ pub fn init(body_: ?BodyInit, opts_: ?InitOpts, exec: *const Execution) !*Respon
         switch (b) {
             .stream => |stream| break :blk .{ .stream = stream },
             else => {
-                const extracted = try b.extract(arena);
+                const extracted = try b.extract(arena.allocator());
                 content_type = extracted.content_type;
                 break :blk .{ .bytes = extracted.bytes };
             },
@@ -109,13 +133,14 @@ pub fn init(body_: ?BodyInit, opts_: ?InitOpts, exec: *const Execution) !*Respon
         ._is_redirected = false,
         ._headers = headers,
     };
+    arena.report();
     return self;
 }
 
 pub fn createError(exec: *const Execution) !*Response {
     const session = exec.session;
-    const arena = try session.getArena(.large, "Response.error");
-    errdefer session.releaseArena(arena);
+    const arena = try session.getPinnedArena(.tiny, "Response.error");
+    errdefer arena.release();
 
     const self = try arena.create(Response);
     self.* = .{
@@ -128,6 +153,7 @@ pub fn createError(exec: *const Execution) !*Response {
         ._is_redirected = false,
         ._headers = try Headers.init(null, exec),
     };
+    arena.report();
     return self;
 }
 
@@ -139,10 +165,10 @@ pub fn createRedirect(url_: []const u8, status_: ?u16, exec: *const Execution) !
     }
 
     const session = exec.session;
-    const arena = try session.getArena(.large, "Response.redirect");
-    errdefer session.releaseArena(arena);
+    const arena = try session.getPinnedArena(.small, "Response.redirect");
+    errdefer arena.release();
 
-    const location = try URL.resolve(arena, exec.base(), url_, .{ .encoding = exec.charset.* });
+    const location = try URL.resolve(arena.allocator(), exec.base(), url_, .{ .encoding = exec.charset.* });
 
     const headers = try Headers.init(null, exec);
     try headers.set("location", location, exec);
@@ -158,15 +184,16 @@ pub fn createRedirect(url_: []const u8, status_: ?u16, exec: *const Execution) !
         ._is_redirected = false,
         ._headers = headers,
     };
+    arena.report();
     return self;
 }
 
 pub fn createJson(data: js.Value, opts_: ?InitOpts, exec: *const Execution) !*Response {
     const session = exec.session;
-    const arena = try session.getArena(.medium, "Response.json");
-    errdefer session.releaseArena(arena);
+    const arena = try session.getPinnedArena(.medium, "Response.json");
+    errdefer arena.release();
 
-    const json = data.toJson(arena) catch |err| switch (err) {
+    const json = data.toJson(arena.allocator()) catch |err| switch (err) {
         error.JsException => return error.TryCatchRethrow,
         else => return err,
     };
@@ -193,15 +220,16 @@ pub fn createJson(data: js.Value, opts_: ?InitOpts, exec: *const Execution) !*Re
         ._is_redirected = false,
         ._headers = headers,
     };
+    arena.report();
     return self;
 }
 
-pub fn deinit(self: *Response, page: *Page) void {
+pub fn deinit(self: *Response, _: *Page) void {
     if (self._http_transfer) |resp| {
         resp.abort(error.Abort);
         self._http_transfer = null;
     }
-    page.releaseArena(self._arena);
+    self._arena.release();
 }
 
 pub fn releaseRef(self: *Response, page: *Page) void {
@@ -441,7 +469,7 @@ pub fn blob(self: *Response, exec: *const Execution) !js.Promise {
         .stream => return local.rejectPromise(.{ .type_error = "Cannot read blob from stream body" }),
     };
     const content_type = try self._headers.get("content-type", exec) orelse "";
-    const b = try Blob.initFromBytes(body, content_type, exec.page);
+    const b = try Blob.initFromBytes(body, content_type, exec);
     return local.resolvePromise(b);
 }
 
@@ -456,6 +484,48 @@ pub fn bytes(self: *Response, exec: *const Execution) !js.Promise {
     return local.resolvePromise(js.TypedArray(u8){ .values = body });
 }
 
+pub fn formData(self: *Response, exec: *const Execution) !js.Promise {
+    const local = exec.js.local.?;
+    if (self.consume(local)) |rejected| return rejected;
+    const body = switch (self._body) {
+        .bytes => |b| b,
+        .empty => "",
+        .stream => return local.rejectPromise(.{ .type_error = "Cannot read FormData from stream body" }),
+    };
+
+    const content_type = try self._headers.get("content-type", exec) orelse {
+        return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+    };
+    var it = ContentTypeIterator.init(content_type);
+    const essence = it.essence;
+
+    // [RFC7578]
+    // Parse bytes, using the value of the `boundary` parameter from mimeType,
+    // per the rules set forth in Returning Values from Forms: multipart/form-data.
+    if (std.ascii.eqlIgnoreCase(essence, "multipart/form-data")) {
+        const boundary = it.findBoundary();
+        if (boundary.len == 0) {
+            return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+        }
+
+        const form_data = FormData.initFromMultipart(body, boundary, exec) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
+        };
+        return local.resolvePromise(form_data);
+    }
+
+    if (std.ascii.eqlIgnoreCase(essence, "application/x-www-form-urlencoded")) {
+        const form_data = FormData.initFromUrlEncoded(body, exec) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" }),
+        };
+        return local.resolvePromise(form_data);
+    }
+
+    return local.rejectPromise(.{ .type_error = "Failed to parse body as FormData" });
+}
+
 pub fn clone(self: *const Response, exec: *const Execution) !*Response {
     const session = exec.session;
     const body_len = switch (self._body) {
@@ -463,8 +533,8 @@ pub fn clone(self: *const Response, exec: *const Execution) !*Response {
         .empty => 0,
         .stream => 0,
     };
-    const arena = try session.getArena(body_len + self._url.len + 256, "Response.clone");
-    errdefer session.releaseArena(arena);
+    const arena = try session.getPinnedArena(body_len + self._url.len + 256, "Response.clone");
+    errdefer arena.release();
 
     const body: Body = switch (self._body) {
         .bytes => |b| .{ .bytes = try arena.dupe(u8, b) },
@@ -486,6 +556,7 @@ pub fn clone(self: *const Response, exec: *const Execution) !*Response {
         ._headers = try Headers.init(.{ .obj = self._headers }, exec),
         ._http_transfer = null,
     };
+    arena.report();
     return cloned;
 }
 
@@ -519,6 +590,7 @@ pub const JsApi = struct {
     pub const arrayBuffer = bridge.function(Response.arrayBuffer, .{});
     pub const blob = bridge.function(Response.blob, .{});
     pub const bytes = bridge.function(Response.bytes, .{});
+    pub const formData = bridge.function(Response.formData, .{});
     pub const clone = bridge.function(Response.clone, .{});
 };
 

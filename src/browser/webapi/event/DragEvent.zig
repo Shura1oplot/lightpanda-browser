@@ -16,7 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
@@ -30,6 +29,8 @@ const DataTransfer = @import("../DataTransfer.zig");
 const String = lp.String;
 
 const DragEvent = @This();
+
+pub const Proto = MouseEvent;
 
 _proto: *MouseEvent,
 _data_transfer: ?*DataTransfer,
@@ -50,8 +51,8 @@ pub fn initTrusted(typ: []const u8, _opts: ?Options, frame: *Frame) !*DragEvent 
 
 fn initWithTrusted(typ: []const u8, _opts: ?Options, trusted: bool, frame: *Frame) !*DragEvent {
     const arena = try frame.getArena(.medium, "DragEvent");
-    errdefer frame.releaseArena(arena);
-    const type_string = try String.init(arena, typ, .{});
+    errdefer arena.release();
+    const type_string = try String.init(arena.allocator(), typ, .{});
 
     const opts = _opts orelse Options{};
 

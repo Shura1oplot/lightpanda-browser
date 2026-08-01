@@ -16,7 +16,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../../js/js.zig");
@@ -24,6 +23,7 @@ const Frame = @import("../../Frame.zig");
 
 const Node = @import("../Node.zig");
 const Element = @import("../Element.zig");
+const Factory = @import("../../Factory.zig");
 const AnimatedString = @import("../svg/AnimatedString.zig");
 pub const Generic = @import("svg/Generic.zig");
 pub const Graphics = @import("svg/Graphics.zig");
@@ -40,10 +40,14 @@ pub const Stop = @import("svg/Stop.zig");
 
 const String = lp.String;
 
+const IS_DEBUG = @import("builtin").mode == .Debug;
+
 const Svg = @This();
+
+pub const Proto = Element;
 _type: Type,
-_proto: *Element,
 _tag_name: String, // Svg elements are case-preserving
+_proto_canary: if (IS_DEBUG) *Element else void = undefined,
 
 pub const Type = union(enum) {
     graphics: *Graphics,
@@ -109,7 +113,7 @@ pub fn getTag(self: *const Svg) Element.Tag {
 }
 
 pub fn asElement(self: *Svg) *Element {
-    return self._proto;
+    return Factory.protoOf(self);
 }
 pub fn asNode(self: *Svg) *Node {
     return self.asElement().asNode();
@@ -156,5 +160,6 @@ pub const JsApi = struct {
 
 const testing = @import("../../../testing.zig");
 test "WebApi: Svg" {
+    testing.expectLog(&.{ .not_implemented, .not_implemented });
     try testing.htmlRunner("element/svg", .{});
 }

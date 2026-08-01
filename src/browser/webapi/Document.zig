@@ -50,6 +50,8 @@ const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Document = @This();
 
+pub const Proto = Node;
+
 _type: Type,
 _proto: *Node,
 _frame: ?*Frame = null,
@@ -402,7 +404,6 @@ pub fn createElementNS(self: *Document, namespace: ?[]const u8, name: []const u8
 pub fn createAttribute(_: *const Document, name: String.Global, frame: *Frame) !?*Element.Attribute {
     try Element.Attribute.validateAttributeName(name.str);
     return frame._factory.node(Element.Attribute{
-        ._proto = undefined,
         ._name = name.str,
         ._value = String.empty,
         ._element = null,
@@ -416,7 +417,6 @@ pub fn createAttributeNS(_: *const Document, namespace: []const u8, name: String
 
     try Element.Attribute.validateAttributeName(name.str);
     return frame._factory.node(Element.Attribute{
-        ._proto = undefined,
         ._name = name.str,
         ._value = String.empty,
         ._element = null,
@@ -1054,22 +1054,21 @@ fn writeInternal(self: *Document, text: []const []const u8, append_newline: bool
     defer frame._parse_mode = previous_parse_mode;
 
     const arena = try frame.getArena(.medium, "Document.write");
-    defer frame.releaseArena(arena);
+    defer arena.release();
 
-    var parser = Parser.init(arena, fragment_node, frame, .{ .allow_declarative_shadow = true });
+    var parser = Parser.init(arena.allocator(), fragment_node, frame, .{ .allow_declarative_shadow = true });
     parser.parseFragment(html);
 
     // Extract children from wrapper HTML element (html5ever wraps fragments)
     // https://github.com/servo/html5ever/issues/583
-    const children = fragment_node._children orelse return;
-    const first = Node.linkToNode(children.first.?);
+    const first = fragment_node.firstChild() orelse return;
 
     // Collect all children to insert (to avoid iterator invalidation)
     var children_to_insert: std.ArrayList(*Node) = .empty;
 
     var it = if (first.is(Element.Html.Html) == null) fragment_node.childrenIterator() else first.childrenIterator();
     while (it.next()) |child| {
-        try children_to_insert.append(arena, child);
+        try children_to_insert.append(arena.allocator(), child);
     }
 
     if (children_to_insert.items.len == 0) {
@@ -1472,7 +1471,7 @@ pub fn injectBlank(self: *Document, frame: *Frame) error{InjectBlankError}!void 
 fn _injectBlank(self: *Document, frame: *Frame) !void {
     if (comptime IS_DEBUG) {
         // should only be called on an empty document
-        std.debug.assert(self.asNode()._children == null);
+        std.debug.assert(self.asNode()._first_child == null);
     }
 
     const html = try Frame.node_factory.createElementNS(frame, .html, "html", null);
