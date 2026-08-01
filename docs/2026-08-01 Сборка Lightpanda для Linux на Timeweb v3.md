@@ -42,6 +42,8 @@
 
 5. Ключ `shura`, идентификатор `570909`, локальный закрытый ключ `~/.ssh/id_ed25519`.
 
+6. SSH использует порт `443`, потому что среда запуска агента блокирует исходящие соединения к порту `22`. Параметры передаются через файл `docs/timeweb-cloud-init-ssh-443.yaml`; проверка по ключу и запрет пароля сохраняются.
+
 Перед каждым запуском повторно проверьте параметры через API. Не создавайте ресурс, если они изменились.
 
 ## 4. Один локальный сеанс
@@ -57,6 +59,8 @@ lightpanda_repo="$workspace/lightpanda"
 curl_repo="$workspace/curl-impersonate"
 release_dir="$workspace/build"
 local_binary="$release_dir/lightpanda-x86_64-linux"
+ssh_port=443
+user_data_file="$lightpanda_repo/docs/timeweb-cloud-init-ssh-443.yaml"
 
 lightpanda_sha="$(git -C "$lightpanda_repo" rev-parse HEAD)"
 curl_sha="$(git -C "$curl_repo" rev-parse HEAD)"
@@ -70,6 +74,7 @@ lightpanda_version="$base_version.$commit_count+$short_sha"
 
 test -z "$(git -C "$lightpanda_repo" status --short)"
 test -z "$(git -C "$curl_repo" status --short --untracked-files=no)"
+test -s "$user_data_file"
 test "$(twc --version)" = v2.15.2
 twc whoami
 
@@ -82,7 +87,7 @@ twc server list-presets --region ru-3 --output json |
 ssh_key_json="$(twc ssh-key list --output json)"
 test "$(jq '[.ssh_keys[] | select(.name == "shura")] | length' <<<"$ssh_key_json")" = 1
 test "$(jq -r '.ssh_keys[] | select(.name == "shura") | .id' <<<"$ssh_key_json")" = 570909
-test "$(tr -d '\r\n' <"$HOME/.ssh/id_ed25519.pub")" = +  "$(jq -r '.ssh_keys[] | select(.name == "shura") | .body' <<<"$ssh_key_json")"
+test "$(tr -d '\r\n' <"$HOME/.ssh/id_ed25519.pub")" = "$(jq -r '.ssh_keys[] | select(.name == "shura") | .body' <<<"$ssh_key_json")"
 unset ssh_key_json
 ```
 
@@ -100,14 +105,10 @@ recover_timeweb_ids() {
 
   if [[ -z "$server_id" ]]; then
     payload="$(twc server list --output json)"
-    count="$(
-      jq --arg name "$server_name" +        '[.servers[] | select(.name == $name)] | length' <<<"$payload"
-    )"
+    count="$(jq --arg name "$server_name" '[.servers[] | select(.name == $name)] | length' <<<"$payload")"
     ((count <= 1))
     if ((count == 1)); then
-      server_id="$(
-        jq -r --arg name "$server_name" +          '.servers[] | select(.name == $name) | .id' <<<"$payload"
-      )"
+      server_id="$(jq -r --arg name "$server_name" '.servers[] | select(.name == $name) | .id' <<<"$payload")"
     fi
   fi
 
@@ -135,13 +136,11 @@ recover_timeweb_ids() {
 }
 
 server_absent() {
-  twc server list --output json |
-    jq -e --arg id "$server_id" +      'all(.servers[]; (.id | tostring) != $id)' >/dev/null
+  twc server list --output json | jq -e --arg id "$server_id" 'all(.servers[]; (.id | tostring) != $id)' >/dev/null
 }
 
 ip_absent() {
-  twc ip list --output json |
-    jq -e --arg id "$server_ip_id" --arg ip "$server_ip" +      'all(.ips[]; ((.id | tostring) != $id and .ip != $ip))' >/dev/null
+  twc ip list --output json | jq -e --arg id "$server_ip_id" --arg ip "$server_ip" 'all(.ips[]; ((.id | tostring) != $id and .ip != $ip))' >/dev/null
 }
 
 cleanup_timeweb() {
@@ -204,9 +203,7 @@ trap 'exit 143' TERM
 После прямого разрешения пользователя выполните:
 
 ```bash
-server_json="$(
-  twc server create +    --name "$server_name" +    --image 99 +    --preset-id 4805 +    --region ru-3 +    --ssh-key shura +    --disable-ssh-password-auth +    --output json
-)"
+server_json="$(twc server create --name "$server_name" --image 99 --preset-id 4805 --region ru-3 --ssh-key shura --user-data "$user_data_file" --disable-ssh-password-auth --output json)"
 server_id="$(jq -er '.server.id' <<<"$server_json")"
 unset server_json
 
@@ -222,17 +219,18 @@ test -n "$server_ip"
 test -n "$server_ip_id"
 
 known_hosts_file="$(mktemp)"
-ssh-keyscan -H "$server_ip" >"$known_hosts_file"
+ssh-keyscan -p "$ssh_port" -H "$server_ip" >"$known_hosts_file"
 ssh-keygen -lf "$known_hosts_file"
 
 ssh_options=(
   -i "$HOME/.ssh/id_ed25519"
   -o IdentitiesOnly=yes
+  -p "$ssh_port"
   -o "UserKnownHostsFile=$known_hosts_file"
   -o StrictHostKeyChecking=yes
 )
 
-ssh "${ssh_options[@]}" "root@$server_ip" +  'test "$(uname -m)" = x86_64; . /etc/os-release; test "$VERSION_ID" = 24.04'
+ssh "${ssh_options[@]}" "root@$server_ip" 'test "$(uname -m)" = x86_64; . /etc/os-release; test "$VERSION_ID" = 24.04'
 ```
 
 Зафиксируйте показанный отпечаток ключа узла. Если возможно, сравните его с консолью Timeweb до передачи исходников.
@@ -240,15 +238,15 @@ ssh "${ssh_options[@]}" "root@$server_ip" +  'test "$(uname -m)" = x86_64; . /et
 ## 6. Передача зафиксированных деревьев
 
 ```bash
-ssh "${ssh_options[@]}" "root@$server_ip" +  'install -d /opt/src/lightpanda /opt/src/curl-impersonate'
+ssh "${ssh_options[@]}" "root@$server_ip" 'install -d /opt/src/lightpanda /opt/src/curl-impersonate'
 
 git -C "$lightpanda_repo" archive --format=tar "$lightpanda_sha" |
-  ssh "${ssh_options[@]}" "root@$server_ip" +    'tar -xpf - -C /opt/src/lightpanda'
+  ssh "${ssh_options[@]}" "root@$server_ip" 'tar -xpf - -C /opt/src/lightpanda'
 
 git -C "$curl_repo" archive --format=tar "$curl_sha" |
-  ssh "${ssh_options[@]}" "root@$server_ip" +    'tar -xpf - -C /opt/src/curl-impersonate'
+  ssh "${ssh_options[@]}" "root@$server_ip" 'tar -xpf - -C /opt/src/curl-impersonate'
 
-ssh "${ssh_options[@]}" "root@$server_ip" +  'test ! -e /opt/src/lightpanda/.git; test ! -e /opt/src/curl-impersonate/.git'
+ssh "${ssh_options[@]}" "root@$server_ip" 'test ! -e /opt/src/lightpanda/.git; test ! -e /opt/src/curl-impersonate/.git'
 ```
 
 ## 7. Подготовка Ubuntu
@@ -259,15 +257,14 @@ ssh "${ssh_options[@]}" "root@$server_ip" +  'test ! -e /opt/src/lightpanda/.git
 set -Eeuo pipefail
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y +  autoconf automake binutils build-essential bzip2 ca-certificates cmake curl +  file git golang-go gperf jq libtool make ninja-build patch pkg-config +  python3 unzip xz-utils
+DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake binutils build-essential bzip2 ca-certificates cmake curl file git golang-go gperf jq libtool make ninja-build patch pkg-config python3 unzip xz-utils
 
 install_zig() {
   local version="$1"
   local metadata tarball shasum archive install_dir
 
   metadata="$(
-    curl -fsSL https://ziglang.org/download/index.json |
-      jq -ce --arg version "$version" +        '.[$version]["x86_64-linux"] | {tarball, shasum}'
+    curl -fsSL https://ziglang.org/download/index.json | jq -ce --arg version "$version" '.[$version]["x86_64-linux"] | {tarball, shasum}'
   )"
   tarball="$(jq -er '.tarball' <<<"$metadata")"
   shasum="$(jq -er '.shasum' <<<"$metadata")"
@@ -284,7 +281,7 @@ install_zig() {
 install_zig 0.14.0
 install_zig 0.16.0
 
-curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init.sh +  https://sh.rustup.rs
+curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init.sh https://sh.rustup.rs
 sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable
 unlink /tmp/rustup-init.sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -305,7 +302,7 @@ export ZIG_FLAGS='-target x86_64-linux-gnu.2.17'
 
 install_dir=/opt/out/curl-impersonate
 install -d "$install_dir"
-cmake_args="-G Ninja -DCMAKE_INSTALL_PREFIX=$install_dir +-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64 +-DCURL_IMPERSONATE_CXX_RUNTIME_LIBRARY=c++ +-DCURL_IMPERSONATE_ENV_HOOK=OFF +-DCURL_CA_PATH=/etc/ssl/certs +-DCURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+cmake_args="-G Ninja -DCMAKE_INSTALL_PREFIX=$install_dir -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DCURL_IMPERSONATE_CXX_RUNTIME_LIBRARY=c++ -DCURL_IMPERSONATE_ENV_HOOK=OFF -DCURL_CA_PATH=/etc/ssl/certs -DCURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 
 make prepare-libidn2 BUILD_DIR=build
 make configure BUILD_DIR=build CMAKE_CONFIGURE_ARGS="$cmake_args"
@@ -338,7 +335,7 @@ if [[ -f libidn2.a ]]; then
   link_archives+=(libidn2.a)
 fi
 
-cxx_link="$("$CXX" -### -shared -o runtime-probe.so +  libcurl-impersonate.orig.a 2>&1)"
+cxx_link="$("$CXX" -### -shared -o runtime-probe.so libcurl-impersonate.orig.a 2>&1)"
 libcxx="$(printf '%s\n' "$cxx_link" |
   grep -oE '/[^[:space:]]+/libc\+\+\.a' | head -n 1)"
 libcxxabi="$(printf '%s\n' "$cxx_link" |
@@ -349,7 +346,7 @@ test -f "$libcxx"
 test -f "$libcxxabi"
 test -f "$libunwind"
 
-"$CC" -r -o libcurl-impersonate.full.o +  -Wl,--whole-archive "${link_archives[@]}" -Wl,--no-whole-archive +  -Wl,--start-group "$libcxx" "$libcxxabi" "$libunwind" -Wl,--end-group
+"$CC" -r -o libcurl-impersonate.full.o -Wl,--whole-archive "${link_archives[@]}" -Wl,--no-whole-archive -Wl,--start-group "$libcxx" "$libcxxabi" "$libunwind" -Wl,--end-group
 "$AR" rcs libcurl-impersonate-complete.a libcurl-impersonate.full.o
 unlink libcurl-impersonate.full.o
 
@@ -363,7 +360,7 @@ if nm -u "$curl_archive" |
 fi
 sha256sum "$curl_archive"
 
-CURL_IMPERSONATE=lightpanda-invalid-profile +CURL_IMPERSONATE_HEADERS=no +  "$install_dir/bin/curl-impersonate" +  --silent --show-error --output /dev/null file:///dev/null
+CURL_IMPERSONATE=lightpanda-invalid-profile CURL_IMPERSONATE_HEADERS=no "$install_dir/bin/curl-impersonate" --silent --show-error --output /dev/null file:///dev/null
 ```
 
 ## 9. Сборка и проверка Lightpanda
@@ -381,7 +378,7 @@ mkdir -p "${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}/tmp"
 make download-v8
 
 v8_archive="$(
-  make -s --no-print-directory +    --eval "print-v8-cache:;@printf '%s\n' '\$(V8_CACHE)'" +    print-v8-cache
+  make -s --no-print-directory --eval "print-v8-cache:;@printf '%s\n' '\$(V8_CACHE)'" print-v8-cache
 )"
 test -f "$v8_archive"
 
@@ -403,9 +400,9 @@ zig build "${build_flags[@]}" test -freference-trace 2>&1 |
   tee "$test_log"
 grep -F '1130 of 1130 tests passed' "$test_log"
 
-zig build "${build_flags[@]}" -Doptimize=ReleaseFast +  snapshot_creator -- src/snapshot.bin
+zig build "${build_flags[@]}" -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
 test -s src/snapshot.bin
-zig build "${build_flags[@]}" -Doptimize=ReleaseFast +  -Dsnapshot_path=../../snapshot.bin
+zig build "${build_flags[@]}" -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin
 
 lightpanda=/opt/src/lightpanda/zig-out/bin/lightpanda
 file "$lightpanda" | grep -E 'ELF 64-bit.*x86-64'
@@ -416,13 +413,13 @@ if ldd "$lightpanda" | grep -E 'lib(curl|ssl|crypto)'; then
   exit 1
 fi
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 +  --dump html https://example.com >/tmp/example.json
-jq -e '.http_status == 200 and (.content | contains("Example Domain"))' +  /tmp/example.json
+"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 --dump html https://example.com >/tmp/example.json
+jq -e '.http_status == 200 and (.content | contains("Example Domain"))' /tmp/example.json
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 +  --dump html https://rzd.ru/ >/tmp/rzd.json
+"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 --dump html https://rzd.ru/ >/tmp/rzd.json
 jq -e '.http_status == 200 and (.content | contains("РЖД"))' /tmp/rzd.json
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 15000 +  https://self-signed.badssl.com/ +  >/tmp/self-signed.json 2>/tmp/self-signed.log
+"$lightpanda" fetch --json --wait-until done --terminate-ms 15000 https://self-signed.badssl.com/ >/tmp/self-signed.json 2>/tmp/self-signed.log
 jq -e '.http_status == 0' /tmp/self-signed.json
 grep -F PeerFailedVerification /tmp/self-signed.log
 
@@ -441,10 +438,10 @@ local_partial="$release_dir/.lightpanda-x86_64-linux.partial"
 test ! -e "$local_partial"
 
 remote_sha="$(
-  ssh "${ssh_options[@]}" "root@$server_ip" +    'sha256sum /opt/src/lightpanda/zig-out/bin/lightpanda' |
+  ssh "${ssh_options[@]}" "root@$server_ip" 'sha256sum /opt/src/lightpanda/zig-out/bin/lightpanda' |
     awk '{print $1}'
 )"
-scp "${ssh_options[@]}" +  "root@$server_ip:/opt/src/lightpanda/zig-out/bin/lightpanda" +  "$local_partial"
+scp "${ssh_options[@]}" "root@$server_ip:/opt/src/lightpanda/zig-out/bin/lightpanda" "$local_partial"
 
 local_sha="$(shasum -a 256 "$local_partial" | awk '{print $1}')"
 test "$remote_sha" = "$local_sha"

@@ -1,0 +1,13 @@
+#cloud-config
+disable_root: false
+ssh_pwauth: false
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-lightpanda-port.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      Port 443
+      PasswordAuthentication no
+      PermitRootLogin prohibit-password
+runcmd:
+  - [systemctl, restart, ssh]
