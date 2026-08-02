@@ -12,7 +12,7 @@
 
 4. Для сборки создается временный платный сервер Timeweb. Весь цикл от создания до проверки удаления выполняется в одном сеансе Bash.
 
-5. Профиль `chrome146` содержит заголовок `Sec-Ch-Ua-Platform: "macOS"`. Поэтому сетевой отпечаток Linux остается смешанным до отдельной адаптации профиля.
+5. Linux-бинарник намеренно представляет профиль Chrome 146 на macOS Tahoe.
 
 ## 2. Условия безопасности
 
@@ -57,7 +57,7 @@ set -Eeuo pipefail
 workspace=/Users/alexandergordeev/Documents/GitHub/web-tools-for-agents
 lightpanda_repo="$workspace/lightpanda"
 curl_repo="$workspace/curl-impersonate"
-release_dir="$workspace/build"
+release_dir="$lightpanda_repo/build"
 local_binary="$release_dir/lightpanda-x86_64-linux"
 ssh_port=443
 user_data_file="$lightpanda_repo/docs/timeweb-cloud-init-ssh-443.yaml"

@@ -6,7 +6,7 @@
 
 Инструкция создает выпуск `Lightpanda` для компьютера с `Darwin arm64`. Итоговый файл содержит статически связанную библиотеку `curl-impersonate`, которая программно применяет профиль Chrome 146 к каждому соединению и не принимает профиль из переменных среды.
 
-Сборка для Linux не входит в этот выпуск. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-01%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v2.md).
+Сборка для Linux не входит в этот выпуск. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-01%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v3.md).
 
 ## Обязательные фиксации
 
@@ -27,7 +27,7 @@ set -euo pipefail
 workspace=/Users/alexandergordeev/Documents/GitHub/web-tools-for-agents
 lightpanda_root="$workspace/lightpanda"
 curl_root="$workspace/curl-impersonate"
-release_dir="$workspace/build"
+release_dir="$lightpanda_root/build"
 release_bin="$release_dir/lightpanda-aarch64-macos"
 
 curl_required=126d1e43e83b55b7ccfbd618addd19eb43cc5e37
@@ -295,7 +295,7 @@ EOF
 test "$(find "$release_dir" -maxdepth 1 -type f | wc -l | tr -d '[:space:]')" = 5
 ```
 
-Каталог `/Users/alexandergordeev/Documents/GitHub/web-tools-for-agents/build` должен содержать `lightpanda-aarch64-macos`, `LICENSE`, `LICENSING.md`, `SHA256SUMS` и `RELEASE.md`. Вложенный каталог `lightpanda-aarch64-macos` создавать нельзя.
+Каталог [`../build`](../build) должен содержать `lightpanda-aarch64-macos`, `LICENSE`, `LICENSING.md`, `SHA256SUMS` и `RELEASE.md`. Вложенный каталог `lightpanda-aarch64-macos` создавать нельзя.
 
 Без подписи удостоверением Developer ID и нотариального заверения Apple выпуск предназначен только для внутреннего использования. Не публикуйте его и не передавайте внешним пользователям. Выпуск также нельзя использовать, если хотя бы одна проверка завершилась ненулевым кодом.
 
