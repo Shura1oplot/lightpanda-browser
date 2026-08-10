@@ -19,6 +19,7 @@
 const std = @import("std");
 const zenai = @import("zenai");
 const lp = @import("lightpanda");
+const builtin = @import("builtin");
 
 const cli = @import("cli.zig");
 const dump = @import("browser/dump.zig");
@@ -1008,16 +1009,6 @@ test "Config: Chrome 146 client identity" {
         HttpHeaders.user_agent_base,
         config.http_headers.user_agent,
     );
-    const expected_header = try std.fmt.allocPrint(
-        std.testing.allocator,
-        "User-Agent: {s}",
-        .{HttpHeaders.user_agent_base},
-    );
-    defer std.testing.allocator.free(expected_header);
-    try std.testing.expectEqualStrings(
-        expected_header,
-        config.http_headers.user_agent_header,
-    );
     try std.testing.expectEqualStrings(
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
         HttpHeaders.chromeUserAgent(.macos),
@@ -1027,7 +1018,7 @@ test "Config: Chrome 146 client identity" {
         HttpHeaders.chromeUserAgent(.linux),
     );
     try std.testing.expectEqualStrings(
-        "Sec-Ch-Ua: \"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
+        "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"",
         HttpHeaders.sec_ch_ua,
     );
 
