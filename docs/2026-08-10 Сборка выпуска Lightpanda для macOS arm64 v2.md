@@ -1,19 +1,19 @@
 # Сборка выпуска Lightpanda для macOS arm64
 
-Дата инструкции: 1 августа 2026 года.
+Дата актуализации: 10 августа 2026 года. Редакция 2.
 
 ## Периметр
 
 Инструкция создает выпуск `Lightpanda` для компьютера с `Darwin arm64`. Итоговый файл содержит статически связанную библиотеку `curl-impersonate`, которая программно применяет профиль Chrome 146 к каждому соединению и не принимает профиль из переменных среды.
 
-Сборка для Linux не входит в этот выпуск. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-01%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v3.md).
+Сборка для Linux не входит в этот этап. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-10%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v4.md).
 
 ## Обязательные фиксации
 
-| Каталог            | Обязательная фиксация                        | Назначение                                                                              |
-| ------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `lightpanda`       | Чистый `HEAD` после фиксации этого документа | Статическая библиотека `curl-impersonate` и программный профиль каждого запроса         |
-| `curl-impersonate` | `126d1e43e83b55b7ccfbd618addd19eb43cc5e37`   | Отключение `SecTrust` из `242a4bc98172d5a90367c75de0b5014d40bf32cf` и обработчика среды |
+| Каталог            | Обязательная фиксация                      | Назначение                                                                      |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------- |
+| `lightpanda`       | `a0e1a2906d1e46edfaeeb1ad97303114625e114e` | Статическая библиотека `curl-impersonate` и программный профиль каждого запроса |
+| `curl-impersonate` | `266cd9ffce634930e7b236fe340016718ac29dba` | Отключение Apple `SecTrust` и обработчика переменных среды                      |
 
 Фиксация `lightpanda` должна содержать изменения `Link curl-impersonate as external static library` и `Apply Chrome impersonation to every HTTP connection`. Полный SHA используемого `HEAD` записывается в итоговый `RELEASE.md`.
 
@@ -30,13 +30,14 @@ curl_root="$workspace/curl-impersonate"
 release_dir="$lightpanda_root/build"
 release_bin="$release_dir/lightpanda-aarch64-macos"
 
-curl_required=126d1e43e83b55b7ccfbd618addd19eb43cc5e37
+lightpanda_required=a0e1a2906d1e46edfaeeb1ad97303114625e114e
+curl_required=266cd9ffce634930e7b236fe340016718ac29dba
 
 test "$(uname -s)" = Darwin
 test "$(uname -m)" = arm64
 test "$(zig version)" = 0.16.0
 test "$(cmake --version | awk 'NR == 1 { print $3 }')" = 4.4.2
-command -v cargo cmake cmp jq make ninja nm otool shasum xcrun >/dev/null
+command -v cargo cmake cmp jq make ninja nm otool rg shasum xcrun >/dev/null
 macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
 test -d "$macos_sdk_path/System/Library/Frameworks"
 test -d "$macos_sdk_path/usr/lib"
@@ -46,6 +47,9 @@ rg -F 'curl_easy_impersonate(self._easy, IMPERSONATION_TARGET, true)' \
   "$lightpanda_root/src/network/http.zig"
 git -C "$curl_root" merge-base --is-ancestor "$curl_required" HEAD
 test "$(git -C "$curl_root" rev-parse HEAD)" = "$curl_required"
+git -C "$lightpanda_root" merge-base --is-ancestor "$lightpanda_required" HEAD
+git -C "$lightpanda_root" diff --quiet "$lightpanda_required" -- . \
+  ':(exclude)docs'
 
 test -z "$(git -C "$lightpanda_root" status --porcelain)"
 test -z "$(git -C "$curl_root" status --porcelain)"
@@ -55,8 +59,15 @@ test ! -e "$release_dir/LICENSING.md"
 test ! -e "$release_dir/RELEASE.md"
 test ! -e "$release_dir/SHA256SUMS"
 
-lightpanda_source_commit="$(git -C "$lightpanda_root" rev-parse HEAD)"
-curl_source_commit="$(git -C "$curl_root" rev-parse HEAD)"
+lightpanda_source_commit="$lightpanda_required"
+curl_source_commit="$curl_required"
+base_version="$(
+  git -C "$lightpanda_root" show "$lightpanda_required:build.zig.zon" |
+    awk -F '"' '/\.version =/ { print $2; exit }'
+)"
+commit_count="$(git -C "$lightpanda_root" rev-list --count "$lightpanda_required")"
+short_sha="$(git -C "$lightpanda_root" rev-parse --short "$lightpanda_required")"
+lightpanda_version="$base_version.$commit_count+$short_sha"
 ```
 
 Для проверенного окружения использовались `Xcode 26.5`, `SDK macOS 26.5`, `CMake 4.4.2`, `Ninja 1.13.2`, `GNU Make 4.4.1`, `Zig 0.16.0` и `Rust 1.91.1`. Если версии отличаются, сохраните их в `RELEASE.md` и не заявляйте побайтовое совпадение с прежней сборкой.
@@ -89,10 +100,10 @@ make -C "$curl_root" checkbuild BUILD_DIR="$curl_build"
 cmake --build "$curl_build" --target curl-install --parallel
 cmake --install "$curl_build" --strip
 
-grep -Fx 'CURL_IMPERSONATE_ENV_HOOK:BOOL=OFF' "$curl_build/CMakeCache.txt"
-grep -Fx 'CMAKE_OSX_DEPLOYMENT_TARGET:UNINITIALIZED=11.0' \
+rg -Fx 'CURL_IMPERSONATE_ENV_HOOK:BOOL=OFF' "$curl_build/CMakeCache.txt"
+rg -Fx 'CMAKE_OSX_DEPLOYMENT_TARGET:UNINITIALIZED=11.0' \
   "$curl_build/CMakeCache.txt"
-grep -Fx 'USE_APPLE_SECTRUST:BOOL=OFF' "$curl_build/CMakeCache.txt"
+rg -Fx 'USE_APPLE_SECTRUST:BOOL=OFF' "$curl_build/CMakeCache.txt"
 ```
 
 Объедините статическую библиотеку `curl-impersonate` и ее зависимости в один архив:
@@ -119,10 +130,10 @@ done
 
 /usr/bin/libtool -static -o "$curl_archive" "${curl_static_inputs[@]}"
 test "$(ar -t "$curl_archive" | wc -l | tr -d '[:space:]')" = 791
-file "$curl_archive" | grep -F 'current ar archive'
-nm -gU "$curl_archive" | grep -E ' T _curl_easy_impersonate$'
+file "$curl_archive" | rg -F 'current ar archive'
+nm -gU "$curl_archive" | rg ' T _curl_easy_impersonate$'
 
-if nm -u "$curl_archive" | grep -E \
+if nm -u "$curl_archive" | rg \
   '_(SecTrust|SecCertificate|SecPolicy|SecKeychain)'; then
   printf 'Найдена зависимость Apple SecTrust\n' >&2
   exit 1
@@ -138,7 +149,7 @@ CURL_IMPERSONATE_HEADERS=no \
 
 ## Сборка Lightpanda
 
-Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1130 тестов:
+Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1 156 тестов:
 
 ```bash
 cd "$lightpanda_root"
@@ -151,6 +162,7 @@ test -f "$v8_archive"
 
 build_flags=(
   -Dtarget=aarch64-macos.12.0
+  "-Dversion=$lightpanda_version"
   "-Dmacos_sdk_path=$macos_sdk_path"
   "-Dprebuilt_v8_path=$v8_archive"
   "-Dcurl_impersonate_archive=$curl_archive"
@@ -164,7 +176,7 @@ test_log="$(mktemp)"
 CURL_IMPERSONATE=lightpanda-invalid-profile \
 CURL_IMPERSONATE_HEADERS=lightpanda-invalid-headers \
   zig build "${build_flags[@]}" test -freference-trace 2>&1 | tee "$test_log"
-grep -F '1130 of 1130 tests passed' "$test_log"
+rg -F '1156 of 1156 tests passed' "$test_log"
 ```
 
 Создайте `src/snapshot.bin`, затем соберите исполняемый файл в режиме `ReleaseFast` с теми же явными путями:
@@ -186,9 +198,9 @@ test -x "$lightpanda_bin"
 Проверьте архитектуру, встроенный символ и динамические зависимости:
 
 ```bash
-file "$lightpanda_bin" | grep -F 'Mach-O 64-bit executable arm64'
+file "$lightpanda_bin" | rg -F 'Mach-O 64-bit executable arm64'
 "$lightpanda_bin" version
-nm -gU "$lightpanda_bin" | grep -E ' T _curl_easy_impersonate$'
+nm -gU "$lightpanda_bin" | rg ' T _curl_easy_impersonate$'
 
 macos_minos="$(
   otool -l "$lightpanda_bin" |
@@ -196,7 +208,7 @@ macos_minos="$(
 )"
 test "$macos_minos" = 12.0
 
-if otool -L "$lightpanda_bin" | grep -E 'lib(curl|ssl|crypto)'; then
+if otool -L "$lightpanda_bin" | rg 'lib(curl|ssl|crypto)'; then
   printf 'Найдена динамическая зависимость curl или TLS\n' >&2
   exit 1
 fi
@@ -243,7 +255,7 @@ env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
   2> "$network_tmp/self-signed.log"
 
 jq -e '.http_status == 0' "$network_tmp/self-signed.json"
-grep -F 'PeerFailedVerification' "$network_tmp/self-signed.log"
+rg -F 'PeerFailedVerification' "$network_tmp/self-signed.log"
 ```
 
 HTTP 200 для недоверенного сертификата означает ошибку выпуска.
@@ -267,7 +279,7 @@ curl_archive_sha="$(shasum -a 256 "$curl_archive" | cut -d ' ' -f 1)"
 cat > "$release_dir/RELEASE.md" <<EOF
 # Выпуск Lightpanda
 
-- Дата: 2026-08-01.
+- Дата: 2026-08-10.
 - Файл macOS arm64: \`lightpanda-aarch64-macos\`.
 - Минимальная версия из заголовка Mach-O: macOS \`$macos_minos\`.
 - Фиксация Lightpanda: \`$lightpanda_source_commit\`.
@@ -276,7 +288,7 @@ cat > "$release_dir/RELEASE.md" <<EOF
 - SHA-256 статического архива curl-impersonate: \`$curl_archive_sha\`.
 - Параметр CURL_IMPERSONATE_ENV_HOOK: \`OFF\`.
 - Параметр USE_APPLE_SECTRUST: \`OFF\`.
-- Тесты: \`1130 of 1130 tests passed\`.
+- Тесты: \`1156 of 1156 tests passed\`.
 - Linux: отсутствует на этапе выпуска macOS.
 - Распространение: только внутреннее использование без Developer ID и нотариального заверения Apple.
 EOF

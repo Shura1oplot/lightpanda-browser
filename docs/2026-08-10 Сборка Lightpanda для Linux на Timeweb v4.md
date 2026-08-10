@@ -1,6 +1,6 @@
 # Сборка Lightpanda для Linux x86_64 на Timeweb
 
-Дата актуализации: 1 августа 2026 года. Редакция 3.
+Дата актуализации: 10 августа 2026 года. Редакция 4.
 
 ## 1. Назначение
 
@@ -14,23 +14,33 @@
 
 5. Linux-бинарник намеренно представляет профиль Chrome 146 на macOS Tahoe.
 
+6. Один разрешенный цикл использует один сервер и его автоматически назначенный адрес. Сбой отдельного сетевого запроса не является основанием для создания нового сервера.
+
 ## 2. Условия безопасности
 
-1. Перед созданием сервера покажите пользователю регион, образ, параметры, цену, расчетное время и получите прямое разрешение.
+01. Перед созданием сервера покажите пользователю регион, образ, параметры, цену, расчетное время и получите прямое разрешение.
 
-2. Не читайте `.env`. Используйте ранее настроенный профиль `twc`.
+02. Не читайте `.env`. Используйте ранее настроенный профиль `twc`.
 
-3. Передавайте только деревья зафиксированных коммитов через `git archive`. Не передавайте `.git`, рабочие каталоги, ключи, токены и локальные файлы среды.
+03. Передавайте только деревья зафиксированных коммитов через `git archive`. Не передавайте `.git`, рабочие каталоги, ключи, токены и локальные файлы среды.
 
-4. Не изменяйте другие серверы и адреса. Имя временного сервера должно отличаться от имен существующих ресурсов.
+04. Не изменяйте другие серверы и адреса. Имя временного сервера должно отличаться от имен существующих ресурсов.
 
-5. После получения бинарного файла удалите временный сервер и его публичный адрес. Задача не завершена, пока API повторно не подтвердит отсутствие обоих ресурсов.
+05. Не создавайте отдельный плавающий адрес. Используйте только адрес, автоматически назначенный одному временному серверу. Плавающий адрес допустим только по отдельному решению для многократных запусков после проверки тарификации и порядка привязки.
 
-6. При потере сеанса, недоступности API или неподтвержденном удалении немедленно проверьте ресурсы вручную. Не оставляйте сервер для последующей диагностики без нового разрешения пользователя.
+06. До создания платного ресурса локально выполните точные команды трех сетевых проверок на готовом файле macOS. Это исключает потерю цикла из-за ошибки в параметрах командной строки.
+
+07. Каждый сетевой запрос можно повторить не более трех раз на том же сервере. Между попытками выдерживайте пять секунд. Не создавайте второй сервер из-за временной ошибки внешнего сайта.
+
+08. Сохраните исполняемый файл в `/opt/out` до сетевых проверок. Получите файл и протокол даже при отрицательном сетевом результате, затем удалите тот же сервер.
+
+09. После получения бинарного файла удалите временный сервер и автоматически назначенный публичный адрес. Задача не завершена, пока API повторно не подтвердит отсутствие обоих ресурсов.
+
+10. При потере сеанса, недоступности API или неподтвержденном удалении немедленно проверьте ресурсы вручную. Не оставляйте сервер для последующей диагностики без нового разрешения пользователя.
 
 ## 3. Проверенная конфигурация
 
-На 1 августа 2026 года использовались следующие параметры:
+На 10 августа 2026 года использовались следующие параметры:
 
 1. Учетная запись имеет идентификатор `cg76969`.
 
@@ -59,11 +69,20 @@ lightpanda_repo="$workspace/lightpanda"
 curl_repo="$workspace/curl-impersonate"
 release_dir="$lightpanda_repo/build"
 local_binary="$release_dir/lightpanda-x86_64-linux"
+preflight_binary="$release_dir/lightpanda-aarch64-macos"
 ssh_port=443
 user_data_file="$lightpanda_repo/docs/timeweb-cloud-init-ssh-443.yaml"
 
-lightpanda_sha="$(git -C "$lightpanda_repo" rev-parse HEAD)"
-curl_sha="$(git -C "$curl_repo" rev-parse HEAD)"
+lightpanda_release_sha=a0e1a2906d1e46edfaeeb1ad97303114625e114e
+curl_release_sha=266cd9ffce634930e7b236fe340016718ac29dba
+git -C "$lightpanda_repo" merge-base --is-ancestor \
+  "$lightpanda_release_sha" HEAD
+git -C "$lightpanda_repo" diff --quiet "$lightpanda_release_sha" -- . \
+  ':(exclude)docs'
+test "$(git -C "$curl_repo" rev-parse HEAD)" = "$curl_release_sha"
+
+lightpanda_sha="$lightpanda_release_sha"
+curl_sha="$curl_release_sha"
 base_version="$(
   git -C "$lightpanda_repo" show "$lightpanda_sha:build.zig.zon" |
     awk -F '"' '/\.version =/ { print $2; exit }'
@@ -89,6 +108,35 @@ test "$(jq '[.ssh_keys[] | select(.name == "shura")] | length' <<<"$ssh_key_json
 test "$(jq -r '.ssh_keys[] | select(.name == "shura") | .id' <<<"$ssh_key_json")" = 570909
 test "$(tr -d '\r\n' <"$HOME/.ssh/id_ed25519.pub")" = "$(jq -r '.ssh_keys[] | select(.name == "shura") | .body' <<<"$ssh_key_json")"
 unset ssh_key_json
+```
+
+До установки обработчика очистки и создания сервера проверьте точный синтаксис сетевых команд:
+
+```bash
+test -x "$preflight_binary"
+preflight_dir="$(mktemp -d)"
+
+"$preflight_binary" fetch --json --wait-until done --terminate-ms 30000 \
+  --dump html https://example.com >"$preflight_dir/example.json"
+jq -e '.http_status == 200 and (.content | contains("Example Domain"))' \
+  "$preflight_dir/example.json" >/dev/null
+
+"$preflight_binary" fetch --json --wait-until done --terminate-ms 30000 \
+  --dump html https://rzd.ru/ >"$preflight_dir/rzd.json"
+jq -e '.http_status == 200 and (.content | contains("РЖД"))' \
+  "$preflight_dir/rzd.json" >/dev/null
+
+"$preflight_binary" fetch --json --wait-until done --terminate-ms 15000 \
+  https://self-signed.badssl.com/ >"$preflight_dir/self-signed.json" \
+  2>"$preflight_dir/self-signed.log"
+jq -e '.http_status == 0' "$preflight_dir/self-signed.json" >/dev/null
+rg -F 'PeerFailedVerification' "$preflight_dir/self-signed.log" >/dev/null
+
+unlink "$preflight_dir/example.json"
+unlink "$preflight_dir/rzd.json"
+unlink "$preflight_dir/self-signed.json"
+unlink "$preflight_dir/self-signed.log"
+rmdir "$preflight_dir"
 ```
 
 Установите обработчик очистки до команды создания:
@@ -239,9 +287,22 @@ scp_options=(
 )
 
 ssh "${ssh_options[@]}" "root@$server_ip" 'test "$(uname -m)" = x86_64; . /etc/os-release; test "$VERSION_ID" = 24.04'
+ssh "${ssh_options[@]}" "root@$server_ip" '
+  cloud-init status --wait
+  timedatectl set-ntp true
+  systemctl restart systemd-timesyncd
+  for attempt in {1..60}; do
+    if [[ "$(timedatectl show -p NTPSynchronized --value)" = yes ]]; then
+      date -u
+      exit 0
+    fi
+    sleep 2
+  done
+  exit 1
+'
 ```
 
-Зафиксируйте показанный отпечаток ключа узла. Если возможно, сравните его с консолью Timeweb до передачи исходников.
+Зафиксируйте показанный отпечаток ключа узла. Если возможно, сравните его с консолью Timeweb до передачи исходников. Передача исходников начинается только после завершения `cloud-init` и синхронизации времени.
 
 ## 6. Передача зафиксированных деревьев
 
@@ -265,7 +326,7 @@ ssh "${ssh_options[@]}" "root@$server_ip" 'test ! -e /opt/src/lightpanda/.git; t
 set -Eeuo pipefail
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake binutils build-essential bzip2 ca-certificates cmake curl file git golang-go gperf jq libtool make ninja-build patch pkg-config python3 unzip xz-utils
+DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake binutils build-essential bzip2 ca-certificates cmake curl file git golang-go gperf jq libtool make ninja-build patch pkg-config python3 ripgrep unzip xz-utils
 
 install_zig() {
   local version="$1"
@@ -345,11 +406,11 @@ fi
 
 cxx_link="$("$CXX" -### -shared -o runtime-probe.so libcurl-impersonate.orig.a 2>&1)"
 libcxx="$(printf '%s\n' "$cxx_link" |
-  grep -oE '/[^[:space:]]+/libc\+\+\.a' | head -n 1)"
+  rg -o '/[^[:space:]]+/libc\+\+\.a' | head -n 1)"
 libcxxabi="$(printf '%s\n' "$cxx_link" |
-  grep -oE '/[^[:space:]]+/libc\+\+abi\.a' | head -n 1)"
+  rg -o '/[^[:space:]]+/libc\+\+abi\.a' | head -n 1)"
 libunwind="$(printf '%s\n' "$cxx_link" |
-  grep -oE '/[^[:space:]]+/libunwind\.a' | head -n 1)"
+  rg -o '/[^[:space:]]+/libunwind\.a' | head -n 1)"
 test -f "$libcxx"
 test -f "$libcxxabi"
 test -f "$libunwind"
@@ -360,10 +421,10 @@ unlink libcurl-impersonate.full.o
 
 curl_archive="$install_lib_dir/libcurl-impersonate-complete.a"
 curl_include="$install_dir/include"
-readelf -h "$curl_archive" | grep -E 'Machine:.*X86-64' >/dev/null
-nm -g --defined-only "$curl_archive" | grep -E 'curl_easy_impersonate$'
+readelf -h "$curl_archive" | rg 'Machine:.*X86-64' >/dev/null
+nm -g --defined-only "$curl_archive" | rg 'curl_easy_impersonate$'
 if nm -u "$curl_archive" |
-  grep -E '[[:space:]]U (_Z|__cxa|__gxx|_Unwind)'; then
+  rg '[[:space:]]U (_Z|__cxa|__gxx|_Unwind)'; then
   exit 1
 fi
 sha256sum "$curl_archive"
@@ -406,30 +467,71 @@ zig build "${build_flags[@]}" check
 test_log="$(mktemp)"
 zig build "${build_flags[@]}" test -freference-trace 2>&1 |
   tee "$test_log"
-grep -F '1130 of 1130 tests passed' "$test_log"
+rg -F '1156 of 1156 tests passed' "$test_log"
 
 zig build "${build_flags[@]}" -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
 test -s src/snapshot.bin
 zig build "${build_flags[@]}" -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin
 
 lightpanda=/opt/src/lightpanda/zig-out/bin/lightpanda
-file "$lightpanda" | grep -E 'ELF 64-bit.*x86-64'
+file "$lightpanda" | rg 'ELF 64-bit.*x86-64'
 test "$("$lightpanda" version)" = "$LINUX_VERSION"
-readelf -h "$lightpanda" | grep -E 'Machine:.*X86-64'
-nm "$lightpanda" | grep -E 'curl_easy_impersonate$'
-if ldd "$lightpanda" | grep -E 'lib(curl|ssl|crypto)'; then
+readelf -h "$lightpanda" | rg 'Machine:.*X86-64'
+nm "$lightpanda" | rg 'curl_easy_impersonate$'
+if ldd "$lightpanda" | rg 'lib(curl|ssl|crypto)'; then
   exit 1
 fi
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 --dump html https://example.com >/tmp/example.json
-jq -e '.http_status == 200 and (.content | contains("Example Domain"))' /tmp/example.json
+install -D -m 0755 "$lightpanda" /opt/out/lightpanda
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 30000 --dump html https://rzd.ru/ >/tmp/rzd.json
-jq -e '.http_status == 200 and (.content | contains("РЖД"))' /tmp/rzd.json
+retry_check() {
+  local label="$1"
+  local command_name="$2"
+  local attempt
 
-"$lightpanda" fetch --json --wait-until done --terminate-ms 15000 https://self-signed.badssl.com/ >/tmp/self-signed.json 2>/tmp/self-signed.log
-jq -e '.http_status == 0' /tmp/self-signed.json
-grep -F PeerFailedVerification /tmp/self-signed.log
+  for attempt in 1 2 3; do
+    if "$command_name"; then
+      printf '%s: успешно, попытка %s\n' "$label" "$attempt"
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+check_example() {
+  "$lightpanda" fetch --json --wait-until done --terminate-ms 30000 \
+    --dump html https://example.com >/tmp/example.json &&
+    jq -e '.http_status == 200 and (.content | contains("Example Domain"))' \
+      /tmp/example.json >/dev/null
+}
+
+check_rzd() {
+  "$lightpanda" fetch --json --wait-until done --terminate-ms 30000 \
+    --dump html https://rzd.ru/ >/tmp/rzd.json &&
+    jq -e '.http_status == 200 and (.content | contains("РЖД"))' \
+      /tmp/rzd.json >/dev/null
+}
+
+check_self_signed() {
+  "$lightpanda" fetch --json --wait-until done --terminate-ms 15000 \
+    https://self-signed.badssl.com/ >/tmp/self-signed.json \
+    2>/tmp/self-signed.log &&
+    jq -e '.http_status == 0' /tmp/self-signed.json >/dev/null &&
+    rg -F PeerFailedVerification /tmp/self-signed.log >/dev/null
+}
+
+network_example=fail
+network_rzd=fail
+network_self_signed=fail
+retry_check example.com check_example && network_example=pass
+retry_check rzd.ru check_rzd && network_rzd=pass
+retry_check self-signed.badssl.com check_self_signed && \
+  network_self_signed=pass
+
+printf 'NETWORK_EXAMPLE=%s\nNETWORK_RZD=%s\nNETWORK_SELF_SIGNED=%s\n' \
+  "$network_example" "$network_rzd" "$network_self_signed" \
+  >/opt/out/network-status.txt
 
 stat -c '%s' "$lightpanda"
 sha256sum "$lightpanda"
@@ -446,17 +548,27 @@ local_partial="$release_dir/.lightpanda-x86_64-linux.partial"
 test ! -e "$local_partial"
 
 remote_sha="$(
-  ssh "${ssh_options[@]}" "root@$server_ip" 'sha256sum /opt/src/lightpanda/zig-out/bin/lightpanda' |
+  ssh "${ssh_options[@]}" "root@$server_ip" 'sha256sum /opt/out/lightpanda' |
     awk '{print $1}'
 )"
-scp "${scp_options[@]}" "root@$server_ip:/opt/src/lightpanda/zig-out/bin/lightpanda" "$local_partial"
+scp "${scp_options[@]}" "root@$server_ip:/opt/out/lightpanda" "$local_partial"
+scp "${scp_options[@]}" "root@$server_ip:/opt/out/network-status.txt" \
+  "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
 
 local_sha="$(shasum -a 256 "$local_partial" | awk '{print $1}')"
 test "$remote_sha" = "$local_sha"
+rg -F 'NETWORK_EXAMPLE=pass' \
+  "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
+rg -F 'NETWORK_RZD=pass' \
+  "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
+rg -F 'NETWORK_SELF_SIGNED=pass' \
+  "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
+unlink "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
+
 chmod 0755 "$local_partial"
 mv "$local_partial" "$local_binary"
 
-file "$local_binary" | grep -E 'ELF 64-bit.*x86-64'
+file "$local_binary" | rg 'ELF 64-bit.*x86-64'
 shasum -a 256 "$local_binary"
 ```
 
@@ -482,7 +594,7 @@ cleanup_timeweb 0
 
 06. `ldd` не показывает динамические `libcurl`, `libssl` и `libcrypto`.
 
-07. Форматирование, проверка графа и 1130 тестов прошли с враждебными переменными среды.
+07. Форматирование, проверка графа и 1 156 тестов прошли с враждебными переменными среды.
 
 08. Итоговый файл имеет формат ELF64 x86-64 и точную заданную версию.
 
@@ -490,7 +602,9 @@ cleanup_timeweb 0
 
 10. Контрольные суммы удаленного и локального файлов совпали.
 
-11. Сервер и публичный адрес отсутствуют в повторных списках Timeweb.
+11. Использован один сервер с одним автоматически назначенным адресом; отдельный плавающий адрес не создавался.
+
+12. Сервер и публичный адрес отсутствуют в повторных списках Timeweb.
 
 ## 12. Источники
 
