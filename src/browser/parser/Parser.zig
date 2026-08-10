@@ -29,7 +29,6 @@ pub const AttributeIterator = h5e.AttributeIterator;
 
 const Allocator = std.mem.Allocator;
 const TERMINATE_CHECK_INTERVAL = 1024;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 pub const ParsedNode = struct {
     node: *Node,
@@ -134,7 +133,7 @@ fn appendTextChunk(self: *Parser, parent: *Node, txt: []const u8) !void {
             // Existing text sibling without a matching pending_text. Seed the
             // buf from its _data and register pending so subsequent chunks
             // accumulate cheaply.
-            const cdata = tn._proto;
+            const cdata = tn.asCData();
             const existing = cdata.getData().str();
             try self.buf.ensureTotalCapacity(self.arena, existing.len + txt.len);
             self.buf.appendSliceAssumeCapacity(existing);
@@ -150,7 +149,7 @@ fn appendTextChunk(self: *Parser, parent: *Node, txt: []const u8) !void {
     try self.frame.appendNew(parent, new_text);
     self.pending_text = .{
         .parent = parent,
-        .text_node = new_text.is(CData.Text).?._proto,
+        .text_node = new_text.is(CData.Text).?.asCData(),
     };
 }
 
@@ -601,7 +600,7 @@ fn getTemplateContentsCallback(ctx: *anyopaque, target_ref: *anyopaque) callconv
 
 fn _getTemplateContentsCallback(self: *Parser, node: *Node) !*anyopaque {
     const element = node.as(Element);
-    const template = element._type.html.is(Element.Html.Template) orelse unreachable;
+    const template = element.subtype(Element.Html).is(Element.Html.Template) orelse unreachable;
     const content_node = template.getContent().asNode();
 
     // Create a ParsedNode wrapper for the content DocumentFragment
@@ -682,7 +681,7 @@ fn _appendCallback(self: *Parser, parent: *Node, node_or_text: h5e.NodeOrText) !
                 // in the wild, and I'm not sure why. In debug, let's crash so
                 // we can try to figure it out. In release, let's disconnect
                 // the child first.
-                if (comptime IS_DEBUG) {
+                if (comptime lp.IS_DEBUG) {
                     unreachable;
                 }
                 self.frame.removeNode(previous_parent, child, .{ .will_be_reconnected = parent.isConnected() });

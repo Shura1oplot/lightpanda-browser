@@ -46,7 +46,6 @@ pub const HTMLDocument = @import("HTMLDocument.zig");
 
 const log = lp.log;
 const String = lp.String;
-const IS_DEBUG = @import("builtin").mode == .Debug;
 
 const Document = @This();
 
@@ -211,6 +210,11 @@ pub fn getLastModified(self: *const Document, frame: *Frame) ![]const u8 {
         @as(u32, @intCast(tm.tm_min)),
         @as(u32, @intCast(tm.tm_sec)),
     });
+}
+
+pub fn getReferrer(self: *const Document) []const u8 {
+    const frame = self._frame orelse return "";
+    return frame._referrer orelse "";
 }
 
 pub fn getCharset(self: *const Document) []const u8 {
@@ -1299,7 +1303,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                                 }
                                 has_doctype = true;
                             },
-                            .cdata => |cd| switch (cd._type) {
+                            .cdata => switch (frag_child.subtype(Node.CData)._type) {
                                 .comment, .processing_instruction => {}, // Allowed
                                 .text, .cdata_section => return error.HierarchyError, // Not allowed in Document
                             },
@@ -1325,7 +1329,7 @@ fn validateDocumentNodes(self: *Document, nodes: []const Node.NodeOrText, compti
                             }
                             has_doctype = true;
                         },
-                        .cdata => |cd| switch (cd._type) {
+                        .cdata => switch (child.subtype(Node.CData)._type) {
                             .comment, .processing_instruction => {}, // Allowed
                             .text, .cdata_section => return error.HierarchyError, // Not allowed in Document
                         },
@@ -1469,7 +1473,7 @@ pub fn injectBlank(self: *Document, frame: *Frame) error{InjectBlankError}!void 
 }
 
 fn _injectBlank(self: *Document, frame: *Frame) !void {
-    if (comptime IS_DEBUG) {
+    if (comptime lp.IS_DEBUG) {
         // should only be called on an empty document
         std.debug.assert(self.asNode()._first_child == null);
     }
@@ -1589,15 +1593,12 @@ pub const JsApi = struct {
     pub const hasFocus = bridge.function(Document.hasFocus, .{});
 
     pub const prerendering = bridge.property(false, .{ .template = false });
-    pub const characterSet = bridge.accessor(getCharacterSet, null, .{});
-    pub const charset = bridge.accessor(getCharacterSet, null, .{});
-    pub const inputEncoding = bridge.accessor(getCharacterSet, null, .{});
+    pub const characterSet = bridge.accessor(Document.getCharset, null, .{});
+    pub const charset = bridge.accessor(Document.getCharset, null, .{});
+    pub const inputEncoding = bridge.accessor(Document.getCharset, null, .{});
     pub const compatMode = bridge.accessor(Document.getCompatMode, null, .{});
     pub const lastModified = bridge.accessor(Document.getLastModified, null, .{});
-    fn getCharacterSet(self: *const Document) []const u8 {
-        return self.getCharset();
-    }
-    pub const referrer = bridge.property("", .{ .template = false });
+    pub const referrer = bridge.accessor(Document.getReferrer, null, .{});
 
     // Generates a getter/setter pair backed by the frame's attribute-listener
     // map, like onclick above, for other document event handler properties.

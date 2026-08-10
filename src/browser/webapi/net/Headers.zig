@@ -8,7 +8,6 @@ const KeyValueList = @import("../KeyValueList.zig");
 
 const log = lp.log;
 const Execution = js.Execution;
-const Allocator = std.mem.Allocator;
 
 const Headers = @This();
 
@@ -92,19 +91,17 @@ pub fn forEach(self: *Headers, cb_: js.Function, js_this_: ?js.Object) !void {
     const cb = if (js_this_) |js_this| try cb_.withThis(js_this) else cb_;
 
     for (self._list._entries.items) |entry| {
-        var caught: js.TryCatch.Caught = undefined;
+        var caught: js.TryCatch.Caught = .{};
         cb.tryCall(void, .{ entry.value.str(), entry.name.str(), self }, &caught) catch {
             log.debug(.js, "forEach callback", .{ .caught = caught, .source = "headers" });
         };
     }
 }
 
-// TODO: do we really need 2 different header structs??
-const http = @import("../../../network/http.zig");
-pub fn populateHttpHeader(self: *Headers, allocator: Allocator, http_headers: *http.Headers) !void {
+const HttpClient = @import("../../../network/HttpClient.zig");
+pub fn populateRequestHeaders(self: *Headers, transfer: *HttpClient.Transfer) !void {
     for (self._list._entries.items) |entry| {
-        const merged = try std.mem.concatWithSentinel(allocator, u8, &.{ entry.name.str(), ": ", entry.value.str() }, 0);
-        try http_headers.add(merged);
+        try transfer.addHeader(entry.name.str(), entry.value.str(), .{ .source = .author });
     }
 }
 

@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const lp = @import("lightpanda");
-const builtin = @import("builtin");
 
 const CDP = @import("CDP.zig");
 
@@ -28,6 +27,7 @@ const ArenaPool = @import("../ArenaPool.zig");
 
 const WS = @import("../network/WS.zig");
 const sys_net = @import("../sys/net.zig");
+const header_parser = @import("../network/header_parser.zig");
 
 const log = lp.log;
 const posix = std.posix;
@@ -58,7 +58,7 @@ pub fn init(
 ) !void {
     const socket_flags = try sys_net.fcntl(socket, posix.F.GETFL, 0);
     const nonblocking = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
-    if (builtin.is_test == false) {
+    if (lp.IS_TEST == false) {
         lp.assert(socket_flags & nonblocking == nonblocking, "Connection.init blocking", .{});
     }
 
@@ -302,6 +302,12 @@ fn handleHttpRequest(self: *Connection, request: []u8) !HttpResult {
         return .close;
     }
 
+    if (std.mem.eql(u8, url, "/json/protocol") or std.mem.eql(u8, url, "/json/protocol/")) {
+        try self.send(protocol_response);
+        self.shutdown();
+        return .close;
+    }
+
     if (self.metrics_enabled and std.mem.eql(u8, url, "/metrics")) {
         try self.sendMetrics();
         self.shutdown();
@@ -332,6 +338,16 @@ const empty_json_list_response =
     "Connection: Close\r\n" ++
     "Content-Type: application/json; charset=UTF-8\r\n\r\n" ++
     "[]";
+
+const protocol_json = @embedFile("../data/protocol.json");
+
+const protocol_response = std.fmt.comptimePrint(
+    "HTTP/1.1 200 OK\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "Connection: Close\r\n" ++
+        "Content-Type: application/json; charset=UTF-8\r\n\r\n",
+    .{protocol_json.len},
+) ++ protocol_json;
 
 // Framing-only iteration over received bytes. processMessages no
 // longer auto-replies pong/close or sends close-on-error — the Network
@@ -418,59 +434,58 @@ fn pushCdp(self: *Connection, bytes: []const u8) !bool {
 }
 
 pub fn upgrade(self: *Connection, request: []u8) !void {
-    // our caller already confirmed that we have a trailing \r\n\r\n
-    const request_line_end = std.mem.indexOfScalar(u8, request, '\r') orelse unreachable;
-    const request_line = request[0..request_line_end];
+    // We need to extract the `Sec-WebSocket-Key` value.
+    var sec_websocket_key: []const u8 = "";
+    // We need to make sure that we got all the necessary headers + values;
+    // a bit per required header.
+    const FOUND_UPGRADE: u8 = 1 << 0; // Upgrade: websocket
+    const FOUND_VERSION: u8 = 1 << 1; // Sec-WebSocket-Version: 13
+    const FOUND_CONNECTION: u8 = 1 << 2; // Connection: upgrade
+    const FOUND_KEY: u8 = 1 << 3; // Sec-WebSocket-Key
+    const FOUND_ALL = FOUND_UPGRADE | FOUND_VERSION | FOUND_CONNECTION | FOUND_KEY;
 
-    if (!std.ascii.endsWithIgnoreCase(request_line, "http/1.1")) {
+    // A malformed request line maps to a 400 in processHttpRequest.
+    const method, _, const version, var header_iterator = header_parser.parseRequest(request) catch {
+        return error.InvalidProtocol;
+    };
+    if (method != .get or version != .@"1.1") {
         return error.InvalidProtocol;
     }
 
-    // we need to extract the sec-websocket-key value
-    var key: []const u8 = "";
+    var found_headers: u8 = 0;
 
-    // we need to make sure that we got all the necessary headers + values
-    var required_headers: u8 = 0;
+    // A malformed header maps to a 400 in processHttpRequest.
+    while (header_iterator.next() catch return error.InvalidRequest) |header| {
+        const key = header.key;
+        const value = header.value;
 
-    // can't std.mem.split because it forces the iterated value to be const
-    // (we could @constCast...)
-
-    var buf = request[request_line_end + 2 ..];
-
-    while (buf.len > 4) {
-        const index = std.mem.indexOfScalar(u8, buf, '\r') orelse unreachable;
-        const separator = std.mem.indexOfScalar(u8, buf[0..index], ':') orelse return error.InvalidRequest;
-
-        const name = std.mem.trim(u8, toLower(buf[0..separator]), &std.ascii.whitespace);
-        const value = std.mem.trim(u8, buf[(separator + 1)..index], &std.ascii.whitespace);
-
-        if (std.mem.eql(u8, name, "upgrade")) {
+        // Header names are case-insensitive; `Header.parse` keeps their
+        // original casing.
+        if (std.ascii.eqlIgnoreCase(key, "upgrade")) {
             if (!std.ascii.eqlIgnoreCase("websocket", value)) {
                 return error.InvalidUpgradeHeader;
             }
-            required_headers |= 1;
-        } else if (std.mem.eql(u8, name, "sec-websocket-version")) {
+            found_headers |= FOUND_UPGRADE;
+        } else if (std.ascii.eqlIgnoreCase(key, "sec-websocket-version")) {
             if (value.len != 2 or value[0] != '1' or value[1] != '3') {
                 return error.InvalidVersionHeader;
             }
-            required_headers |= 2;
-        } else if (std.mem.eql(u8, name, "connection")) {
+            found_headers |= FOUND_VERSION;
+        } else if (std.ascii.eqlIgnoreCase(key, "connection")) {
             // find if connection header has upgrade in it, example header:
             // Connection: keep-alive, Upgrade
             if (std.ascii.indexOfIgnoreCase(value, "upgrade") == null) {
                 return error.InvalidConnectionHeader;
             }
-            required_headers |= 4;
-        } else if (std.mem.eql(u8, name, "sec-websocket-key")) {
-            key = value;
-            required_headers |= 8;
+            found_headers |= FOUND_CONNECTION;
+        } else if (std.ascii.eqlIgnoreCase(key, "sec-websocket-key")) {
+            sec_websocket_key = value;
+            found_headers |= FOUND_KEY;
         }
-
-        const next = index + 2;
-        buf = buf[next..];
     }
 
-    if (required_headers != 15) {
+    // Check if we've received all related headers.
+    if (found_headers != FOUND_ALL) {
         return error.MissingHeaders;
     }
 
@@ -498,7 +513,7 @@ pub fn upgrade(self: *Connection, request: []u8) !void {
         const key_pos = res.len - 32;
         var h: [20]u8 = undefined;
         var hasher = std.crypto.hash.Sha1.init(.{});
-        hasher.update(key);
+        hasher.update(sec_websocket_key);
         // websocket spec always used this value
         hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
         hasher.final(&h);
@@ -582,12 +597,4 @@ fn websocketHeader(buf: []u8, op_code: WS.OpCode, payload_len: usize) []const u8
     buf[8] = @intCast((len >> 8) & 0xFF);
     buf[9] = @intCast(len & 0xFF);
     return buf[0..10];
-}
-
-// In-place string lowercase
-fn toLower(str: []u8) []u8 {
-    for (str, 0..) |ch, i| {
-        str[i] = std.ascii.toLower(ch);
-    }
-    return str;
 }
