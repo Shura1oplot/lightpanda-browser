@@ -33,6 +33,7 @@ const IpFilter = @import("IpFilter.zig");
 const RobotStore = @import("Robots.zig").RobotStore;
 const WebBotAuth = @import("WebBotAuth.zig");
 const CurlDebugAllocator = @import("CurlDebugAllocator.zig");
+const TrustedRoots = @import("TrustedRoots.zig");
 
 const Cache = @import("cache/Cache.zig");
 const SqliteCache = @import("cache/SqliteCache.zig");
@@ -815,6 +816,9 @@ fn storeFromSystemCA(allocator: Allocator) !*crypto.X509_STORE {
             }
         },
     }
+
+    try TrustedRoots.addRussianTrustedRoot(store);
+    count += 1;
 
     return store;
 }
