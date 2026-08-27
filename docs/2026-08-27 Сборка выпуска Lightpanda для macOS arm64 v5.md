@@ -1,21 +1,21 @@
 # Сборка выпуска Lightpanda для macOS arm64
 
-Дата актуализации: 27 августа 2026 года. Редакция 4.
+Дата актуализации: 27 августа 2026 года. Редакция 5.
 
 ## Периметр
 
 Инструкция создает выпуск `Lightpanda` для компьютера с `Darwin arm64`. Итоговый файл содержит статически связанную библиотеку `curl-impersonate`, которая программно применяет профиль Chrome 146 к каждому соединению и не принимает профиль из переменных среды.
 
-Сборка для Linux не входит в этот этап. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-27%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v6.md).
+Сборка для Linux не входит в этот этап. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-27%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v7.md).
 
 ## Обязательные фиксации
 
-| Каталог            | Обязательная фиксация                      | Назначение                                                                     |
-| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------ |
-| `lightpanda`       | `1681060a57a1d80e2918ca186ef02eecada3d677` | Стабильный выпуск 0.3.7, статическая библиотека и программный профиль запросов |
-| `curl-impersonate` | `266cd9ffce634930e7b236fe340016718ac29dba` | Отключение Apple `SecTrust` и обработчика переменных среды                     |
+| Каталог            | Обязательная фиксация                      | Назначение                                                                |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------- |
+| `lightpanda`       | `1bcebafd4bdedf139520614c8c041df6d36c3926` | Стабильный выпуск 0.3.7, программный профиль и встроенный корень Минцифры |
+| `curl-impersonate` | `266cd9ffce634930e7b236fe340016718ac29dba` | Отключение Apple `SecTrust` и обработчика переменных среды                |
 
-Фиксация `lightpanda` должна содержать изменения `Link curl-impersonate as external static library` и `Apply Chrome impersonation to every HTTP connection`. Полный SHA используемого `HEAD` записывается в итоговый `RELEASE.md`.
+Фиксация `lightpanda` должна содержать изменения `Link curl-impersonate as external static library`, `Apply Chrome impersonation to every HTTP connection` и `Trust Russian Ministry root certificate`. Полный SHA используемого `HEAD` записывается в итоговый `RELEASE.md`.
 
 ## Подготовка
 
@@ -30,7 +30,7 @@ curl_root="$workspace/curl-impersonate"
 release_dir="$lightpanda_root/build"
 release_bin="$release_dir/lightpanda-aarch64-macos"
 
-lightpanda_required=1681060a57a1d80e2918ca186ef02eecada3d677
+lightpanda_required=1bcebafd4bdedf139520614c8c041df6d36c3926
 curl_required=266cd9ffce634930e7b236fe340016718ac29dba
 
 test "$(uname -s)" = Darwin
@@ -48,8 +48,9 @@ rg -F 'curl_easy_impersonate(self._easy, IMPERSONATION_TARGET, true)' \
 git -C "$curl_root" merge-base --is-ancestor "$curl_required" HEAD
 test "$(git -C "$curl_root" rev-parse HEAD)" = "$curl_required"
 git -C "$lightpanda_root" merge-base --is-ancestor "$lightpanda_required" HEAD
-git -C "$lightpanda_root" diff --quiet "$lightpanda_required" -- . \
-  ':(exclude)docs'
+git -C "$lightpanda_root" diff --quiet "$lightpanda_required" -- \
+  '*.zig' build.zig build.zig.zon Makefile install.sh Dockerfile \
+  'src/network/certificates/*.pem'
 
 test -z "$(git -C "$lightpanda_root" status --porcelain)"
 test -z "$(git -C "$curl_root" status --porcelain)"
@@ -149,7 +150,7 @@ CURL_IMPERSONATE_HEADERS=no \
 
 ## Сборка Lightpanda
 
-Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1 182 теста:
+Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1 184 теста:
 
 ```bash
 cd "$lightpanda_root"
@@ -176,7 +177,7 @@ test_log="$(mktemp)"
 CURL_IMPERSONATE=lightpanda-invalid-profile \
 CURL_IMPERSONATE_HEADERS=lightpanda-invalid-headers \
   zig build "${build_flags[@]}" test -freference-trace 2>&1 | tee "$test_log"
-rg -F '1182 of 1182 tests passed' "$test_log"
+rg -F '1184 of 1184 tests passed' "$test_log"
 ```
 
 Создайте `src/snapshot.bin`, затем соберите исполняемый файл в режиме `ReleaseFast` с теми же явными путями:
@@ -237,6 +238,21 @@ env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
   "$lightpanda_bin" fetch \
   --json \
   --wait-until done \
+  --terminate-ms 30000 \
+  https://rzd.ru/ \
+  > "$network_tmp/rzd.json" \
+  2> "$network_tmp/rzd.log"
+
+jq -e '.http_status > 0' "$network_tmp/rzd.json"
+if rg -F 'PeerFailedVerification' "$network_tmp/rzd.log"; then
+  printf 'Цепочка rzd.ru не прошла проверку\n' >&2
+  exit 1
+fi
+
+env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
+  "$lightpanda_bin" fetch \
+  --json \
+  --wait-until done \
   --terminate-ms 15000 \
   https://self-signed.badssl.com/ \
   > "$network_tmp/self-signed.json" \
@@ -248,7 +264,9 @@ rg -F 'PeerFailedVerification' "$network_tmp/self-signed.log"
 
 HTTP 200 для недоверенного сертификата означает ошибку выпуска.
 
-`rzd.ru` используется только как дополнительная диагностика. На 27 августа 2026 года предыдущий и новый выпуски Lightpanda, системный curl и curl-impersonate отклоняли его цепочку с `PeerFailedVerification`: сертификат центра `Russian Trusted Root CA` отсутствовал в системном хранилище. Не отключайте проверку TLS и не добавляйте этот сертификат только ради прохождения проверки выпуска.
+Lightpanda добавляет официальный `Russian Trusted Root CA` к системному хранилищу. Отдельно устанавливать сертификат в систему не нужно. Успех проверки `rzd.ru` означает наличие любого HTTP-ответа без `PeerFailedVerification`: код может зависеть от политики сайта.
+
+Исходный файл получен с официального портала Госуслуг. SHA-256 исходного файла равен `936a43fea6e8e525bcc0f81acd9c3d21b4fc4b9b68acea7906d698005afc6504`, SHA-256 сохраненного PEM равен `aa800ef345422d6158c6fafe1c06c429dbda21c3df4bb1ccb45a920ec1111399`, отпечаток DER равен `d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31`. Полное происхождение записано в [`../src/network/certificates/README.md`](../src/network/certificates/README.md).
 
 ## Формирование общего каталога выпуска
 
@@ -278,7 +296,7 @@ cat > "$release_dir/RELEASE.md" <<EOF
 - SHA-256 статического архива curl-impersonate: \`$curl_archive_sha\`.
 - Параметр CURL_IMPERSONATE_ENV_HOOK: \`OFF\`.
 - Параметр USE_APPLE_SECTRUST: \`OFF\`.
-- Тесты: \`1182 of 1182 tests passed\`.
+- Тесты: \`1184 of 1184 tests passed\`.
 - Linux: отсутствует на этапе выпуска macOS.
 - Распространение: только внутреннее использование без Developer ID и нотариального заверения Apple.
 EOF

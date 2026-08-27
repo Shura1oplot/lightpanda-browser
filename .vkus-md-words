@@ -8,6 +8,8 @@ CLI
 IPv
 Isocline
 Lightpanda
+DER
+PEM
 OrbStack
 SecTrust
 TLS
@@ -40,3 +42,5 @@ yml
 токены
 форки
 РЖД
+Госуслуг
+Минцифры

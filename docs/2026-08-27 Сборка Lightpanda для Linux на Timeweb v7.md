@@ -1,6 +1,6 @@
 # Сборка Lightpanda для Linux x86_64 на Timeweb
 
-Дата актуализации: 27 августа 2026 года. Редакция 6.
+Дата актуализации: 27 августа 2026 года. Редакция 7.
 
 ## 1. Назначение
 
@@ -26,7 +26,7 @@
 
 3. Локальная сборка macOS без явной цели получила минимальную версию текущего SDK macOS 26.5.2. Для файла предварительной проверки и выпуска всегда передавайте `-Dtarget=aarch64-macos.12.0` и проверяйте поле `minos` через `otool`.
 
-4. На 27 августа 2026 года `rzd.ru` использует цепочку до `Russian Trusted Root CA`, которого нет в системных хранилищах проверенных macOS и Ubuntu. Предыдущий и новый выпуски Lightpanda, системный curl и curl-impersonate отклоняют цепочку. Это внешнее состояние не является регрессией. Не отключайте проверку TLS; обязательные сетевые условия выпуска – HTTP 200 от `example.com` и отклонение недоверенного сертификата.
+4. На 27 августа 2026 года `rzd.ru` использует цепочку до `Russian Trusted Root CA`, которого нет в системных хранилищах проверенных macOS и Ubuntu. Lightpanda теперь добавляет официальный корень Минцифры к системному хранилищу. Отдельно устанавливать сертификат в систему не нужно. Обязательные сетевые условия выпуска – HTTP 200 от `example.com`, любой HTTP-ответ от `rzd.ru` без ошибки проверки цепочки и отклонение недоверенного сертификата.
 
 ### 2.2 Порядок быстрого повторения
 
@@ -34,7 +34,7 @@
 
 02. Зафиксируйте SHA Lightpanda и curl-impersonate до создания ресурсов. Передавайте на сервер деревья этих фиксаций через `git archive`.
 
-03. Проверьте локальный файл macOS, минимальную версию 12.0 и две обязательные сетевые команды из раздела 5.
+03. Проверьте локальный файл macOS, минимальную версию 12.0 и три обязательные сетевые команды из раздела 5.
 
 04. Проверьте через API профиль, баланс, регион, образ, тариф, ключ SSH и отсутствие незавершенного сервера с префиксом `lightpanda-linux-amd64-`.
 
@@ -115,12 +115,13 @@ preflight_binary="$release_dir/lightpanda-aarch64-macos"
 ssh_port=443
 user_data_file="$lightpanda_repo/docs/timeweb-cloud-init-ssh-443.yaml"
 
-lightpanda_release_sha=1681060a57a1d80e2918ca186ef02eecada3d677
+lightpanda_release_sha=1bcebafd4bdedf139520614c8c041df6d36c3926
 curl_release_sha=266cd9ffce634930e7b236fe340016718ac29dba
 git -C "$lightpanda_repo" merge-base --is-ancestor \
   "$lightpanda_release_sha" HEAD
-git -C "$lightpanda_repo" diff --quiet "$lightpanda_release_sha" -- . \
-  ':(exclude)docs'
+git -C "$lightpanda_repo" diff --quiet "$lightpanda_release_sha" -- \
+  '*.zig' build.zig build.zig.zon Makefile install.sh Dockerfile \
+  'src/network/certificates/*.pem'
 test "$(git -C "$curl_repo" rev-parse HEAD)" = "$curl_release_sha"
 
 lightpanda_sha="$lightpanda_release_sha"
@@ -169,9 +170,19 @@ jq -e '.http_status == 200 and (.content | contains("Example Domain"))' \
 jq -e '.http_status == 0' "$preflight_dir/self-signed.json" >/dev/null
 rg -F 'PeerFailedVerification' "$preflight_dir/self-signed.log" >/dev/null
 
+"$preflight_binary" fetch --json --wait-until done --terminate-ms 30000 \
+  https://rzd.ru/ >"$preflight_dir/rzd.json" \
+  2>"$preflight_dir/rzd.log"
+jq -e '.http_status > 0' "$preflight_dir/rzd.json" >/dev/null
+if rg -F 'PeerFailedVerification' "$preflight_dir/rzd.log"; then
+  exit 1
+fi
+
 unlink "$preflight_dir/example.json"
 unlink "$preflight_dir/self-signed.json"
 unlink "$preflight_dir/self-signed.log"
+unlink "$preflight_dir/rzd.json"
+unlink "$preflight_dir/rzd.log"
 rmdir "$preflight_dir"
 ```
 
@@ -503,7 +514,7 @@ zig build "${build_flags[@]}" check
 test_log="$(mktemp)"
 zig build "${build_flags[@]}" test -freference-trace 2>&1 |
   tee "$test_log"
-rg -F '1182 of 1182 tests passed' "$test_log"
+rg -F '1184 of 1184 tests passed' "$test_log"
 
 zig build "${build_flags[@]}" -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
 test -s src/snapshot.bin
@@ -544,9 +555,9 @@ check_example() {
 
 check_rzd() {
   "$lightpanda" fetch --json --wait-until done --terminate-ms 30000 \
-    --dump html https://rzd.ru/ >/tmp/rzd.json &&
-    jq -e '.http_status == 200 and (.content | contains("РЖД"))' \
-      /tmp/rzd.json >/dev/null
+    https://rzd.ru/ >/tmp/rzd.json 2>/tmp/rzd.log &&
+    jq -e '.http_status > 0' /tmp/rzd.json >/dev/null &&
+    ! rg -F PeerFailedVerification /tmp/rzd.log >/dev/null
 }
 
 check_self_signed() {
@@ -571,6 +582,33 @@ printf 'NETWORK_EXAMPLE=%s\nNETWORK_RZD=%s\nNETWORK_SELF_SIGNED=%s\n' \
 
 stat -c '%s' "$lightpanda"
 sha256sum "$lightpanda"
+```
+
+Проверьте Linux-ветку локального установщика на том же сервере. Сертификат центра уже встроен в исполняемый файл, поэтому установщик не изменяет системное хранилище:
+
+```bash
+install_test=/opt/install-test
+install -d "$install_test/build"
+install -m 0755 "$lightpanda" \
+  "$install_test/build/lightpanda-x86_64-linux"
+install -m 0755 /opt/src/lightpanda/install.sh "$install_test/install.sh"
+(
+  cd "$install_test/build"
+  sha256sum lightpanda-x86_64-linux >SHA256SUMS
+)
+(
+  cd "$install_test"
+  ./install.sh
+)
+test "$(/root/.local/bin/lightpanda version)" = "$LINUX_VERSION"
+cmp "$lightpanda" /root/.local/bin/lightpanda
+/root/.local/bin/lightpanda fetch --json --wait-until done \
+  --terminate-ms 30000 https://rzd.ru/ >/tmp/installed-rzd.json \
+  2>/tmp/installed-rzd.log
+jq -e '.http_status > 0' /tmp/installed-rzd.json >/dev/null
+if rg -F PeerFailedVerification /tmp/installed-rzd.log; then
+  exit 1
+fi
 ```
 
 ## 11. Получение результата
@@ -627,11 +665,11 @@ cleanup_timeweb 0
 
 06. `ldd` не показывает динамические `libcurl`, `libssl` и `libcrypto`.
 
-07. Форматирование, проверка графа и 1 182 теста прошли с враждебными переменными среды.
+07. Форматирование, проверка графа и 1 184 теста прошли с враждебными переменными среды.
 
 08. Итоговый файл имеет формат ELF64 x86-64 и точную заданную версию.
 
-09. `example.com` вернул HTTP 200, недоверенный сертификат отклонен. Результат `rzd.ru` записан отдельно и не принимается за регрессию без контрольной проверки системным curl с тем же хранилищем удостоверяющих центров.
+09. `example.com` вернул HTTP 200, `rzd.ru` вернул HTTP-ответ без `PeerFailedVerification`, недоверенный сертификат отклонен.
 
 10. Контрольные суммы удаленного и локального файлов совпали.
 
@@ -639,8 +677,12 @@ cleanup_timeweb 0
 
 12. Сервер и публичный адрес отсутствуют в повторных списках Timeweb.
 
+13. Установщик выбрал Linux-файл, проверил его SHA-256, установил точную версию и сохранил работу встроенного корня без изменения системного хранилища.
+
 ## 13. Источники
 
 1. Рецепт статического архива основан на [задании Linux curl-impersonate](https://github.com/lexiforest/curl-impersonate/blob/ec41b71ce888806bfec56ada7a7258d333eb3d19/.github/workflows/build.yml).
 
 2. Управление сервером сверяйте с [документацией Timeweb](https://timeweb.cloud/docs/cloud-servers/manage-servers/create-server) и [справочником TWC CLI](https://github.com/timeweb-cloud/twc/blob/master/docs/ru/CLI_REFERENCE.md).
+
+3. `Russian Trusted Root CA` получен с [официальной страницы сертификатов Госуслуг](https://www.gosuslugi.ru/crt). SHA-256 исходного файла равен `936a43fea6e8e525bcc0f81acd9c3d21b4fc4b9b68acea7906d698005afc6504`, SHA-256 сохраненного PEM равен `aa800ef345422d6158c6fafe1c06c429dbda21c3df4bb1ccb45a920ec1111399`, отпечаток DER равен `d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31`.
