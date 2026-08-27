@@ -1,6 +1,6 @@
 # Сборка Lightpanda для Linux x86_64 на Timeweb
 
-Дата актуализации: 10 августа 2026 года. Редакция 5.
+Дата актуализации: 27 августа 2026 года. Редакция 6.
 
 ## 1. Назначение
 
@@ -16,7 +16,7 @@
 
 6. Один разрешенный цикл использует один сервер и его автоматически назначенный адрес. Сбой отдельного сетевого запроса не является основанием для создания нового сервера.
 
-## 2. Опыт запуска 10 августа 2026 года
+## 2. Опыт запусков 10 и 27 августа 2026 года
 
 ### 2.1 Причины повторных попыток
 
@@ -26,7 +26,7 @@
 
 3. Локальная сборка macOS без явной цели получила минимальную версию текущего SDK macOS 26.5.2. Для файла предварительной проверки и выпуска всегда передавайте `-Dtarget=aarch64-macos.12.0` и проверяйте поле `minos` через `otool`.
 
-4. `rzd.ru` может записывать предупреждения об интерфейсах документа, которые браузер не поддерживает, при успешном получении страницы. Приемка опирается на HTTP 200, маркер РЖД в HTML и отдельное отклонение недоверенного сертификата. Отсутствие предупреждений не является условием приемки.
+4. На 27 августа 2026 года `rzd.ru` использует цепочку до `Russian Trusted Root CA`, которого нет в системных хранилищах проверенных macOS и Ubuntu. Предыдущий и новый выпуски Lightpanda, системный curl и curl-impersonate отклоняют цепочку. Это внешнее состояние не является регрессией. Не отключайте проверку TLS; обязательные сетевые условия выпуска – HTTP 200 от `example.com` и отклонение недоверенного сертификата.
 
 ### 2.2 Порядок быстрого повторения
 
@@ -34,7 +34,7 @@
 
 02. Зафиксируйте SHA Lightpanda и curl-impersonate до создания ресурсов. Передавайте на сервер деревья этих фиксаций через `git archive`.
 
-03. Проверьте локальный файл macOS, минимальную версию 12.0 и три точные сетевые команды из раздела 5.
+03. Проверьте локальный файл macOS, минимальную версию 12.0 и две обязательные сетевые команды из раздела 5.
 
 04. Проверьте через API профиль, баланс, регион, образ, тариф, ключ SSH и отсутствие незавершенного сервера с префиксом `lightpanda-linux-amd64-`.
 
@@ -82,7 +82,7 @@
 
 ## 4. Проверенная конфигурация
 
-На 10 августа 2026 года использовались следующие параметры:
+На 27 августа 2026 года повторно проверены следующие параметры:
 
 1. Учетная запись имеет идентификатор `cg76969`.
 
@@ -115,7 +115,7 @@ preflight_binary="$release_dir/lightpanda-aarch64-macos"
 ssh_port=443
 user_data_file="$lightpanda_repo/docs/timeweb-cloud-init-ssh-443.yaml"
 
-lightpanda_release_sha=a0e1a2906d1e46edfaeeb1ad97303114625e114e
+lightpanda_release_sha=1681060a57a1d80e2918ca186ef02eecada3d677
 curl_release_sha=266cd9ffce634930e7b236fe340016718ac29dba
 git -C "$lightpanda_repo" merge-base --is-ancestor \
   "$lightpanda_release_sha" HEAD
@@ -152,7 +152,7 @@ test "$(tr -d '\r\n' <"$HOME/.ssh/id_ed25519.pub")" = "$(jq -r '.ssh_keys[] | se
 unset ssh_key_json
 ```
 
-До установки обработчика очистки и создания сервера проверьте точный синтаксис сетевых команд:
+До установки обработчика очистки и создания сервера проверьте точный синтаксис обязательных сетевых команд:
 
 ```bash
 test -x "$preflight_binary"
@@ -163,11 +163,6 @@ preflight_dir="$(mktemp -d)"
 jq -e '.http_status == 200 and (.content | contains("Example Domain"))' \
   "$preflight_dir/example.json" >/dev/null
 
-"$preflight_binary" fetch --json --wait-until done --terminate-ms 30000 \
-  --dump html https://rzd.ru/ >"$preflight_dir/rzd.json"
-jq -e '.http_status == 200 and (.content | contains("РЖД"))' \
-  "$preflight_dir/rzd.json" >/dev/null
-
 "$preflight_binary" fetch --json --wait-until done --terminate-ms 15000 \
   https://self-signed.badssl.com/ >"$preflight_dir/self-signed.json" \
   2>"$preflight_dir/self-signed.log"
@@ -175,7 +170,6 @@ jq -e '.http_status == 0' "$preflight_dir/self-signed.json" >/dev/null
 rg -F 'PeerFailedVerification' "$preflight_dir/self-signed.log" >/dev/null
 
 unlink "$preflight_dir/example.json"
-unlink "$preflight_dir/rzd.json"
 unlink "$preflight_dir/self-signed.json"
 unlink "$preflight_dir/self-signed.log"
 rmdir "$preflight_dir"
@@ -504,12 +498,12 @@ build_flags=(
 export CURL_IMPERSONATE=lightpanda-invalid-profile
 export CURL_IMPERSONATE_HEADERS=lightpanda-invalid-headers
 
-zig fmt --check ./*.zig ./**/*.zig
+rg --files -g '*.zig' -0 | xargs -0 zig fmt --check
 zig build "${build_flags[@]}" check
 test_log="$(mktemp)"
 zig build "${build_flags[@]}" test -freference-trace 2>&1 |
   tee "$test_log"
-rg -F '1156 of 1156 tests passed' "$test_log"
+rg -F '1182 of 1182 tests passed' "$test_log"
 
 zig build "${build_flags[@]}" -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin
 test -s src/snapshot.bin
@@ -585,7 +579,6 @@ sha256sum "$lightpanda"
 
 ```bash
 install -d "$release_dir"
-test ! -e "$local_binary"
 local_partial="$release_dir/.lightpanda-x86_64-linux.partial"
 test ! -e "$local_partial"
 
@@ -601,14 +594,12 @@ local_sha="$(shasum -a 256 "$local_partial" | awk '{print $1}')"
 test "$remote_sha" = "$local_sha"
 rg -F 'NETWORK_EXAMPLE=pass' \
   "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
-rg -F 'NETWORK_RZD=pass' \
-  "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
 rg -F 'NETWORK_SELF_SIGNED=pass' \
   "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
 unlink "$release_dir/.lightpanda-x86_64-linux-network-status.txt"
 
 chmod 0755 "$local_partial"
-mv "$local_partial" "$local_binary"
+mv -f "$local_partial" "$local_binary"
 
 file "$local_binary" | rg 'ELF 64-bit.*x86-64'
 shasum -a 256 "$local_binary"
@@ -636,11 +627,11 @@ cleanup_timeweb 0
 
 06. `ldd` не показывает динамические `libcurl`, `libssl` и `libcrypto`.
 
-07. Форматирование, проверка графа и 1 156 тестов прошли с враждебными переменными среды.
+07. Форматирование, проверка графа и 1 182 теста прошли с враждебными переменными среды.
 
 08. Итоговый файл имеет формат ELF64 x86-64 и точную заданную версию.
 
-09. `example.com` и `rzd.ru` вернули HTTP 200, недоверенный сертификат отклонен.
+09. `example.com` вернул HTTP 200, недоверенный сертификат отклонен. Результат `rzd.ru` записан отдельно и не принимается за регрессию без контрольной проверки системным curl с тем же хранилищем удостоверяющих центров.
 
 10. Контрольные суммы удаленного и локального файлов совпали.
 

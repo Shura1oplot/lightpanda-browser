@@ -1,19 +1,19 @@
 # Сборка выпуска Lightpanda для macOS arm64
 
-Дата актуализации: 10 августа 2026 года. Редакция 3.
+Дата актуализации: 27 августа 2026 года. Редакция 4.
 
 ## Периметр
 
 Инструкция создает выпуск `Lightpanda` для компьютера с `Darwin arm64`. Итоговый файл содержит статически связанную библиотеку `curl-impersonate`, которая программно применяет профиль Chrome 146 к каждому соединению и не принимает профиль из переменных среды.
 
-Сборка для Linux не входит в этот этап. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-10%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v5.md).
+Сборка для Linux не входит в этот этап. Для нее действует [отдельная инструкция по нативной сборке на Timeweb](2026-08-27%20%D0%A1%D0%B1%D0%BE%D1%80%D0%BA%D0%B0%20Lightpanda%20%D0%B4%D0%BB%D1%8F%20Linux%20%D0%BD%D0%B0%20Timeweb%20v6.md).
 
 ## Обязательные фиксации
 
-| Каталог            | Обязательная фиксация                      | Назначение                                                                      |
-| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------- |
-| `lightpanda`       | `a0e1a2906d1e46edfaeeb1ad97303114625e114e` | Статическая библиотека `curl-impersonate` и программный профиль каждого запроса |
-| `curl-impersonate` | `266cd9ffce634930e7b236fe340016718ac29dba` | Отключение Apple `SecTrust` и обработчика переменных среды                      |
+| Каталог            | Обязательная фиксация                      | Назначение                                                                     |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------ |
+| `lightpanda`       | `1681060a57a1d80e2918ca186ef02eecada3d677` | Стабильный выпуск 0.3.7, статическая библиотека и программный профиль запросов |
+| `curl-impersonate` | `266cd9ffce634930e7b236fe340016718ac29dba` | Отключение Apple `SecTrust` и обработчика переменных среды                     |
 
 Фиксация `lightpanda` должна содержать изменения `Link curl-impersonate as external static library` и `Apply Chrome impersonation to every HTTP connection`. Полный SHA используемого `HEAD` записывается в итоговый `RELEASE.md`.
 
@@ -30,7 +30,7 @@ curl_root="$workspace/curl-impersonate"
 release_dir="$lightpanda_root/build"
 release_bin="$release_dir/lightpanda-aarch64-macos"
 
-lightpanda_required=a0e1a2906d1e46edfaeeb1ad97303114625e114e
+lightpanda_required=1681060a57a1d80e2918ca186ef02eecada3d677
 curl_required=266cd9ffce634930e7b236fe340016718ac29dba
 
 test "$(uname -s)" = Darwin
@@ -149,7 +149,7 @@ CURL_IMPERSONATE_HEADERS=no \
 
 ## Сборка Lightpanda
 
-Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1 156 тестов:
+Загрузите архив V8, проверьте форматирование и граф сборки, затем выполните 1 182 теста:
 
 ```bash
 cd "$lightpanda_root"
@@ -169,14 +169,14 @@ build_flags=(
   "-Dcurl_impersonate_include=$curl_include"
 )
 
-zig fmt --check ./*.zig ./**/*.zig
+git ls-files -z '*.zig' | xargs -0 zig fmt --check
 zig build "${build_flags[@]}" check
 
 test_log="$(mktemp)"
 CURL_IMPERSONATE=lightpanda-invalid-profile \
 CURL_IMPERSONATE_HEADERS=lightpanda-invalid-headers \
   zig build "${build_flags[@]}" test -freference-trace 2>&1 | tee "$test_log"
-rg -F '1156 of 1156 tests passed' "$test_log"
+rg -F '1182 of 1182 tests passed' "$test_log"
 ```
 
 Создайте `src/snapshot.bin`, затем соберите исполняемый файл в режиме `ReleaseFast` с теми же явными путями:
@@ -237,18 +237,6 @@ env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
   "$lightpanda_bin" fetch \
   --json \
   --wait-until done \
-  --dump html \
-  https://rzd.ru/ \
-  > "$network_tmp/rzd.json"
-
-jq -e \
-  '.http_status == 200 and (.content | contains("РЖД"))' \
-  "$network_tmp/rzd.json"
-
-env -u CURL_IMPERSONATE -u CURL_IMPERSONATE_HEADERS \
-  "$lightpanda_bin" fetch \
-  --json \
-  --wait-until done \
   --terminate-ms 15000 \
   https://self-signed.badssl.com/ \
   > "$network_tmp/self-signed.json" \
@@ -259,6 +247,8 @@ rg -F 'PeerFailedVerification' "$network_tmp/self-signed.log"
 ```
 
 HTTP 200 для недоверенного сертификата означает ошибку выпуска.
+
+`rzd.ru` используется только как дополнительная диагностика. На 27 августа 2026 года предыдущий и новый выпуски Lightpanda, системный curl и curl-impersonate отклоняли его цепочку с `PeerFailedVerification`: сертификат центра `Russian Trusted Root CA` отсутствовал в системном хранилище. Не отключайте проверку TLS и не добавляйте этот сертификат только ради прохождения проверки выпуска.
 
 ## Формирование общего каталога выпуска
 
@@ -279,7 +269,7 @@ curl_archive_sha="$(shasum -a 256 "$curl_archive" | cut -d ' ' -f 1)"
 cat > "$release_dir/RELEASE.md" <<EOF
 # Выпуск Lightpanda
 
-- Дата: 2026-08-10.
+- Дата: 2026-08-27.
 - Файл macOS arm64: \`lightpanda-aarch64-macos\`.
 - Минимальная версия из заголовка Mach-O: macOS \`$macos_minos\`.
 - Фиксация Lightpanda: \`$lightpanda_source_commit\`.
@@ -288,7 +278,7 @@ cat > "$release_dir/RELEASE.md" <<EOF
 - SHA-256 статического архива curl-impersonate: \`$curl_archive_sha\`.
 - Параметр CURL_IMPERSONATE_ENV_HOOK: \`OFF\`.
 - Параметр USE_APPLE_SECTRUST: \`OFF\`.
-- Тесты: \`1156 of 1156 tests passed\`.
+- Тесты: \`1182 of 1182 tests passed\`.
 - Linux: отсутствует на этапе выпуска macOS.
 - Распространение: только внутреннее использование без Developer ID и нотариального заверения Apple.
 EOF
