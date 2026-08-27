@@ -196,7 +196,7 @@ const CommonOptions = .{
     .{ .name = "web_bot_auth_key_file", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_keyid", .type = ?[]const u8 },
     .{ .name = "web_bot_auth_domain", .type = ?[]const u8 },
-    .{ .name = "user_agent", .type = ?[]const u8 },
+    .{ .name = "user_agent", .type = ?[]const u8, .validator = userAgentValidator },
     .{ .name = "block_private_networks", .type = bool },
     .{ .name = "block_cidrs", .type = ?[]const u8 },
     .{ .name = "block_urls", .type = ?[]const u8 },
@@ -664,10 +664,39 @@ pub fn port(self: *const Config) u16 {
 
 pub fn advertiseHost(self: *const Config) []const u8 {
     return switch (self.mode) {
-        .serve => |opts| opts.advertise_host orelse opts.host,
+        .serve => |opts| opts.advertise_host orelse advertiseHostFallback(opts.host),
         .mcp => "127.0.0.1",
         else => unreachable,
     };
+}
+
+// Wildcard bind addresses (0.0.0.0, ::) are not routable for clients
+// resolving /json/version. Fall back to a loopback address so the
+// advertised webSocketDebuggerUrl is at least connectable from the same
+// host (covers the official Docker image, which exposes 9222 via the
+// container's published port, and the WSL localhost bridge).
+// For remote hosts, users can still pin the URL with --advertise-host.
+// See issue #1922.
+fn advertiseHostFallback(host: []const u8) []const u8 {
+    if (isHostWildcard(host)) {
+        return "127.0.0.1";
+    }
+    return host;
+}
+
+// True when serve is binding a wildcard address (e.g. Docker --host
+// 0.0.0.0) without an explicit --advertise-host. /json/version replaces
+// the wildcard with 127.0.0.1 in advertiseHostFallback so the URL stays
+// resolvable, but the caller still benefits from emitting a guidance log.
+pub fn bindIsWildcard(self: *const Config) bool {
+    return switch (self.mode) {
+        .serve => |opts| opts.advertise_host == null and isHostWildcard(opts.host),
+        else => false,
+    };
+}
+
+fn isHostWildcard(host: []const u8) bool {
+    return std.mem.eql(u8, host, "0.0.0.0") or std.mem.eql(u8, host, "::");
 }
 
 pub fn webBotAuth(self: *const Config) ?WebBotAuthConfig {
@@ -1041,6 +1070,72 @@ test "Config: serve exposes cookie jar file" {
     defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("cookies.json", config.cookieJarFile().?);
+}
+
+// /json/version must never advertise a wildcard bind address because
+// clients (Chromedp, Playwright MCP, etc.) cannot dial 0.0.0.0/::. See
+// issue #1922.
+test "Config: advertiseHost falls back to loopback for wildcard binds" {
+    {
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+            .host = "0.0.0.0",
+        } });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expect(config.bindIsWildcard());
+        try std.testing.expectEqualStrings("127.0.0.1", config.advertiseHost());
+    }
+    {
+        var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+            .host = "::",
+        } });
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expect(config.bindIsWildcard());
+        try std.testing.expectEqualStrings("127.0.0.1", config.advertiseHost());
+    }
+}
+
+test "Config: advertiseHost honors explicit --advertise-host override" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .host = "0.0.0.0",
+        .advertise_host = "192.168.0.5",
+    } });
+    defer config.deinit(std.testing.allocator);
+    // The explicit --advertise-host silences the wildcard guidance log.
+    try std.testing.expect(!config.bindIsWildcard());
+    try std.testing.expectEqualStrings("192.168.0.5", config.advertiseHost());
+}
+
+test "Config: advertiseHost preserves concrete host when not a wildcard" {
+    var config = try Config.init(std.testing.allocator, "test", .{ .serve = .{
+        .host = "127.0.0.1",
+    } });
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expect(!config.bindIsWildcard());
+    try std.testing.expectEqualStrings("127.0.0.1", config.advertiseHost());
+}
+
+test "Config: parseArgs refuses a mozilla user-agent" {
+    log.expectLog(&.{.app});
+    const argv = [_][*:0]const u8{ "lightpanda", "fetch", "--user-agent", "mozilla/1.0" };
+    const proc_args: std.process.Args = .{ .vector = &argv };
+    try std.testing.expectError(error.InvalidArgument, parseArgs(std.testing.allocator, proc_args));
+}
+
+test "Config: validateUserAgent" {
+    try validateUserAgent("Lightpanda/1.0");
+    try std.testing.expectError(error.Reserved, validateUserAgent("mozilla/1.0"));
+    try std.testing.expectError(error.Reserved, validateUserAgent("Mozilla/5.0"));
+    try std.testing.expectError(error.NonPrintable, validateUserAgent("bad\x01ua"));
+}
+
+fn userAgentValidator(allocator: Allocator, args: *std.process.Args.Iterator, ua: *?[]const u8) !void {
+    const str = args.next() orelse return error.MissingArgument;
+    validateUserAgent(str) catch |err| {
+        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
+        return error.InvalidArgument;
+    };
+
+    ua.* = try allocator.dupe(u8, str);
 }
 
 pub fn validateUserAgent(ua: []const u8) !void {

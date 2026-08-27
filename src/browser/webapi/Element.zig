@@ -20,10 +20,11 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const js = @import("../js/js.zig");
+const dump = @import("../dump.zig");
 const Frame = @import("../Frame.zig");
+const reflect = @import("../reflect.zig");
 const Factory = @import("../Factory.zig");
 const StyleManager = @import("../StyleManager.zig");
-const reflect = @import("../reflect.zig");
 
 const CSS = @import("CSS.zig");
 const Node = @import("Node.zig");
@@ -131,8 +132,19 @@ pub const Namespace = enum(u8) {
     }
 };
 
+pub const Flags = packed struct(u8) {
+    shadow_host: bool = false,
+    customized_builtin: bool = false,
+    _unused: u6 = 0,
+};
+
 _type: Type,
 _namespace: Namespace = .html,
+// Presence hints for the frame's element-keyed side tables: a set bit means
+// "maybe in the map" (the map stays the authority), a clear bit skips the
+// lookup. Turns the per-element map probe in tree walks into a bit test on
+// memory the walk already touches. Fits in existing struct padding.
+_flags: Flags = .{},
 _attributes: Attribute.List = .{},
 // In debug, set so that we can check that we have a proper contiguous block
 // of memory for the entire chain (and thus, simple pointer arithmetics will
@@ -518,7 +530,6 @@ pub fn insertAdjacentHTML(
 }
 
 pub fn getOuterHTML(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
-    const dump = @import("../dump.zig");
     return dump.deep(self.asNode(), .{ .shadow = .skip }, writer, frame);
 }
 
@@ -557,7 +568,6 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
     const next_sibling = node.nextSibling();
 
     if (fragment) |frag| {
-        const dest_connected = parent.isConnected();
         var it = frag.childrenIterator();
         while (it.next()) |child| {
             if (node._parent != parent) {
@@ -566,7 +576,7 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
             if (notify) {
                 try added.append(frame.call_arena, child);
             }
-            frame.removeNode(frag, child, .{ .will_be_reconnected = dest_connected, .notify_observers = false });
+            frame.removeNode(frag, child, .{ .reconnect_to = parent, .notify_observers = false });
             try frame.insertNodeRelative(parent, child, .{ .before = node }, .{ .notify_observers = false });
         }
     }
@@ -574,7 +584,7 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
     if (node._parent != parent) {
         return error.NotFound;
     }
-    frame.removeNode(parent, node, .{ .will_be_reconnected = false, .notify_observers = false });
+    frame.removeNode(parent, node, .{ .reconnect_to = null, .notify_observers = false });
 
     if (notify) {
         const removed = [_]*Node{node};
@@ -583,8 +593,11 @@ pub fn setOuterHTML(self: *Element, html: []const u8, frame: *Frame) !void {
 }
 
 pub fn getInnerHTML(self: *Element, writer: *std.Io.Writer, frame: *Frame) !void {
-    const dump = @import("../dump.zig");
     return dump.children(self.asNode(), .{ .shadow = .skip }, writer, frame);
+}
+
+pub fn getHTML(self: *Element, opts: dump.Opts.Shadow.Declarative, writer: *std.Io.Writer, frame: *Frame) !void {
+    return dump.getHTML(self.asNode(), opts, writer, frame);
 }
 
 pub fn setInnerHTML(self: *Element, html: []const u8, frame: *Frame) !void {
@@ -620,31 +633,6 @@ pub fn getDir(self: *const Element) []const u8 {
 
 pub fn setDir(self: *Element, value: []const u8, frame: *Frame) !void {
     return self.setAttributeSafe(comptime .wrap("dir"), .wrap(value), frame);
-}
-
-// ARIAMixin - ARIA attribute reflection
-pub fn getAriaAtomic(self: *const Element) ?[]const u8 {
-    return self.getAttributeSafe(comptime .wrap("aria-atomic"));
-}
-
-pub fn setAriaAtomic(self: *Element, value: ?[]const u8, frame: *Frame) !void {
-    if (value) |v| {
-        try self.setAttributeSafe(comptime .wrap("aria-atomic"), .wrap(v), frame);
-    } else {
-        try self.removeAttribute(comptime .wrap("aria-atomic"), frame);
-    }
-}
-
-pub fn getAriaLive(self: *const Element) ?[]const u8 {
-    return self.getAttributeSafe(comptime .wrap("aria-live"));
-}
-
-pub fn setAriaLive(self: *Element, value: ?[]const u8, frame: *Frame) !void {
-    if (value) |v| {
-        try self.setAttributeSafe(comptime .wrap("aria-live"), .wrap(v), frame);
-    } else {
-        try self.removeAttribute(comptime .wrap("aria-live"), frame);
-    }
 }
 
 pub fn getClassName(self: *const Element) []const u8 {
@@ -813,7 +801,7 @@ pub fn setAttributeSafe(self: *Element, name: String, value: String, frame: *Fra
 }
 
 pub fn getShadowRoot(self: *Element, frame: *Frame) ?*ShadowRoot {
-    const shadow_root = frame._element_shadow_roots.get(self) orelse return null;
+    const shadow_root = self.hostedShadowRoot(frame) orelse return null;
     if (shadow_root._mode == .closed) return null;
     return shadow_root;
 }
@@ -850,7 +838,7 @@ pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Fram
         }
     }
 
-    if (frame._element_shadow_roots.get(self)) |existing| {
+    if (self.hostedShadowRoot(frame)) |existing| {
         // Imperative attachShadow over a declarative shadow root with a matching
         // mode empties it and returns the same root. The parser
         // (opts.declarative) never replaces an existing root.
@@ -864,7 +852,18 @@ pub fn attachShadow(self: *Element, opts: ShadowRoot.AttachOptions, frame: *Fram
 
     const shadow_root = try ShadowRoot.init(self, opts, frame);
     try frame._element_shadow_roots.put(frame.arena, self, shadow_root);
+    self._flags.shadow_host = true;
     return shadow_root;
+}
+
+// The shadow root this element hosts, closed ones included (the JS-facing
+// getShadowRoot filters those). The flag check skips the map probe for the
+// overwhelming majority of elements, which host nothing.
+pub fn hostedShadowRoot(self: *Element, frame: *const Frame) ?*ShadowRoot {
+    if (!self._flags.shadow_host) {
+        return null;
+    }
+    return frame._element_shadow_roots.get(self);
 }
 
 pub fn insertAdjacentElement(
@@ -1035,8 +1034,6 @@ pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame
     const parent = ref_node._parent orelse return;
     frame.domChanged();
 
-    const parent_is_connected = parent.isConnected();
-
     // Detect if the ref_node must be removed (by default) or kept.
     // We kept it when ref_node is present into the nodes list.
     var rm_ref_node = true;
@@ -1056,22 +1053,24 @@ pub fn replaceWith(self: *Element, nodes: []const Node.NodeOrText, frame: *Frame
             continue;
         }
 
+        var previous_root: ?*Node = null;
         if (child._parent) |current_parent| {
-            frame.removeNode(current_parent, child, .{ .will_be_reconnected = parent_is_connected });
+            previous_root = child.getRootNode(.{});
+            frame.removeNode(current_parent, child, .{ .reconnect_to = parent });
         }
 
         try frame.insertNodeRelative(
             parent,
             child,
             .{ .before = ref_node },
-            .{ .child_already_connected = child.isConnected() },
+            .{ .previous_root = previous_root },
         );
     }
 
     // Re-check parent after insertNodeRelative since callbacks (e.g. connectedCallback)
     // could have already removed ref_node from parent.
     if (rm_ref_node and ref_node._parent == parent) {
-        frame.removeNode(parent, ref_node, .{ .will_be_reconnected = false });
+        frame.removeNode(parent, ref_node, .{ .reconnect_to = null });
     }
 }
 
@@ -1079,7 +1078,7 @@ pub fn remove(self: *Element, frame: *Frame) void {
     const node = self.asNode();
     const parent = node._parent orelse return;
     frame.domChanged();
-    frame.removeNode(parent, node, .{ .will_be_reconnected = false });
+    frame.removeNode(parent, node, .{ .reconnect_to = null });
 }
 
 pub fn focus(self: *Element, frame: *Frame) !void {
@@ -1787,7 +1786,7 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
 
     // Per spec, a clonable shadow root is cloned along with its host — its
     // children always deep-cloned, even when the host clone is shallow.
-    if (frame._element_shadow_roots.get(self)) |shadow| {
+    if (self.hostedShadowRoot(frame)) |shadow| {
         if (shadow._clonable) {
             const cloned_shadow = node.as(Element).attachShadow(.{
                 .mode = shadow._mode,
@@ -1802,7 +1801,7 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
             var shadow_child_it = shadow.asNode().childrenIterator();
             while (shadow_child_it.next()) |child| {
                 if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
-                    try frame.appendNode(cloned_shadow_node, cloned_child, .{ .child_already_connected = true });
+                    try frame.appendNode(cloned_shadow_node, cloned_child, .{});
                 }
             }
         }
@@ -1812,10 +1811,7 @@ pub fn clone(self: *Element, deep: bool, frame: *Frame) !*Node {
         var child_it = self.asNode().childrenIterator();
         while (child_it.next()) |child| {
             if (try child.cloneNodeForAppending(true, frame)) |cloned_child| {
-                // We pass `true` to `child_already_connected` as a hacky optimization
-                // We _know_ this child isn't connected (Because the parent isn't connected)
-                // setting this to `true` skips all connection checks.
-                try frame.appendNode(node, cloned_child, .{ .child_already_connected = true });
+                try frame.appendNode(node, cloned_child, .{});
             }
         }
     }
@@ -2333,6 +2329,21 @@ pub const JsApi = struct {
         return self.setInnerHTML(if (value.isNull()) "" else try value.toZig([]const u8), frame);
     }
 
+    pub const getHTML = bridge.function(_getHTML, .{});
+    const GetHTMLOpts = struct {
+        serializableShadowRoots: bool = false,
+        shadowRoots: []const *ShadowRoot = &.{},
+    };
+    fn _getHTML(self: *Element, opts_: ?GetHTMLOpts, frame: *Frame) ![]const u8 {
+        const opts = opts_ orelse GetHTMLOpts{};
+        var buf = std.Io.Writer.Allocating.init(frame.local_arena);
+        try self.getHTML(.{
+            .shadow_roots = opts.shadowRoots,
+            .serializable_shadow_roots = opts.serializableShadowRoots,
+        }, &buf.writer, frame);
+        return buf.written();
+    }
+
     pub const prefix = bridge.accessor(Element._prefix, null, .{});
 
     pub const setAttribute = bridge.function(_setAttribute, .{ .ce_reactions = true });
@@ -2348,8 +2359,50 @@ pub const JsApi = struct {
     pub const localName = bridge.accessor(Element.getLocalName, null, .{});
     pub const id = bridge.accessor(Element.getId, Element.setId, .{ .ce_reactions = true });
     pub const slot = bridge.accessor(Element.getSlot, Element.setSlot, .{ .ce_reactions = true });
-    pub const ariaAtomic = bridge.accessor(Element.getAriaAtomic, Element.setAriaAtomic, .{ .ce_reactions = true });
-    pub const ariaLive = bridge.accessor(Element.getAriaLive, Element.setAriaLive, .{ .ce_reactions = true });
+    pub const role = ariaAccessor("role");
+    pub const ariaAtomic = ariaAccessor("aria-atomic");
+    pub const ariaAutoComplete = ariaAccessor("aria-autocomplete");
+    pub const ariaBrailleLabel = ariaAccessor("aria-braillelabel");
+    pub const ariaBrailleRoleDescription = ariaAccessor("aria-brailleroledescription");
+    pub const ariaBusy = ariaAccessor("aria-busy");
+    pub const ariaChecked = ariaAccessor("aria-checked");
+    pub const ariaColCount = ariaAccessor("aria-colcount");
+    pub const ariaColIndex = ariaAccessor("aria-colindex");
+    pub const ariaColIndexText = ariaAccessor("aria-colindextext");
+    pub const ariaColSpan = ariaAccessor("aria-colspan");
+    pub const ariaCurrent = ariaAccessor("aria-current");
+    pub const ariaDescription = ariaAccessor("aria-description");
+    pub const ariaDisabled = ariaAccessor("aria-disabled");
+    pub const ariaExpanded = ariaAccessor("aria-expanded");
+    pub const ariaHasPopup = ariaAccessor("aria-haspopup");
+    pub const ariaHidden = ariaAccessor("aria-hidden");
+    pub const ariaInvalid = ariaAccessor("aria-invalid");
+    pub const ariaKeyShortcuts = ariaAccessor("aria-keyshortcuts");
+    pub const ariaLabel = ariaAccessor("aria-label");
+    pub const ariaLevel = ariaAccessor("aria-level");
+    pub const ariaLive = ariaAccessor("aria-live");
+    pub const ariaModal = ariaAccessor("aria-modal");
+    pub const ariaMultiLine = ariaAccessor("aria-multiline");
+    pub const ariaMultiSelectable = ariaAccessor("aria-multiselectable");
+    pub const ariaOrientation = ariaAccessor("aria-orientation");
+    pub const ariaPlaceholder = ariaAccessor("aria-placeholder");
+    pub const ariaPosInSet = ariaAccessor("aria-posinset");
+    pub const ariaPressed = ariaAccessor("aria-pressed");
+    pub const ariaReadOnly = ariaAccessor("aria-readonly");
+    pub const ariaRelevant = ariaAccessor("aria-relevant");
+    pub const ariaRequired = ariaAccessor("aria-required");
+    pub const ariaRoleDescription = ariaAccessor("aria-roledescription");
+    pub const ariaRowCount = ariaAccessor("aria-rowcount");
+    pub const ariaRowIndex = ariaAccessor("aria-rowindex");
+    pub const ariaRowIndexText = ariaAccessor("aria-rowindextext");
+    pub const ariaRowSpan = ariaAccessor("aria-rowspan");
+    pub const ariaSelected = ariaAccessor("aria-selected");
+    pub const ariaSetSize = ariaAccessor("aria-setsize");
+    pub const ariaSort = ariaAccessor("aria-sort");
+    pub const ariaValueMax = ariaAccessor("aria-valuemax");
+    pub const ariaValueMin = ariaAccessor("aria-valuemin");
+    pub const ariaValueNow = ariaAccessor("aria-valuenow");
+    pub const ariaValueText = ariaAccessor("aria-valuetext");
     pub const dir = bridge.accessor(Element.getDir, Element.setDir, .{ .ce_reactions = true });
     pub const className = bridge.accessor(Element.getClassName, Element.setClassName, .{ .ce_reactions = true });
     pub const classList = bridge.accessor(Element.getClassList, Element.setClassList, .{ .ce_reactions = true });
@@ -2416,6 +2469,7 @@ pub const JsApi = struct {
     pub const previousElementSibling = bridge.accessor(Element.previousElementSibling, null, .{});
     pub const childElementCount = bridge.accessor(Element.getChildElementCount, null, .{});
     pub const matches = bridge.function(Element.matches, .{});
+    pub const webkitMatchesSelector = bridge.function(Element.matches, .{});
     pub const querySelector = bridge.function(Element.querySelector, .{});
     pub const querySelectorAll = bridge.function(Element.querySelectorAll, .{});
     pub const closest = bridge.function(Element.closest, .{});
@@ -2448,6 +2502,23 @@ pub const JsApi = struct {
     pub const scroll = bridge.function(Element.scrollTo, .{});
     pub const scrollTo = bridge.function(Element.scrollTo, .{});
     pub const scrollBy = bridge.function(Element.scrollBy, .{});
+
+    fn ariaAccessor(comptime attr: []const u8) js.bridge.Accessor {
+        const R = struct {
+            pub fn get(self: *const Element) ?[]const u8 {
+                return self.getAttributeSafe(.wrap(attr));
+            }
+
+            pub fn set(self: *Element, value: ?[]const u8, frame: *Frame) !void {
+                if (value) |v| {
+                    try self.setAttributeSafe(.wrap(attr), .wrap(v), frame);
+                } else {
+                    try self.removeAttribute(.wrap(attr), frame);
+                }
+            }
+        };
+        return bridge.accessor(R.get, R.set, .{ .ce_reactions = true });
+    }
 };
 
 pub const Build = struct {
@@ -2486,4 +2557,12 @@ pub const Build = struct {
 const testing = @import("../../testing.zig");
 test "WebApi: Element" {
     try testing.htmlRunner("element", .{});
+}
+
+test "Element: div chain slot size" {
+    // Guard against accidental growth: new Element fields (e.g. _flags) must
+    // fit in existing padding. Debug is larger from the _proto_canary fields.
+    const Div = @import("element/html/Div.zig");
+    const slot = comptime Factory.chainOffsetOf(Div, Div) + @sizeOf(Div);
+    try testing.expectEqual(if (comptime lp.IS_DEBUG) 120 else 74, slot);
 }

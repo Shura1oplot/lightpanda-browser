@@ -6,7 +6,8 @@ BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # option test filter make test F="server"
 F=
 
-# Extra flags forwarded to every `$(ZIG) build` invocation.
+# Extra flags forwarded to every `$(ZIG) build` invocation, e.g.:
+#   ZIGFLAGS=-Ddev_fast=false make test
 ZIGFLAGS ?=
 
 # Lightpanda uses curl-impersonate instead of the system libcurl. The default
@@ -49,7 +50,8 @@ endif
 # Prebuilt V8
 # -----------
 # Building V8 from source takes 10+ minutes. `make download-v8` fetches the
-# matching prebuilt archive from the zig-v8-fork releases instead. The versions
+# matching prebuilt archive from the zig-v8-fork releases instead; build.zig
+# discovers the cached files itself, so the target only fetches. The versions
 # are read from the install action so they can't drift from CI.
 #
 # The cache path is keyed on ZIG_V8_TAG as well as the archive name: a
@@ -64,11 +66,12 @@ ZIG_V8_TAG := $(shell awk -F\' '/^  zig-v8:/{f=1} f&&/default:/{print $$2; exit}
 V8_ARCHIVE := libc_v8_$(V8_VERSION)_$(OS)_$(ARCH).a
 V8_CACHE   := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/$(V8_ARCHIVE)
 
-# Use the cached archive even when callers pass unrelated ZIGFLAGS such as a
-# release version. Override PREBUILT_V8_PATH to select a different archive.
-PREBUILT_V8_PATH ?= $(wildcard $(V8_CACHE))
-V8_FLAGS = $(if $(PREBUILT_V8_PATH),-Dprebuilt_v8_path=$(PREBUILT_V8_PATH),)
-BUILD_FLAGS = $(V8_FLAGS) $(ZIGFLAGS) $(CURL_IMPERSONATE_FLAGS) $(MACOS_SDK_FLAGS)
+# The shared flavor serves -Ddev_fast (Linux x86_64 Debug only). It is cached
+# under the name the exe's DT_NEEDED records, libc_v8.so; the tag directory
+# already keys freshness.
+V8_SO_ASSET := libc_v8_$(V8_VERSION)_$(OS)_$(ARCH).so
+V8_SO_CACHE := .lp-cache/prebuilt-v8/$(ZIG_V8_TAG)/libc_v8.so
+BUILD_FLAGS = $(ZIGFLAGS) $(CURL_IMPERSONATE_FLAGS) $(MACOS_SDK_FLAGS)
 
 
 # Infos
@@ -96,7 +99,7 @@ check-curl-impersonate:
 	@test -f "$(CURL_IMPERSONATE_ARCHIVE)" || (printf "\033[33mMissing curl-impersonate archive: %s\033[0m\n" "$(CURL_IMPERSONATE_ARCHIVE)"; exit 1)
 	@test -f "$(CURL_IMPERSONATE_INCLUDE)/curl/curl.h" || (printf "\033[33mMissing curl-impersonate headers: %s\033[0m\n" "$(CURL_IMPERSONATE_INCLUDE)"; exit 1)
 
-## Download the prebuilt V8 archive (skips the 10+ min source build)
+## Download the prebuilt V8 libraries (skips the 10+ min source build)
 download-v8:
 	@mkdir -p $(dir $(V8_CACHE))
 	@test -f $(V8_CACHE) || ( \
@@ -105,6 +108,14 @@ download-v8:
 			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_ARCHIVE) \
 		|| (rm -f $(V8_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
 	@printf "\033[33mV8 ready: %s\033[0m\n" "$(V8_CACHE)"
+ifeq ($(OS)_$(ARCH),linux_x86_64)
+	@test -f $(V8_SO_CACHE) || ( \
+		printf "\033[36mDownloading prebuilt shared V8 $(V8_VERSION) ($(ZIG_V8_TAG))...\033[0m\n"; \
+		curl -fL --progress-bar -o $(V8_SO_CACHE) \
+			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_SO_ASSET) \
+		|| (rm -f $(V8_SO_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
+	@printf "\033[33mShared V8 ready: %s\033[0m\n" "$(V8_SO_CACHE)"
+endif
 
 ## Build v8 snapshot
 build-v8-snapshot: check-curl-impersonate
@@ -135,7 +146,7 @@ run-debug: build-dev
 	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
 
 test: check-curl-impersonate
-	TEST_FILTER="${F}" $(ZIG) build $(BUILD_FLAGS) test -freference-trace
+	TEST_FILTER="$(or $(F),$(TEST_FILTER))" $(ZIG) build $(BUILD_FLAGS) test -freference-trace
 
 ## Run demo/runner end to end tests
 end2end:

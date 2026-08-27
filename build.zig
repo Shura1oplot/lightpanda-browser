@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2024  Lightpanda (Selecy SAS)
+// Copyright (C) 2023-2026  Lightpanda (Selecy SAS)
 //
 // Francis Bouvier <francis@lightpanda.io>
 // Pierre Tachoire <pierre@lightpanda.io>
@@ -36,17 +36,57 @@ const Build = blk: {
 };
 
 pub fn build(b: *Build) !void {
-    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const requested_target = b.standardTargetOptions(.{});
 
-    const prebuilt_v8_path = b.option([]const u8, "prebuilt_v8_path", "Path to prebuilt libc_v8.a");
     const curl_impersonate_archive = b.option([]const u8, "curl_impersonate_archive", "Path to the static curl-impersonate archive") orelse
         return error.CurlImpersonateArchiveRequired;
     const curl_impersonate_include = b.option([]const u8, "curl_impersonate_include", "Path to the curl-impersonate include directory") orelse
         return error.CurlImpersonateIncludeRequired;
     const macos_sdk_path = b.option([]const u8, "macos_sdk_path", "Path to the macOS SDK");
+    const enable_tsan = b.option(bool, "tsan", "Enable Thread Sanitizer") orelse false;
+    const enable_asan = b.option(bool, "asan", "Enable Address Sanitizer") orelse false;
+    const enable_csan = b.option(std.zig.SanitizeC, "csan", "Enable C Sanitizers");
+
+    const prebuilt_v8_path_option = b.option([]const u8, "prebuilt_v8_path", "Path to a prebuilt libc_v8.a or libc_v8.so");
+
+    const dev_fast = b.option(bool, "dev_fast", "Linux debug builds: shared V8 + self-hosted backend. Implies -Dshared_v8, -Duse_llvm=false and a bundled-CRT target") orelse
+        (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64 and
+            optimize == .Debug and requested_target.query.isNative() and
+            !enable_tsan and !enable_asan and
+            (prebuilt_v8_path_option == null or std.mem.endsWith(u8, prebuilt_v8_path_option.?, ".so")));
+
+    if (dev_fast) {
+        if (builtin.os.tag != .linux) {
+            std.debug.print("-Ddev_fast is Linux-only (host is {s})\n", .{@tagName(builtin.os.tag)});
+            return error.DevFastUnsupportedHost;
+        }
+        if (optimize != .Debug) {
+            std.debug.print("-Ddev_fast is Debug-only (optimize is {s})\n", .{@tagName(optimize)});
+            return error.DevFastRequiresDebug;
+        }
+        if (!requested_target.query.isNative()) {
+            std.debug.print("-Ddev_fast builds for the host; drop -Dtarget/-Dcpu\n", .{});
+            return error.DevFastRequiresNativeTarget;
+        }
+    }
+
+    const target = if (dev_fast) b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .linux,
+        .abi = .gnu,
+        // https://codeberg.org/ziglang/zig/issues/31272
+        .glibc_version = .{ .major = 2, .minor = 43, .patch = 0 },
+    }) else requested_target;
+
+    // Without an explicit -Dprebuilt_v8_path, pick up whatever `make
+    // download-v8` cached rather than building V8 from source.
+    const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
+    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse
+        (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+    const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
 
     const version = resolveVersion(b);
     std.debug.print("Lightpanda {f}\n", .{version});
@@ -59,10 +99,6 @@ pub fn build(b: *Build) !void {
     opts.addOption([]const u8, "version_encoded", version_encoded);
     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
     opts.addOption(bool, "wpt_extensions", wpt_extensions);
-
-    const enable_tsan = b.option(bool, "tsan", "Enable Thread Sanitizer") orelse false;
-    const enable_asan = b.option(bool, "asan", "Enable Address Sanitizer") orelse false;
-    const enable_csan = b.option(std.zig.SanitizeC, "csan", "Enable C Sanitizers");
 
     const lightpanda_module = blk: {
         const mod = b.addModule("lightpanda", .{
@@ -88,7 +124,7 @@ pub fn build(b: *Build) !void {
         // Set default behavior
         b.default_step.dependOn(fmt_step);
 
-        try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path);
+        try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path, shared_v8);
         try linkCurl(b, mod, curl_impersonate_archive, curl_impersonate_include, macos_sdk_path);
         try linkHtml5Ever(b, mod);
         linkZenai(b, mod);
@@ -117,7 +153,7 @@ pub fn build(b: *Build) !void {
         // browser
         const exe = b.addExecutable(.{
             .name = "lightpanda",
-            .use_llvm = true,
+            .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = target,
@@ -154,7 +190,7 @@ pub fn build(b: *Build) !void {
         // snapshot creator
         const exe = b.addExecutable(.{
             .name = "lightpanda-snapshot-creator",
-            .use_llvm = true,
+            .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_snapshot_creator.zig"),
                 .target = target,
@@ -184,7 +220,7 @@ pub fn build(b: *Build) !void {
         // skills generator
         const exe = b.addExecutable(.{
             .name = "lightpanda-skills",
-            .use_llvm = true,
+            .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main_skills.zig"),
                 .target = target,
@@ -216,7 +252,7 @@ pub fn build(b: *Build) !void {
         // test
         const tests = b.addTest(.{
             .root_module = lightpanda_module,
-            .use_llvm = true,
+            .use_llvm = use_llvm,
             .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .simple },
         });
         const run_tests = b.addRunArtifact(tests);
@@ -225,12 +261,75 @@ pub fn build(b: *Build) !void {
     }
 }
 
+/// Looks for the prebuilt V8 that `make download-v8` caches. The cache
+/// path is keyed on the zig-v8 release tag, read from the install action so
+/// it cannot drift from CI (the Makefile reads the same source of truth).
+fn findPrebuiltV8(b: *Build, target: Build.ResolvedTarget, dev_fast: bool) ?[]const u8 {
+    const io = b.graph.io;
+    const action = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        b.pathFromRoot(".github/actions/install/action.yml"),
+        b.allocator,
+        .limited(64 * 1024),
+    ) catch return null;
+
+    const tag = actionDefault(action, "zig-v8:") orelse return null;
+    if (tag.len == 0) {
+        return null;
+    }
+
+    // The .so must keep the name the exe's DT_NEEDED records; the archive
+    // name encodes V8 version, os and arch.
+    const path = if (dev_fast)
+        b.fmt("{s}/prebuilt-v8/{s}/libc_v8.so", .{ b.pathFromRoot(".lp-cache"), tag })
+    else blk: {
+        const version = actionDefault(action, "v8:") orelse return null;
+        break :blk b.fmt("{s}/prebuilt-v8/{s}/libc_v8_{s}_{s}_{s}.a", .{
+            b.pathFromRoot(".lp-cache"),
+            tag,
+            version,
+            @tagName(target.result.os.tag),
+            @tagName(target.result.cpu.arch),
+        });
+    };
+    std.Io.Dir.cwd().access(io, path, .{}) catch {
+        if (dev_fast) {
+            std.debug.print("No cached libc_v8.so; building V8 from source. `make download-v8` skips this.\n", .{});
+        }
+        return null;
+    };
+    std.debug.print("Using prebuilt V8: {s}\n", .{path});
+    return path;
+}
+
+// Returns the quoted `default:` value of a top-level `key` in the install
+// action's yaml.
+fn actionDefault(action: []const u8, key: []const u8) ?[]const u8 {
+    var in_key = false;
+    var lines = std.mem.splitScalar(u8, action, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "  ") and !std.mem.startsWith(u8, line, "   ")) {
+            in_key = std.mem.eql(u8, std.mem.trimEnd(u8, line[2..], " \r"), key);
+            continue;
+        }
+        if (!in_key) continue;
+        const trimmed = std.mem.trim(u8, line, " \r");
+        if (std.mem.startsWith(u8, trimmed, "default:")) {
+            var it = std.mem.splitScalar(u8, trimmed, '\'');
+            _ = it.next();
+            return it.next();
+        }
+    }
+    return null;
+}
+
 fn linkV8(
     b: *Build,
     mod: *Build.Module,
     is_asan: bool,
     is_tsan: bool,
     prebuilt_v8_path: ?[]const u8,
+    shared_v8: bool,
 ) !void {
     const target = mod.resolved_target.?;
 
@@ -243,6 +342,7 @@ fn linkV8(
         .v8_enable_sandbox = is_tsan,
         .cache_root = b.pathFromRoot(".lp-cache"),
         .prebuilt_v8_path = prebuilt_v8_path,
+        .shared_v8 = shared_v8,
     });
     mod.addImport("v8", dep.module("v8"));
 }
