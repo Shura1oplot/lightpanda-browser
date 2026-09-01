@@ -410,14 +410,16 @@ fn dropCdp(self: *Network, link: *CdpLink, err: ?anyerror, opts: DropCdpOpts) vo
     }
 
     if (opts.notify) {
-        link.cdp.terminateFromNetwork();
-
         // notify=true means the worker hasn't been told yet — push the
-        // disconnect into the inbox and break it out of curl_multi_poll.
+        // disconnect into the inbox before requesting termination. A V8
+        // interrupt can resume the worker immediately; publishing first lets
+        // CDP.tick observe the terminal reason and send its specific close
+        // frame instead of the generic going-away frame.
         // notify=false paths have already woken the worker (close frame
         // case) or are about to be unblocked via cdp_unregister.broadcast
         // (unregister case); no extra wakeup needed.
         link.cdp.onLinkDisconnect(err);
+        link.cdp.terminateFromNetwork();
         link.handles.wakeup() catch |e| {
             lp.log.warn(.cdp, "CDP link wakeup", .{ .err = e });
         };

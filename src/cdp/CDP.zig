@@ -248,10 +248,27 @@ pub fn sendJSON(self: *CDP, message: anytype) !void {
 }
 
 pub fn tick(self: *CDP) !bool {
+    // Network publishes terminal close/disconnect messages before using the
+    // terminate request to interrupt a stuck worker. Drain only those already
+    // delivered terminal messages first so framing errors retain their
+    // protocol close code. Ordinary CDP work remains deferred once terminate
+    // is pending.
+    self.browser.http_client.drainTerminalInbox() catch |err| switch (err) {
+        error.ClientDisconnected => return false,
+    };
+
     // terminatePending means someone decided this browser must die (e.g. the
     // heap limit was reached). Nothing in the CDP path ever calls cancelTerminate
     // so the flag can't be a stale leftover here. Exit.
     if (self.browser.env.terminatePending()) {
+        // A terminal message can arrive between the first drain and this
+        // acquire-load. Network publishes it before the release-store in
+        // requestTerminate, so after observing termination this second drain
+        // closes that race without waiting or dispatching ordinary CDP work.
+        self.browser.http_client.drainTerminalInbox() catch |err| switch (err) {
+            error.ClientDisconnected => return false,
+        };
+
         log.warn(.cdp, "closing connection", .{ .reason = "pending terminate" });
         // The worker thread is the sole writer of this socket, so sending the
         // close frame here can't interleave with another write.
@@ -1510,25 +1527,47 @@ test "cdp: disconnect latches so the worker keeps exiting" {
     try testing.expectError(error.ClientDisconnected, client.tick(0));
 }
 
-test "cdp: tick sends a close frame on pending terminate" {
-    testing.expectLog(&.{.cdp});
+test "cdp: tick prioritizes terminal inbox over pending terminate" {
+    {
+        var ctx = try testing.context();
+        defer ctx.deinit();
 
-    var ctx = try testing.context();
-    defer ctx.deinit();
+        const cdp = ctx.cdp();
+        const client = &cdp.browser.http_client;
+        {
+            const arena = try client.arena_pool.acquire(.tiny, "test framing error");
+            client.inbox.push(arena, .{ .disconnect = error.InvalidMessageType });
+        }
+        cdp.browser.env.requestTerminate();
+        defer cdp.browser.env.cancelTerminate();
 
-    const cdp = ctx.cdp();
-    cdp.browser.env.requestTerminate();
-    // Clear the pending terminate so deinit's V8 calls don't trip over the
-    // terminating-state asserts.
-    defer cdp.browser.env.cancelTerminate();
+        try testing.expectEqual(false, try cdp.tick());
 
-    try testing.expectEqual(false, try cdp.tick());
+        var buf: [WS.CLOSE_PROTOCOL_ERROR.len]u8 = undefined;
+        const n = try posix.read(ctx.socket, &buf);
+        try testing.expectEqualSlices(u8, &WS.CLOSE_PROTOCOL_ERROR, buf[0..n]);
+    }
 
-    // The client should receive a close frame (code 1001, going away), not
-    // just an abrupt socket close.
-    var buf: [WS.CLOSE_GOING_AWAY.len]u8 = undefined;
-    const n = try posix.read(ctx.socket, &buf);
-    try testing.expectEqualSlices(u8, &WS.CLOSE_GOING_AWAY, buf[0..n]);
+    {
+        testing.expectLog(&.{.cdp});
+
+        var ctx = try testing.context();
+        defer ctx.deinit();
+
+        const cdp = ctx.cdp();
+        cdp.browser.env.requestTerminate();
+        // Clear the pending terminate so deinit's V8 calls don't trip over the
+        // terminating-state asserts.
+        defer cdp.browser.env.cancelTerminate();
+
+        try testing.expectEqual(false, try cdp.tick());
+
+        // With no terminal message waiting, the client should receive a close
+        // frame with code 1001 (going away), not just an abrupt socket close.
+        var buf: [WS.CLOSE_GOING_AWAY.len]u8 = undefined;
+        const n = try posix.read(ctx.socket, &buf);
+        try testing.expectEqualSlices(u8, &WS.CLOSE_GOING_AWAY, buf[0..n]);
+    }
 }
 
 test "cdp: syncRequest short-circuits after disconnect" {

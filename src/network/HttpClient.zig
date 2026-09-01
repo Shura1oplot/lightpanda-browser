@@ -517,7 +517,9 @@ pub fn activity(self: *const Client) Activity {
 //                refs to page / session / V8 state; dispatching a
 //                command that frees that state would UAF on unwind.
 //                Cherry-pick only Fetch interception responses
-const DrainMode = enum { all, sync_wait };
+//   .terminal   — before honoring a terminate request. Cherry-pick only
+//                close/disconnect so their close semantics take precedence.
+const DrainMode = enum { all, sync_wait, terminal };
 
 // One-shot convenience: create and submit in a single call.
 pub fn request(self: *Client, req: Request, owner: ?*Owner) anyerror!void {
@@ -602,6 +604,17 @@ pub fn newRequest(self: *Client, req: Request, owner: ?*Owner) anyerror!*Transfe
 pub fn tick(self: *Client, timeout_ms: u32) !bool {
     self.processGraveyard();
     return self._tick(timeout_ms, .all);
+}
+
+// Give an already-delivered close or disconnect precedence over a general
+// terminate request. Network queues the terminal message before requesting the
+// V8 interrupt, so a worker interrupted out of user code can still send the
+// protocol-specific close frame from the terminal message.
+pub fn drainTerminalInbox(self: *Client) !void {
+    if (self.inbox.terminated) {
+        return error.ClientDisconnected;
+    }
+    try self.drainInbox(.terminal);
 }
 
 pub fn tickSync(self: *Client, timeout_ms: u32) !void {
@@ -1261,6 +1274,7 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
         const msg = switch (mode) {
             .all => self.inbox.pop(),
             .sync_wait => self.inbox.popIf(allowDuringSyncWait),
+            .terminal => self.inbox.popIf(isTerminalInboxMessage),
         } orelse return;
 
         defer msg.deinit();
@@ -1285,6 +1299,13 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
             },
         }
     }
+}
+
+fn isTerminalInboxMessage(msg: *Inbox.Message) bool {
+    return switch (msg.payload) {
+        .close, .disconnect => true,
+        .cdp, .ping => false,
+    };
 }
 
 // Predicate for Inbox.popIf during sync_wait drains. Always allows
