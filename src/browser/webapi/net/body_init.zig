@@ -90,10 +90,7 @@ pub const BodyInit = union(enum) {
                 @memcpy(boundary[4..], &hex);
 
                 var buf = std.Io.Writer.Allocating.init(arena);
-                try fd.write(.{
-                    .allocator = arena,
-                    .encoding = .{ .formdata = &boundary },
-                }, &buf.writer);
+                try fd.write(arena, .{ .encoding = .{ .formdata = &boundary } }, &buf.writer);
 
                 const ct = try std.fmt.allocPrint(arena, "multipart/form-data; boundary={s}", .{boundary});
                 return .{
@@ -157,8 +154,8 @@ test "BodyInit: URLSearchParams emit urlencoded body + content-type" {
 
     const usp = try arena.create(URLSearchParams);
     usp.* = .{ ._arena = arena, ._params = .empty };
-    try usp.append("a", "1");
-    try usp.append("b", "2");
+    try usp._params.append(arena.allocator(), "a", "1");
+    try usp._params.append(arena.allocator(), "b", "2");
 
     const r = try (BodyInit{ .url_search_params = usp }).extract(arena.allocator());
     try testing.expectString("a=1&b=2", r.bytes);

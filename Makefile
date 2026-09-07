@@ -3,6 +3,8 @@
 
 ZIG := zig
 BC := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+# tikv-jemalloc-sys's nested make can't parse inherited "-- F=..." overrides
+MAKEOVERRIDES =
 # option test filter make test F="server"
 F=
 
@@ -158,13 +160,13 @@ end2end:
 ## without one only the deterministic layer runs. See ../demo/agent/README.md.
 test-agent:
 	@test -d ../demo
-	@test -x zig-out/bin/lightpanda || $(MAKE) build
+	@test -x zig-out/bin/lightpanda || $(MAKE) build ZIGFLAGS="$(ZIGFLAGS)"
 	@cd ../demo && ./agent/run.sh $(LAYER)
 
 ## Remove build artifacts (keeps .lp-cache/ and zig-pkg/ — slow to re-fetch)
 clean:
 	rm -rf zig-out .zig-cache src/snapshot.bin
-	cd src/html5ever && cargo clean
+	cd src/rust && cargo clean
 
 # Install and build required dependencies commands
 # ------------

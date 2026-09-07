@@ -20,16 +20,17 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const App = @import("../App.zig");
-const CDP = @import("../cdp/CDP.zig");
+const Watchdog = @import("../Watchdog.zig");
+const Driver = @import("../server/Driver.zig");
 const Notification = @import("../Notification.zig");
+const HttpClient = @import("../network/HttpClient.zig");
 
 const js = @import("js/js.zig");
 const Page = @import("Page.zig");
-const Watchdog = @import("../Watchdog.zig");
 const Session = @import("Session.zig");
-const Selector = @import("webapi/selector/Selector.zig");
 const Viewport = @import("Viewport.zig");
-const HttpClient = @import("../network/HttpClient.zig");
+const Selector = @import("webapi/selector/Selector.zig");
+const Geolocation = @import("webapi/geolocation/Geolocation.zig");
 const PermissionState = @import("webapi/Permissions.zig").State;
 
 const ArenaPool = App.ArenaPool;
@@ -63,13 +64,14 @@ last_reported_js_bytes: usize = 0,
 // browser context. Keys are owned by `allocator`; values are enum tags.
 permissions: std.StringHashMapUnmanaged(PermissionState) = .empty,
 
-// Runtime viewport override set via Emulation.setDeviceMetricsOverride and
-// cleared via clearDeviceMetricsOverride. Null means use the compile-time
-// Viewport.default. Scoped to the Browser so it persists across page
-// navigations (matching how Chrome scopes the override to the connection).
-// Every viewport consumer reads it through Page.getViewport so they all
-// observe the same (possibly overridden) value.
+// Runtime viewport override
 viewport_override: ?Viewport = null,
+
+// Screenshot renderer (fonts, glyph cache); created on the first screenshot.
+renderer: ?*lp.screenshot.Renderer = null,
+
+// Runtime geolocation override
+geolocation_override: ?Geolocation.Override = null,
 
 // used by sessions to allocate pages.
 page_pool: std.heap.MemoryPool(Page),
@@ -110,7 +112,7 @@ pub fn nextFrameId(self: *Browser) u32 {
     return id;
 }
 
-pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
+pub fn init(self: *Browser, app: *App, opts: InitOpts, driver: ?Driver) !void {
     const allocator = app.allocator;
 
     var env = try js.Env.init(app, opts.env);
@@ -129,7 +131,7 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts, cdp: ?*CDP) !void {
         .watchdog_entry = undefined,
     };
     self.env.protectHeapLimit();
-    try self.http_client.init(allocator, &app.network, cdp);
+    try self.http_client.init(app, driver);
 
     self.watchdog_entry = .{
         .env = &self.env,
@@ -154,10 +156,8 @@ pub fn deinit(self: *Browser) void {
     // fire — only now is it safe to free the pool backing their parameters.
     self.fc_identity_pool.deinit(allocator);
     self.page_pool.deinit(allocator);
-    if (self.http_client.cache) |cache| {
-        cache.maintenance(lp.datetime.timestamp(.real));
-    }
     self.http_client.deinit();
+    if (self.renderer) |r| r.deinit();
     self.clearPermissions();
     self.permissions.deinit(allocator);
     self.selector_cache.deinit();

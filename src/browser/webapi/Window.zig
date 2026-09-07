@@ -704,7 +704,10 @@ pub fn open(self: *Window, url_: ?[]const u8, target_: ?[]const u8, features_: ?
         std.ascii.eqlIgnoreCase(target, "_parent") or
         std.ascii.eqlIgnoreCase(target, "_top"))
     {
-        const nav_target = frame.resolveTargetFrame(target) orelse frame;
+        const nav_target = switch (frame.resolveTargetFrame(target)) {
+            .frame => |f| f,
+            .blank => unreachable,
+        };
         const nav_url = if (raw_url.len == 0) "about:blank" else raw_url;
         try frame.scheduleNavigation(nav_url, .{
             .reason = .script,
@@ -927,9 +930,9 @@ const ScrollToOpts = union(enum) {
     opts: Opts,
 
     const Opts = struct {
-        top: i32,
-        left: i32,
         behavior: []const u8 = "",
+        left: i32,
+        top: i32,
     };
 };
 pub fn scrollTo(self: *Window, opts: ScrollToOpts, y: ?i32, frame: *Frame) !void {

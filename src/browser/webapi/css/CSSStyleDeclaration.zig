@@ -34,6 +34,7 @@ const CSSStyleDeclaration = @This();
 _element: ?*Element = null,
 _properties: std.DoublyLinkedList = .{},
 _is_computed: bool = false,
+_syncing: bool = false,
 
 // Parse the element's existing style attribute into _properties so that
 // subsequent JS reads and writes see all CSS properties, not just newly
@@ -43,11 +44,14 @@ pub fn parseInlineStyle(self: *CSSStyleDeclaration, frame: *Frame) !void {
         return;
     }
     const el = self._element orelse return;
-    if (el.getAttributeSafe(comptime .wrap("style"))) |attr_value| {
-        var it = CssParser.parseDeclarationsList(attr_value);
-        while (it.next()) |declaration| {
-            try self.applyParsedDeclaration(declaration, frame);
-        }
+    const attr_value = el.getAttributeSafe(comptime .wrap("style")) orelse return;
+    try self.applyDeclarations(attr_value, frame);
+}
+
+fn applyDeclarations(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !void {
+    var it = CssParser.parseDeclarationsList(text);
+    while (it.next()) |declaration| {
+        try self.applyParsedDeclaration(declaration, frame);
     }
 }
 
@@ -78,10 +82,11 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
     // tree builders (Playwright ariaSnapshot) consult on every element.
     if (self._is_computed) {
         if (self._element) |element| {
+            const style_manager = &element.ownerFrame(frame)._style_manager;
             if (wrapped.eql(comptime .wrap("display"))) {
-                if (frame._style_manager.hasDisplayNone(element)) return "none";
+                if (style_manager.hasDisplayNone(element, .materialize)) return "none";
             } else if (wrapped.eql(comptime .wrap("visibility"))) {
-                if (frame._style_manager.hasVisibilityHiddenInherited(element)) return "hidden";
+                if (style_manager.hasVisibilityHiddenInherited(element)) return "hidden";
             }
         }
     }
@@ -92,7 +97,7 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
             if (self._element) |element| {
                 // Resolve inline `style=` declarations through the element's
                 // parsed inline style, so computed values match `el.style`.
-                if (frame._style_manager.inlineStyleValue(element, wrapped)) |value| {
+                if (element.ownerFrame(frame)._style_manager.inlineStyleValue(element, wrapped)) |value| {
                     return value;
                 }
 
@@ -117,13 +122,12 @@ pub fn getPropertyValue(self: *const CSSStyleDeclaration, property_name: []const
 }
 
 fn resolvedDimension(element: *Element, dimension: enum { width, height }, frame: *Frame) []const u8 {
-    var visibility_cache: Element.VisibilityCache = .{};
-    if (!element.checkVisibilityCached(&visibility_cache, frame)) {
+    if (!element.checkVisibilityCached(null, frame, .materialize)) {
         return "auto";
     }
     const value = switch (dimension) {
-        .width => element.getClientWidthWithCache(frame, &visibility_cache),
-        .height => element.getClientHeightWithCache(frame, &visibility_cache),
+        .width => element.boxAxis(frame, .width),
+        .height => element.boxAxis(frame, .height),
     };
     return std.fmt.allocPrint(frame.local_arena, "{d}px", .{value}) catch "auto";
 }
@@ -162,6 +166,12 @@ fn applyParsedDeclaration(self: *CSSStyleDeclaration, declaration: CssParser.Dec
     try self.setPropertyImpl(declaration.name, declaration.value, declaration.important, frame);
 }
 
+fn initOwnedString(allocator: Allocator, value: []const u8) !String {
+    if (value.len <= 12) return String.wrap(value);
+    if (value.len >= std.math.maxInt(i32)) return error.StringTooLarge;
+    return String.wrap(try allocator.dupe(u8, value));
+}
+
 fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value: []const u8, important: bool, frame: *Frame) !void {
     if (value.len == 0) {
         _ = try self.removePropertyImpl(property_name, frame);
@@ -175,7 +185,10 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
 
     // Find existing property
     if (self.findProperty(.wrap(normalized))) |existing| {
-        existing._value = try String.init(frame.arena, normalized_value, .{});
+        const allocator = frame._factory.storageAllocator();
+        const new_value = try initOwnedString(allocator, normalized_value);
+        existing._value.deinit(allocator);
+        existing._value = new_value;
         existing._important = important;
         return;
     }
@@ -184,7 +197,7 @@ fn setPropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, value:
     const prop = try frame._factory.create(Property{
         ._node = .{},
         ._name = try String.init(frame.arena, normalized, .{}),
-        ._value = try String.init(frame.arena, normalized_value, .{}),
+        ._value = try initOwnedString(frame._factory.storageAllocator(), normalized_value),
         ._important = important,
     });
     self._properties.append(&prop._node);
@@ -204,6 +217,7 @@ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, fra
     // optimization), so we need to dupe it.
     const old_value = try frame.call_arena.dupe(u8, prop._value.str());
     self._properties.remove(&prop._node);
+    prop._value.deinit(frame._factory.storageAllocator());
     frame._factory.destroy(prop);
     return old_value;
 }
@@ -213,7 +227,35 @@ fn removePropertyImpl(self: *CSSStyleDeclaration, property_name: []const u8, fra
 fn syncStyleAttribute(self: *CSSStyleDeclaration, frame: *Frame) !void {
     const element = self._element orelse return;
     const css_text = try self.getCssText(frame);
+    self._syncing = true;
+    defer self._syncing = false;
     try element.setAttributeSafe(comptime .wrap("style"), .wrap(css_text), frame);
+}
+
+// The element's style attribute changed (null: removed)
+pub fn styleAttributeChanged(self: *CSSStyleDeclaration, text: ?[]const u8, frame: *Frame) !void {
+    if (self._syncing) {
+        // this was us making the change internally, automatically in-sync
+        return;
+    }
+    // ok, this change was from the outside, e.g. via setAttribute('style', ....)
+    // we need to get this declaration back in sync
+    self.clearProperties(frame);
+    if (text) |t| {
+        try self.applyDeclarations(t, frame);
+    }
+}
+
+fn clearProperties(self: *CSSStyleDeclaration, frame: *Frame) void {
+    var node = self._properties.first;
+    while (node) |n| {
+        const next = n.next;
+        const prop = Property.fromNodeLink(n);
+        self._properties.remove(n);
+        prop._value.deinit(frame._factory.storageAllocator());
+        frame._factory.destroy(prop);
+        node = next;
+    }
 }
 
 pub fn getFloat(self: *const CSSStyleDeclaration, frame: *Frame) []const u8 {
@@ -232,21 +274,9 @@ pub fn getCssText(self: *const CSSStyleDeclaration, frame: *Frame) ![]const u8 {
 }
 
 pub fn setCssText(self: *CSSStyleDeclaration, text: []const u8, frame: *Frame) !void {
-    // Clear existing properties
-    var node = self._properties.first;
-    while (node) |n| {
-        const next = n.next;
-        const prop = Property.fromNodeLink(n);
-        self._properties.remove(n);
-        frame._factory.destroy(prop);
-        node = next;
-    }
+    self.clearProperties(frame);
 
-    // Parse and set new properties
-    var it = CssParser.parseDeclarationsList(text);
-    while (it.next()) |declaration| {
-        try self.applyParsedDeclaration(declaration, frame);
-    }
+    try self.applyDeclarations(text, frame);
     try self.syncStyleAttribute(frame);
 }
 
@@ -897,6 +927,23 @@ pub const JsApi = struct {
 };
 
 const testing = @import("../../../testing.zig");
+test "CSS property value storage is reused" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var style = CSSStyleDeclaration{};
+    defer style.clearProperties(frame);
+
+    try style.setPropertyImpl("transform", "translate3d(1px,0,0)", false, frame);
+    const first_ptr = style.findProperty(comptime .wrap("transform")).?._value.suffix.ptr;
+    try style.setPropertyImpl("transform", "translate3d(2px,0,0)", false, frame);
+    try style.setPropertyImpl("transform", "translate3d(3px,0,0)", false, frame);
+
+    const property = style.findProperty(comptime .wrap("transform")).?;
+    try testing.expectEqual(first_ptr, property._value.suffix.ptr);
+    try std.testing.expectEqualStrings("translate3d(3px,0,0)", property._value.str());
+}
+
 test "normalizePropertyValue: unitless zero to 0px" {
     const cases = .{
         .{ "width", "0", "0px" },

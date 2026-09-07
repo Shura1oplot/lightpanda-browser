@@ -406,7 +406,15 @@ pub fn module(self: *Context, comptime want_result: bool, local: *const js.Local
 }
 
 fn evaluateModule(self: *Context, comptime want_result: bool, mod: js.Module, url: []const u8, cacheable: bool) !(if (want_result) ModuleEntry else void) {
-    const evaluated = mod.evaluate() catch {
+    const evaluated = mod.evaluate() catch |err| {
+        if (err == error.InvalidModuleStatus) {
+            log.err(.js, "evaluate module status", .{
+                .specifier = url,
+                .status = @tagName(mod.getStatus()),
+                .note = "please report this issue: https://github.com/lightpanda-io/browser/issues",
+            });
+            return err;
+        }
         if (comptime lp.IS_DEBUG) {
             std.debug.assert(mod.getStatus() == .kErrored);
         }
@@ -883,8 +891,14 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
                 }
             }
 
-            const evaluated = mod.evaluate() catch {
-                if (comptime lp.IS_DEBUG) {
+            const evaluated = mod.evaluate() catch |err| {
+                if (err == error.InvalidModuleStatus) {
+                    log.err(.js, "dynamic module status", .{
+                        .specifier = specifier,
+                        .status = @tagName(mod.getStatus()),
+                        .note = "please report this issue: https://github.com/lightpanda-io/browser/issues",
+                    });
+                } else if (comptime lp.IS_DEBUG) {
                     std.debug.assert(mod.getStatus() == .kErrored);
                 }
                 _ = resolver.reject("module evaluation", local.newString("Module evaluation failed"));
@@ -911,6 +925,12 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
 fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptManagerBase.ModuleSource) void {
     const state: *DynamicModuleResolveState = @ptrCast(@alignCast(ctx));
     var self = state.context;
+
+    if (self.env.terminatePending()) {
+        var module_source = module_source_ catch return;
+        module_source.deinit();
+        return;
+    }
 
     var ls: js.Local.Scope = undefined;
     self.localScope(&ls);
@@ -1022,6 +1042,39 @@ fn resolveDynamicModule(self: *Context, state: *DynamicModuleResolveState, modul
         });
         _ = local.toLocal(state.resolver).reject("module promise", local.newString("Failed to evaluate promise"));
     };
+}
+
+const testing = @import("../../testing.zig");
+test "Context: terminated async module completion does not re-enter V8" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    const local = &ls.local;
+
+    const resolver = local.createPromiseResolver();
+    const promise = resolver.promise();
+    const resolver_global = try resolver.persist();
+    defer resolver_global.deinit();
+
+    var state = DynamicModuleResolveState{
+        .module = null,
+        .context_id = frame.js.id,
+        .context = frame.js,
+        .specifier = "https://example.com/late-module.js",
+        .resolver = resolver_global,
+    };
+
+    const env = frame.js.env;
+    env.terminate();
+    js.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+    defer env.cancelTerminate();
+
+    dynamicModuleSourceCallback(&state, error.Abort);
+
+    try testing.expectEqual(js.Promise.State.pending, promise.state());
 }
 
 // Used to make temporarily enter and exit a context, updating and restoring

@@ -240,7 +240,6 @@ fn connect(self: *WebSocket, protocols: [][]const u8) !void {
     for (http_client.baselineHeaders()) |hdr| {
         try conn.addHeader(allocator, hdr.name, hdr.value);
     }
-
     if (protocols.len > 0) {
         try conn.addHeader(allocator, "Sec-WebSocket-Protocol", try std.mem.join(allocator, ", ", protocols));
     }
@@ -523,7 +522,12 @@ fn queueMessage(self: *WebSocket, msg: Message) !void {
     if (was_empty) {
         // Unpause the send callback so libcurl will request data
         if (self._conn) |conn| {
-            try conn.pause(.{ .cont = true });
+            conn.pause(.{ .cont = true }) catch |err| {
+                // our caller is doing `errdefer errdefer arena.release();` which
+                // will free msg. So we have to pop it out.
+                _ = self._send_queue.pop();
+                return err;
+            };
         }
     }
 }
@@ -803,7 +807,7 @@ fn sendDataCallback(buffer: [*]u8, buf_count: usize, buf_len: usize, data: *anyo
 }
 
 fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
-    lp.assert(buf.len >= 2, "WS short buffer", .{ .len = buf.len });
+    lp.assert(buf.len > 0, "WS short buffer", .{ .len = buf.len });
 
     const self = conn.transport.websocket;
 
@@ -820,22 +824,29 @@ fn _sendDataCallback(conn: *http.Connection, buf: []u8) !usize {
             const reason = self._close_reason;
 
             // Close frame: 2 bytes for code (big-endian) + optional reason
-            // Truncate reason to fit in buf (max 123 bytes per spec)
-            const reason_len: usize = @min(reason.len, 123, buf.len -| 2);
-            const frame_len = 2 + reason_len;
-            const to_copy = @min(buf.len, frame_len);
-
+            // (max 123 bytes per spec)
+            const reason_len: usize = @min(reason.len, 123);
             var close_payload: [125]u8 = undefined;
             close_payload[0] = @intCast((code >> 8) & 0xFF);
             close_payload[1] = @intCast(code & 0xFF);
             if (reason_len > 0) {
                 @memcpy(close_payload[2..][0..reason_len], reason[0..reason_len]);
             }
+            const payload = close_payload[0 .. 2 + reason_len];
 
-            try conn.wsStartFrame(.close, to_copy);
-            @memcpy(buf[0..to_copy], close_payload[0..to_copy]);
+            if (self._send_offset == 0) {
+                try conn.wsStartFrame(.close, payload.len);
+            }
 
-            _ = self._send_queue.orderedRemove(0);
+            const remaining = payload[self._send_offset..];
+            const to_copy = @min(remaining.len, buf.len);
+            @memcpy(buf[0..to_copy], remaining[0..to_copy]);
+
+            self._send_offset += to_copy;
+            if (self._send_offset == payload.len) {
+                _ = self._send_queue.orderedRemove(0);
+                self._send_offset = 0;
+            }
             return to_copy;
         },
         .text => |content| return self.writeContent(conn, buf, content, .text),
@@ -1047,4 +1058,33 @@ test "WebApi: WebSocket" {
 
 test "WebApi: WebSocket in worker" {
     try testing.htmlRunner("net/websocket_worker.html", .{});
+}
+
+// Production crash (release overflow on unrelated pooled objects): send()
+// released the message arena on a failed unpause while the message stayed in
+// _send_queue, which released it again later — a pooled-arena double release.
+test "WebApi: WebSocket send owns its message arena once when the unpause fails" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    var ls: js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var protocols: [0][]const u8 = .{};
+    const ws = try WebSocket.init("ws://127.0.0.1:9582/ws", &protocols, &frame.js.execution);
+    try testing.expect(ws._conn != null);
+
+    // connect() tracked the easy handle but no tick has performed it, so
+    // libcurl has no connection behind it and curl_easy_pause fails: the
+    // same state as a send() on a socket the peer already closed, before
+    // the close has been dispatched.
+    ws._ready_state = .open;
+
+    const message = try ls.local.exec("'hello'", null);
+    try testing.expectError(error.BadFunctionArgument, ws.send(.{ .js_val = message }));
+
+    // The queued message owns the arena. A failed send must not leave it
+    // queued with its arena already released.
+    try testing.expectEqual(0, ws._send_queue.items.len);
 }

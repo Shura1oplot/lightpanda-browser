@@ -36,7 +36,7 @@ const ScriptManagerBase = @import("../ScriptManagerBase.zig");
 const Event = @import("Event.zig");
 const Crypto = @import("Crypto.zig");
 const Console = @import("Console.zig");
-const Navigator = @import("Navigator.zig");
+const WorkerNavigator = @import("WorkerNavigator.zig");
 const Timers = @import("Timers.zig");
 const Scheduler = @import("Scheduler.zig");
 const EventTarget = @import("EventTarget.zig");
@@ -105,7 +105,7 @@ _message_ports: std.DoublyLinkedList = .{},
 _proto: *EventTarget,
 _console: Console = .init,
 _crypto: Crypto = .init,
-_navigator: Navigator = .init,
+_navigator: WorkerNavigator = .init,
 _performance: Performance,
 _idb_factory: ?*idb.IDBFactory = null,
 _on_error: ?JS.Function.Global = null,
@@ -270,7 +270,7 @@ pub fn makeRequest(self: *WorkerGlobalScope, req: HttpClient.Request) !void {
         errdefer transfer.deinit();
         try self.headersForRequest(transfer);
     }
-    return transfer.submit();
+    transfer.submit() catch {};
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
@@ -300,7 +300,7 @@ pub fn getCrypto(self: *WorkerGlobalScope) *Crypto {
     return &self._crypto;
 }
 
-pub fn getNavigator(self: *WorkerGlobalScope) *Navigator {
+pub fn getNavigator(self: *WorkerGlobalScope) *WorkerNavigator {
     return &self._navigator;
 }
 
@@ -436,7 +436,7 @@ fn importScript(self: *WorkerGlobalScope, arena: Allocator, url: [:0]const u8) !
         try self.headersForRequest(transfer);
     }
 
-    var response = http_client.syncRequest(transfer) catch |err| {
+    var response = transfer.submitSync() catch |err| {
         log.warn(.http, "importScript", .{ .url = resolved_url, .err = err });
         return error.NetworkError;
     };

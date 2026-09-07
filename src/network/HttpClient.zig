@@ -20,11 +20,11 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const Inbox = @import("../Inbox.zig");
+const Watchdog = @import("../Watchdog.zig");
 const ArenaPool = @import("../ArenaPool.zig");
 const Notification = @import("../Notification.zig");
+const Driver = @import("../server/Driver.zig");
 
-const CDP = @import("../cdp/CDP.zig");
-const Watchdog = @import("../Watchdog.zig");
 const URL = @import("../browser/URL.zig");
 const referrer = @import("../browser/referrer.zig");
 const WebSocket = @import("../browser/webapi/net/WebSocket.zig");
@@ -35,6 +35,7 @@ const Network = @import("Network.zig");
 const Cache = @import("cache/Cache.zig");
 const RobotsGate = @import("RobotsGate.zig");
 const UrlBlocklist = @import("UrlBlocklist.zig");
+
 pub const BlockPattern = UrlBlocklist.Pattern;
 
 const log = lp.log;
@@ -88,6 +89,10 @@ in_use: std.DoublyLinkedList = .{},
 // Queue for request that are waiting an available connection (aka, easy)
 pending_queue: std.DoublyLinkedList = .{},
 
+// Transfers waiting out the per-host navigation throttle, ordered by _run_at.
+delayed_queue: std.DoublyLinkedList = .{},
+delayed_count: usize = 0,
+
 // Queue for completed transfers that haven't had their callbacks executed yet
 dispatch_queue: std.DoublyLinkedList = .{},
 
@@ -135,32 +140,38 @@ use_proxy: bool,
 // Current TLS verification state, applied per-connection in makeRequest.
 tls_verify: bool = true,
 
+// Test-only fault injection: makes the next submit() fail synchronously from
+// inside the pipeline, the shape where error_callback fires AND the error is
+// returned to the caller (see Transfer.submit).
+test_fail_submit: if (lp.IS_TEST) ?anyerror else void = if (lp.IS_TEST) null else {},
+
 // User agent override set via CDP Emulation.setUserAgentOverride.
 // When set, takes precedence over the config's http_headers value.
 // Allocated from self.allocator when set, null otherwise.
 user_agent_override: ?[:0]const u8 = null,
 
-// The CDP layer we dispatch inbox messages to. Set in CDP.init for
-// `serve` mode; null in all other modes. Since this is set early, BEFORE the
-// CDP socket is registered with the network thread, we also have the
-// `cdp_link_active` boolean.
-cdp: ?*CDP = null,
+// The protocol layer we dispatch inbox messages to. Set in CDP.init /
+// BiDi.init for `serve` mode; null in all other modes. Since this is set
+// early, BEFORE the socket is registered with the network thread, we also
+// have the `driver_link_active` boolean.
+driver: ?Driver = null,
 
 // True iff a producer (Server.handleConnection, after the worker
-// handshake completes) has registered the CDP socket with the Network
+// handshake completes) has registered the client socket with the Network
 // thread and Network will fire curl_multi_wakeup on our multi handle
-// when it pushes to the inbox. perform uses this — NOT `cdp != null`
+// when it pushes to the inbox. perform uses this — NOT `driver != null`
 // — to decide whether to block in poll without any in-flight curl
-// work. cdp is set in CDP.init, well before the link is wired; tests
-// and the pre-handshake window have a cdp but no producer, so polling
+// work. driver is set in the driver's init, well before the link is
+// wired; tests and the pre-handshake window have a driver but no
+// producer, so polling
 // there would just eat the timeout waiting for a wakeup that's never
 // coming.
-cdp_link_active: bool = false,
+driver_link_active: bool = false,
 
-// CDP messages parsed off the WS socket by the Network thread land
+// Client messages read off the WS socket by the Network thread land
 // here. perform drains the inbox at each safe point and dispatches
-// via cdp.onMessage / onPing / onClose / onDisconnect. Always present
-// even in non-CDP mode — the empty-queue drain is one mutex lock plus
+// via driver.onMessage / onPing / onClose / onDisconnect. Always present
+// even in non-serve mode — the empty-queue drain is one mutex lock plus
 // a linked-list head check, cheaper than nullability everywhere.
 inbox: Inbox,
 
@@ -176,24 +187,30 @@ blocking_requests: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 // heuristics add this in.
 intercepted: usize = 0,
 
-// null or referencing network.cache
-cache: ?*Cache,
+cache: *Cache,
 
 // Cached config decisions, resolved once at init.
 serve_mode: bool,
 obey_robots: bool,
 
+// Applied to every transfer at configureConn, so a CDP change takes effect
+// on the next request, not on in-flight ones.
+http_version: lp.Config.HttpVersion,
+
 robots: RobotsGate,
 url_blocklist: ?UrlBlocklist,
 
-pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) !void {
-    var handles = try http.Handles.init(network.config);
+pub fn init(self: *Client, app: *lp.App, driver: ?Driver) !void {
+    const config = app.config;
+    const allocator = app.allocator;
+
+    var handles = try http.Handles.init(config);
     errdefer handles.deinit();
 
-    const http_proxy = network.config.httpProxy();
+    const http_proxy = config.httpProxy();
 
     var url_blocklist: ?UrlBlocklist = null;
-    if (network.config.blockedUrlPatterns()) |initial_patterns| {
+    if (config.blockedUrlPatterns()) |initial_patterns| {
         var patterns: std.ArrayList([]const u8) = .empty;
         defer patterns.deinit(allocator);
 
@@ -207,27 +224,30 @@ pub fn init(self: *Client, allocator: Allocator, network: *Network, cdp: ?*CDP) 
     }
     errdefer if (url_blocklist) |*blocklist| blocklist.deinit();
 
+    const network = &app.network;
+
     self.* = Client{
         .handles = handles,
         .network = network,
-        .allocator = allocator,
-        .cdp = cdp,
+        .allocator = app.allocator,
+        .driver = driver,
         .inbox = .{},
-        .cache = if (network.cache) |*c| c else null,
+        .cache = &network.cache,
 
         .use_proxy = http_proxy != null,
         .http_proxy = http_proxy,
         .tls_verify = network.config.tlsVerifyHost(),
         .max_response_size = network.config.httpMaxResponseSize() orelse 1 * 1024 * 1024 * 1024, // 1 GiB
 
-        .serve_mode = network.config.mode == .serve,
-        .obey_robots = network.config.obeyRobots(),
+        .serve_mode = config.mode == .serve,
+        .obey_robots = config.obeyRobots(),
+        .http_version = config.httpVersion(),
         .robots = .{
             .network = network,
             .single_flight = .init(allocator),
         },
         .url_blocklist = url_blocklist,
-        .arena_pool = &network.app.arena_pool,
+        .arena_pool = &app.arena_pool,
     };
 }
 
@@ -260,6 +280,7 @@ pub fn deinit(self: *Client) void {
     self.blocking_requests.deinit(self.allocator);
     self.transfers.deinit(self.allocator);
     self.inbox.deinit();
+    self.cache.maintenance(lp.datetime.timestamp(.real));
 }
 
 // Look up a live transfer by its id. Returns null if the transfer has been
@@ -304,11 +325,21 @@ pub fn setTlsVerify(self: *Client, verify: bool) !void {
     self.tls_verify = verify;
 }
 
+pub fn obeyRobots(self: *Client, enable: bool) !void {
+    if (self.obey_robots == enable) return;
+    try self.ensureNoActiveConnection();
+    self.obey_robots = enable;
+}
+
+pub fn setHttpVersion(self: *Client, version: lp.Config.HttpVersion) void {
+    self.http_version = version;
+}
+
 pub fn disableCache(self: *Client, disable: bool) void {
     if (disable) {
-        self.cache = null;
+        self.cache = &Cache.noop;
     } else {
-        self.cache = if (self.network.cache) |*c| c else null;
+        self.cache = &self.network.cache;
     }
 }
 
@@ -372,10 +403,26 @@ fn clearUrlBlocklist(self: *Client) void {
     }
 }
 
-fn isUrlBlocked(self: *const Client, url: []const u8, internal: bool) bool {
+/// Every reason a request is refused before it reaches the network:
+/// `--block-urls` patterns and the `--adblock-lists` filters both land here
+/// so that no call site can apply one without the other.
+fn isUrlBlocked(self: *const Client, url: [:0]const u8, internal: bool) bool {
     if (internal) return false;
-    const blocklist = self.url_blocklist orelse return false;
-    return blocklist.isBlocked(url);
+    if (self.url_blocklist) |*blocklist| {
+        if (blocklist.isBlocked(url)) return true;
+    }
+    return self.isHostAdblocked(url);
+}
+
+fn isHostAdblocked(self: *const Client, url: [:0]const u8) bool {
+    const blocker = if (self.network.adblocker) |*b| b else return false;
+    const host = URL.getHostname(url);
+    if (host.len == 0 or host.len > 253) return false;
+    // The trie expects normalized (lowercase) hostnames; URLs aren't
+    // guaranteed to arrive that way.
+    var buf: [253]u8 = undefined;
+    const hostname = std.ascii.lowerString(&buf, host);
+    return blocker.matchHostname(hostname) == .blocked;
 }
 
 pub fn getUserAgent(self: *const Client) [:0]const u8 {
@@ -383,10 +430,11 @@ pub fn getUserAgent(self: *const Client) [:0]const u8 {
 }
 
 // Headers _all_ requests include.
-pub fn baselineHeaders(self: *const Client) [3]Transfer.RequestHeader {
+pub fn baselineHeaders(self: *const Client) [4]Transfer.RequestHeader {
     return .{
         .{ .name = "User-Agent", .value = self.getUserAgent() },
         .{ .name = "Sec-Ch-Ua", .value = lp.Config.HttpHeaders.sec_ch_ua, .source = .fixed },
+        .{ .name = "Sec-Ch-Ua-Full-Version-List", .value = lp.Config.HttpHeaders.sec_ch_ua_full_version_list, .source = .fixed },
         // Omitting Accept-Language triggers bot-protection on some CDNs
         // (Akamai) when Accept-Encoding is present.
         .{ .name = "Accept-Language", .value = lp.Config.HttpHeaders.accept_language },
@@ -419,6 +467,7 @@ pub fn abort(self: *Client) void {
     if (comptime lp.IS_DEBUG) {
         std.debug.assert(self.transfers.size == 0);
         std.debug.assert(self.pending_queue.first == null);
+        std.debug.assert(self.delayed_queue.first == null);
         std.debug.assert(self.dispatch_queue.first == null);
         std.debug.assert(self.gated_queue.first == null);
         std.debug.assert(self.in_use.first == null);
@@ -502,14 +551,14 @@ pub const Activity = struct {
 
 pub fn activity(self: *const Client) Activity {
     return .{
-        .http = self.http_active + self.dispatch_count + self.intercepted,
+        .http = self.http_active + self.dispatch_count + self.intercepted + self.delayed_count,
         .ws_events = self.ws_dispatch_count,
         .ws_conns = self.ws_active,
         .pending = self.pending_queue.first != null,
     };
 }
 
-// What CDP messages drainInbox is allowed to dispatch this tick.
+// What client messages drainInbox is allowed to dispatch this tick.
 //   .all       — outer event loop (Runner.tick). Safe to dispatch
 //                everything; the JS stack is empty.
 //   .sync_wait — reachable from inside a JS callback (syncRequest,
@@ -647,12 +696,12 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
     if (dispatched == false and processed == false and self.dispatch_queue.first == null and self.ws_dispatch_queue.first == null) {
         // Nothing was dispatched, no messages were processed and nothing is
         // waiting for dispatch. We need to wait for I/O.
-        if (running > 0 or self.cdp_link_active) {
+        if (running > 0 or self.driver_link_active or self.delayed_queue.first != null) {
             {
                 self.heartbeat.enterWait();
                 defer self.heartbeat.exitWait();
                 // The network layer will wake this up if there's acticity.
-                try self.handles.poll(&.{}, @intCast(timeout_ms));
+                try self.handles.poll(&.{}, @intCast(self.clampToDelayed(timeout_ms)));
             }
             // poll only waits, so we do the perform -> process dance again
             _ = try self.handles.perform();
@@ -683,12 +732,24 @@ pub fn _tick(self: *Client, timeout_ms: u32, mode: DrainMode) !bool {
             // doing some work (e.g. running tasks). Let's assert that we were
             // right in doing that, else we'll likely introduce latency.
             std.debug.assert(self.pending_queue.first == null);
+            std.debug.assert(self.delayed_queue.first == null);
             std.debug.assert(self.dispatch_queue.first == null);
             std.debug.assert(self.ws_dispatch_queue.first == null);
         }
     }
 
     return waited;
+}
+
+// Never sleep past the next delayed transfer's start time.
+fn clampToDelayed(self: *const Client, timeout_ms: u32) u32 {
+    const node = self.delayed_queue.first orelse return timeout_ms;
+    const transfer: *const Transfer = @fieldParentPtr("_node", node);
+    const now = lp.datetime.milliTimestamp(.boot);
+    if (transfer._run_at <= now) {
+        return 0;
+    }
+    return @intCast(@min(timeout_ms, transfer._run_at - now));
 }
 
 // Deliver completed response. This is the ONLY place user callbacks run,
@@ -799,6 +860,7 @@ fn isGated(self: *const Client, transfer: *const Transfer) bool {
 }
 
 fn startPending(self: *Client) !void {
+    try self.startDelayed();
     while (self.pending_queue.popFirst()) |queue_node| {
         const transfer: *Transfer = @fieldParentPtr("_node", queue_node);
         const conn = self.network.getConnection() orelse {
@@ -821,6 +883,57 @@ fn startPending(self: *Client) !void {
     }
 }
 
+// Enter the pipeline for every delayed transfer whose time has come.
+fn startDelayed(self: *Client) !void {
+    if (self.delayed_queue.first == null) {
+        return;
+    }
+    const now = lp.datetime.milliTimestamp(.boot);
+    while (self.delayed_queue.first) |node| {
+        const transfer: *Transfer = @fieldParentPtr("_node", node);
+        if (transfer._run_at > now) {
+            // these are added to the queue in order, so we can exit as soon as
+            // we hit the first future _run_at.
+            return;
+        }
+        self.delayed_count -= 1;
+        self.delayed_queue.remove(node);
+
+        transfer.state = .created;
+        self.pipeline(transfer, .start) catch |err| {
+            // Same as startPending: this can run from a tick(.sync_wait), and
+            // error_callback JS must not fire on a blocking request's stack.
+            if (transfer.state == .created) {
+                transfer.failAsync(err);
+            }
+            return err;
+        };
+    }
+}
+
+// Hold the transfer out of the pipeline until `run_at` (ms, boot clock).
+fn delay(self: *Client, transfer: *Transfer, run_at: u64) void {
+    transfer._run_at = run_at;
+    transfer.state = .delayed;
+    self.delayed_count += 1;
+
+    // Ordered insert; reservations for one host are monotonic, so this is
+    // usually an append.
+    var node = self.delayed_queue.last;
+    while (node) |n| {
+        const other: *const Transfer = @fieldParentPtr("_node", n);
+        if (other._run_at <= run_at) {
+            break;
+        }
+        node = n.prev;
+    }
+    if (node) |n| {
+        self.delayed_queue.insertAfter(n, &transfer._node);
+    } else {
+        self.delayed_queue.prepend(&transfer._node);
+    }
+}
+
 const SubmitFrom = enum { start, after_intercept, network };
 
 // Process a transfer, passing it through our pipeline. A transfer an move off
@@ -829,6 +942,12 @@ const SubmitFrom = enum { start, after_intercept, network };
 fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
     sw: switch (from) {
         .start => {
+            if (comptime lp.IS_TEST) {
+                if (self.test_fail_submit) |err| {
+                    return err;
+                }
+            }
+
             if (self.network.web_bot_auth) |wba| {
                 const authority = URL.getHost(transfer.req.url);
                 try wba.signRequest(transfer, authority);
@@ -859,7 +978,7 @@ fn pipeline(self: *Client, transfer: *Transfer, from: SubmitFrom) !void {
         },
         .after_intercept => {
             if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
-                log.warn(.http, "blocked url", .{ .url = transfer.req.url });
+                log.info(.http, "blocked url", .{ .url = transfer.req.url });
                 return transfer.failAsync(error.UrlBlocked);
             }
             if (try self.cacheLookup(transfer)) {
@@ -904,7 +1023,7 @@ fn findHeader(headers: []const http.Header, name: []const u8) ?[]const u8 {
 // the response; on an expired-with-validators entry the request becomes a
 // conditional revalidation.
 fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
-    const cache = self.cache orelse return false;
+    const cache = self.cache.active() orelse return false;
 
     const req = &transfer.req;
     if (req.method != .GET or req.streaming or req.skip_cache) {
@@ -921,19 +1040,24 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         return false;
     }
 
+    const arena = transfer.arena;
+
     // Redirects rewrite req.url; the entry must be stored/renewed under the
     // URL this lookup ran against, not the final hop. req.url is arena-owned,
     // so the captured slice outlives any redirect rewrite.
-    transfer._cache_key = req.url;
+    const key: [:0]const u8 = if (req.headers_only)
+        try std.fmt.allocPrintSentinel(arena.allocator(), "headers-only:{s}", .{req.url}, 0)
+    else
+        req.url;
+    transfer._cache_key = key;
 
-    const arena = transfer.arena;
     const req_headers = try arena.alloc(http.Header, transfer.req_headers.items.len);
     for (transfer.req_headers.items, req_headers) |hdr, *out| {
         out.* = .{ .name = hdr.name, .value = hdr.value };
     }
 
     const cache_result = cache.get(arena.allocator(), .{
-        .url = req.url,
+        .url = key,
         .timestamp = lp.datetime.timestamp(.real),
         .request_headers = req_headers,
     }) catch |e| blk: {
@@ -949,7 +1073,7 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         },
         .revalidate => |cached| {
             log.debug(.cache, "revalidate cache entry", .{
-                .url = req.url,
+                .url = key,
                 .etag = cached.etag,
                 .last_modified = cached.last_modified,
             });
@@ -969,7 +1093,7 @@ fn cacheLookup(self: *Client, transfer: *Transfer) !bool {
         },
         .stale => {
             lp.metrics.http_cache.incr(.miss);
-            cache.evict(req.url);
+            cache.evict(key);
             transfer._cache_intent = .store;
             return false;
         },
@@ -987,7 +1111,7 @@ fn cacheRevalidated(self: *Client, transfer: *Transfer) !bool {
         return false;
     }
     // could have been disabled in-between
-    const cache = self.cache orelse return false;
+    const cache = self.cache.active() orelse return false;
 
     const stale = transfer._cache_intent.revalidate;
     transfer._cache_intent = .none;
@@ -1023,7 +1147,7 @@ fn cacheStore(self: *Client, transfer: *Transfer) void {
     transfer._cache_intent = .none;
 
     // could have been disabled while waiting of the response
-    const cache = self.cache orelse return;
+    const cache = self.cache.active() orelse return;
 
     const arena = transfer.arena;
     const rh = &(transfer.res.header orelse return);
@@ -1136,69 +1260,6 @@ const SyncContext = struct {
     }
 };
 
-// Synchronous submit for a transfer created with newRequest. Like `submit`,
-// `syncRequest` consuems the transfer unconditionally.
-// Caller must deinit SyncResponse or otherwise take ownership of its optional arena
-pub fn syncRequest(self: *Client, transfer: *Transfer) !SyncResponse {
-    if (self.inbox.terminated) {
-        transfer.deinit();
-        return error.ClientDisconnected;
-    }
-    // A parser can start another blocking script/style fetch while unwinding
-    // a previous interrupted fetch. The first tickSync below would fail
-    // anyway; bail before submitting and notifying CDP.
-    if (self.hasPendingTeardown()) {
-        transfer.deinit();
-        return error.SyncWaitInterrupted;
-    }
-
-    var sync_ctx = SyncContext{ .client = self, .body = .empty };
-    errdefer if (sync_ctx.arena) |arena| arena.release();
-
-    const req = &transfer.req;
-    req.sync = true;
-    req.ctx = &sync_ctx;
-    req.header_callback = SyncContext.headerCallback;
-    req.data_callback = SyncContext.dataCallback;
-    req.done_callback = SyncContext.doneCallback;
-    req.error_callback = SyncContext.errorCallback;
-    req.shutdown_callback = SyncContext.shutdownCallback;
-
-    const frame_id = req.frame_id;
-    self.blocking_requests.putNoClobber(self.allocator, frame_id, transfer.id) catch |err| {
-        transfer.deinit();
-        return err;
-    };
-    defer self.releaseBlocking(frame_id);
-
-    try transfer.submit();
-
-    while (sync_ctx.completion == .in_progress) {
-        self.tickSync(200) catch |err| {
-            if (sync_ctx.completion == .in_progress) {
-                // tick failed for a reason unrelated to our transfer: OOM,
-                // client disconnect, or a queued teardown command (which
-                // sync_wait can't dispatch mid-parse — it would free the
-                // Page/Frame this stack holds). transfer.req.ctx points at
-                // &sync_ctx on this stack — abort to sever that reference
-                // before we return
-                transfer.abort(err);
-            }
-            return err;
-        };
-    }
-
-    switch (sync_ctx.completion) {
-        .in_progress => @panic("Impossible to be in progress here."),
-        .done, .shutdown => return .{
-            .status = sync_ctx.status,
-            .body = sync_ctx.body,
-            .arena = sync_ctx.arena,
-        },
-        .err => |e| return e,
-    }
-}
-
 fn processTransfer(self: *Client, transfer: *Transfer) !void {
     if (self.network.getConnection()) |conn| {
         return self.makeRequest(conn, transfer);
@@ -1262,14 +1323,14 @@ fn makeRequest(self: *Client, conn: *http.Connection, transfer: *Transfer) anyer
     _ = try self.handles.perform();
 }
 
-// Drain any CDP messages the Network thread pushed into our inbox
-// and dispatch them via the cdp_client callbacks. Returns
+// Drain any client messages the Network thread pushed into our inbox
+// and dispatch them via the driver callbacks. Returns
 // error.ClientDisconnected if the inbox surfaced a disconnect message,
 // so the worker loop can tear down the connection. Called from tick
 // only — NOT from perform, because perform recurses through
 // processOneMessage's redirect path.
 fn drainInbox(self: *Client, mode: DrainMode) !void {
-    const cdp = self.cdp orelse return;
+    const driver = &(self.driver orelse return);
     while (true) {
         const msg = switch (mode) {
             .all => self.inbox.pop(),
@@ -1280,20 +1341,19 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
         defer msg.deinit();
 
         switch (msg.payload) {
-            .cdp => |*c| cdp.onMessage(c) catch |err| {
+            .cdp, .bidi => driver.onMessage(msg) catch |err| {
                 // A single malformed/failed dispatch shouldn't poison
                 // the rest of the batch — log and continue.
-                log.err(.cdp, "CDP dispatch", .{ .err = err });
+                log.err(.app, "client dispatch", .{ .err = err });
             },
-            .ping => |body| cdp.onPing(body),
+            .ping => |body| driver.onPing(body),
             .close => {
-                cdp.onClose();
-                cdp.onDisconnect(null);
+                driver.onClose();
                 self.inbox.terminated = true;
                 return error.ClientDisconnected;
             },
             .disconnect => |err| {
-                cdp.onDisconnect(err);
+                driver.onDisconnect(err);
                 self.inbox.terminated = true;
                 return error.ClientDisconnected;
             },
@@ -1304,7 +1364,7 @@ fn drainInbox(self: *Client, mode: DrainMode) !void {
 fn isTerminalInboxMessage(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
         .close, .disconnect => true,
-        .cdp, .ping => false,
+        .cdp, .bidi, .ping => false,
     };
 }
 
@@ -1324,6 +1384,9 @@ fn allowDuringSyncWait(msg: *Inbox.Message) bool {
     return switch (msg.payload) {
         .ping, .close, .disconnect => true,
         .cdp => |c| isFetchInterceptionMethod(c.input.method),
+        // BiDi has no request interception yet, so nothing it can send is
+        // safe to dispatch from inside a JS callback.
+        .bidi => false,
     };
 }
 
@@ -1343,6 +1406,9 @@ fn isSyncWaitInterrupt(msg: *Inbox.Message) bool {
         .close, .disconnect => true,
         .ping => false,
         .cdp => |c| isTeardownMethod(c.input.method),
+        // Frames aren't parsed on the Network thread for BiDi, so we
+        // can't spot a teardown command without re-parsing here.
+        .bidi => false,
     };
 }
 
@@ -1428,6 +1494,11 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
     // we match that behavior: when CURLE_WRITE_ERROR arrives but our callback
     // never errored and bytes were received, treat it as success.
     const effective_err: ?anyerror = if (msg.err) |err| blk: {
+        // Our own headers_only abort, not a failure: fall through so the
+        // response is materialized and delivered with an empty body.
+        if (err == error.WriteError and transfer.res.headers_only_abort) {
+            break :blk null;
+        }
         if (err == error.WriteError and transfer.res.callback_error == null and transfer.res.bytes_received > 0) {
             log.debug(.http, "WriteError downgraded", .{ .url = transfer.req.url, .bytes = transfer.res.bytes_received });
             break :blk null;
@@ -1519,7 +1590,7 @@ fn processOneMessage(self: *Client, msg: http.Handles.MultiMessage, transfer: *T
                     }
 
                     if (self.isUrlBlocked(transfer.req.url, transfer.req.internal)) {
-                        log.warn(.http, "blocked url", .{ .url = transfer.req.url });
+                        log.info(.http, "blocked url", .{ .url = transfer.req.url });
                         self.removeConn(msg.conn);
                         transfer._conn = null;
                         transfer.failAsync(error.UrlBlocked);
@@ -1674,6 +1745,7 @@ pub const Request = struct {
         fetch,
         stylesheet,
         eventsource,
+        image,
 
         // Allowed Values: Document, Stylesheet, Image, Media, Font, Script,
         // TextTrack, XHR, Fetch, Prefetch, EventSource, WebSocket, Manifest,
@@ -1687,6 +1759,7 @@ pub const Request = struct {
                 .fetch => "Fetch",
                 .stylesheet => "Stylesheet",
                 .eventsource => "EventSource",
+                .image => "Image",
             };
         }
     };
@@ -1694,6 +1767,12 @@ pub const Request = struct {
     // Fetch request redirect mode. `.follow` keeps navigations, XHR and
     // internal requests transparently following redirects.
     pub const RedirectMode = enum { follow, manual, @"error" };
+
+    // How much of a headers_only body we'll read rather than abort. Draining
+    // costs bandwidth but keeps the connection poolable; aborting saves
+    // bandwidth but forces a reconnect. 16 KiB is the rough break-even: about
+    // ten segments, versus a TCP handshake plus a TLS one.
+    const HEADERS_ONLY_DRAIN_MAX: usize = 16 * 1024;
 
     frame_id: u32,
     loader_id: u32,
@@ -1710,6 +1789,15 @@ pub const Request = struct {
     timeout_ms: u32 = 0,
     skip_cache: bool = false,
 
+    // The caller wants the status and the response headers, not the body.
+    // Unlike a HEAD, the request itself is byte-for-byte a normal GET, so
+    // origins and CDNs see (and answer) exactly what a real browser sends;
+    // the body is then discarded, and torn off the wire if it doesn't fit in
+    // HEADERS_ONLY_DRAIN_MAX. The consumer still gets the usual
+    // start/header/done sequence, with an empty body; `data_callback` never
+    // fires.
+    headers_only: bool = false,
+
     // The document frame this request belongs to, for CDP attribution.
     // This will be different than frame_id for Workers.
     document_frame_id: ?u32 = null,
@@ -1717,6 +1805,9 @@ pub const Request = struct {
     // Requests that are internal to the browser and skip various layers,
     // these do not need to be deferred and do not obey robots.txt.
     internal: bool = false,
+
+    // Whether this request should (possibly) be throttled based on the RateLimiter
+    throttle: bool = false,
 
     // Set by syncRequest; only used to label the http_requests metric.
     sync: bool = false,
@@ -1970,7 +2061,13 @@ pub const Transfer = struct {
 
     start_time: u64,
 
+    // Earliest start time (ms, boot clock) while .delayed.
+    _run_at: u64 = 0,
+
     _notified_fail: bool = false,
+
+    // guard to ensure only one of done/error/shutdown is ever called
+    _outcome_delivered: bool = false,
 
     // Set when conn is temporarily detached from transfer during redirect
     // reconfiguration. Used by processMessages to release the orphaned conn
@@ -1988,9 +2085,10 @@ pub const Transfer = struct {
     // need to restore (and hence capture) the original headers.
     _intercept_original_headers: ?[]const RequestHeader = null,
 
-    // Linked into client.pending_queue while .queued; reused to link the
-    // retired transfer into client.graveyard (deinit unlinks it from the
-    // pending queue first, so the node is always free by then).
+    // Linked into client.pending_queue while .queued and client.delayed_queue
+    // while .delayed; reused to link the retired transfer into
+    // client.graveyard (deinit unlinks it from those queues first, so the
+    // node is always free by then).
     _node: std.DoublyLinkedList.Node = .{},
 
     // Buffered response ordered events awaiting dispatch.
@@ -2041,6 +2139,11 @@ pub const Transfer = struct {
         // linked into client.queue.
         queued,
 
+        // On client.delayed_queue, waiting for its per-host navigation slot
+        // (`_run_at`) before entering the pipeline. `_node` is linked into
+        // client.delayed_queue.
+        delayed,
+
         // Response events are buffered on `_events`, waiting for dispatch
         // to deliver them. `_queue_node` is linked into
         // client.dispatch_queue. No conn is held.
@@ -2061,9 +2164,9 @@ pub const Transfer = struct {
         // responsible for resuming or terminating it.
         parked: ParkedBy,
 
-        // detachInDelivery ran; user callbacks are noop'd, owner link is
-        // cleared, deliver() will deinit when its loop exits. `_conn`
-        // (if any) is what `deinit` will release.
+        // detachInDelivery ran; delivery callbacks are noop'd, owner link
+        // is cleared, deliver() will finishDelivery when its loop exits.
+        // `_conn` (if any) is what `deinit` will release.
         aborted,
     };
 
@@ -2141,10 +2244,90 @@ pub const Transfer = struct {
             return;
         }
 
+        if (self.req.throttle) {
+            if (self.client.network.rate_limiter) |*rl| {
+                const now = lp.datetime.milliTimestamp(.boot);
+                const run_at = rl.reserve(URL.getHostname(self.req.url), now) catch |err| {
+                    self.abortPipelineError(err);
+                    return err;
+                };
+                if (run_at > now) {
+                    const d = run_at - now;
+                    lp.metrics.http_navigation_delay_ms.observe(@intCast(d));
+                    log.debug(.http, "navigation delayed", .{ .url = self.req.url, .ms = d });
+                    self.client.delay(self, run_at);
+                    return;
+                }
+            }
+        }
+
         self.client.pipeline(self, .start) catch |err| {
             self.abortPipelineError(err);
             return err;
         };
+    }
+
+    pub fn submitSync(self: *Transfer) !SyncResponse {
+        const client = self.client;
+
+        if (client.inbox.terminated) {
+            self.deinit();
+            return error.ClientDisconnected;
+        }
+
+        // A parser can start another blocking script/style fetch while unwinding
+        // a previous interrupted fetch. The first tickSync below would fail
+        // anyway; bail before submitting and notifying CDP.
+        if (client.hasPendingTeardown()) {
+            self.deinit();
+            return error.SyncWaitInterrupted;
+        }
+
+        var sync_ctx = SyncContext{ .client = client, .body = .empty };
+        errdefer if (sync_ctx.arena) |arena| arena.release();
+
+        const req = &self.req;
+        req.sync = true;
+        req.ctx = &sync_ctx;
+        req.header_callback = SyncContext.headerCallback;
+        req.data_callback = SyncContext.dataCallback;
+        req.done_callback = SyncContext.doneCallback;
+        req.error_callback = SyncContext.errorCallback;
+        req.shutdown_callback = SyncContext.shutdownCallback;
+
+        const frame_id = req.frame_id;
+        client.blocking_requests.putNoClobber(client.allocator, frame_id, self.id) catch |err| {
+            self.deinit();
+            return err;
+        };
+        defer client.releaseBlocking(frame_id);
+
+        try self.submit();
+
+        while (sync_ctx.completion == .in_progress) {
+            client.tickSync(200) catch |err| {
+                if (sync_ctx.completion == .in_progress) {
+                    // tick failed for a reason unrelated to our transfer: OOM,
+                    // client disconnect, or a queued teardown command (which
+                    // sync_wait can't dispatch mid-parse — it would free the
+                    // Page/Frame this stack holds). transfer.req.ctx points at
+                    // &sync_ctx on this stack — abort to sever that reference
+                    // before we return
+                    self.abort(err);
+                }
+                return err;
+            };
+        }
+
+        switch (sync_ctx.completion) {
+            .in_progress => @panic("Impossible to be in progress here."),
+            .done, .shutdown => return .{
+                .status = sync_ctx.status,
+                .body = sync_ctx.body,
+                .arena = sync_ctx.arena,
+            },
+            .err => |e| return e,
+        }
     }
 
     pub fn deinit(self: *Transfer) void {
@@ -2163,9 +2346,13 @@ pub const Transfer = struct {
             self._conn = null;
         }
 
-        // Unlink from client.pending_queue if we were waiting for a handle.
+        // Unlink from client.pending_queue if we were waiting for a handle,
+        // or from client.delayed_queue if we were waiting for our slot.
         if (self.state == .queued) {
             self.client.pending_queue.remove(&self._node);
+        } else if (self.state == .delayed) {
+            self.client.delayed_queue.remove(&self._node);
+            self.client.delayed_count -= 1;
         }
 
         // Same for the dispatch queue: a queued transfer (buffered, or
@@ -2269,8 +2456,14 @@ pub const Transfer = struct {
                 .err = error.Shutdown,
             });
         }
-        self.req.shutdown_callback(self.req.ctx);
-        self.detachOrDeinit();
+        switch (self.state) {
+            .delivering => self.detachInDelivery(),
+            .aborted => {}, // already detached
+            else => {
+                self.req.shutdown_callback(self.req.ctx);
+                self.deinit();
+            },
+        }
     }
 
     // Decide whether to tear down now or defer.
@@ -2299,8 +2492,9 @@ pub const Transfer = struct {
     //     the next event (and, for a streaming transfer whose conn is
     //     still in the multi, so a nested pump's completion path
     //     short-circuits),
-    //   - noop every user callback so a nested pump draining the still-
-    //     inflight response can't re-enter user code,
+    //   - noop every delivery callback so a nested pump draining the still-
+    //     inflight response can't re-enter user code. shutdown_callback is
+    //     kept: only kill() calls it.
     //   - unlink from owner.transfers and clear `owner` so the owning
     //     Frame/WGS can be freed while this transfer is still draining.
     //     transfer.deinit (called by deliver() on exit) sees
@@ -2311,7 +2505,6 @@ pub const Transfer = struct {
         // releases it once libcurl is done.
         self.state = .aborted;
         self.req.start_callback = null;
-        self.req.shutdown_callback = noopShutdown;
         self.req.header_callback = Noop.headerCallback;
         self.req.data_callback = Noop.dataCallback;
         self.req.done_callback = Noop.doneCallback;
@@ -2329,6 +2522,10 @@ pub const Transfer = struct {
         if (self._notified_fail) {
             return;
         }
+
+        if (self.state == .aborted) {
+            return;
+        }
         self._notified_fail = true;
 
         if (!self.req.internal) {
@@ -2343,6 +2540,7 @@ pub const Transfer = struct {
             });
         }
 
+        self._outcome_delivered = true;
         self.req.error_callback(self.req.ctx, err);
     }
 
@@ -2351,7 +2549,7 @@ pub const Transfer = struct {
     fn failDelivery(self: *Transfer, err: anyerror) void {
         log.err(.http, "delivery callback", .{ .err = err, .req = self });
         self.requestFailed(err);
-        self.deinit();
+        self.finishDelivery();
     }
 
     // Fail the transfer asynchronously: the error is buffered and
@@ -2519,7 +2717,11 @@ pub const Transfer = struct {
             }
         }
 
-        if (opts.check_content_length) {
+        // headers_only is exempt: the cap exists to bound how much body we
+        // buffer, and this transfer buffers none of it. Failing a 4 MB image
+        // we were never going to read would turn the size limit into a
+        // spurious `error` event on a perfectly good response.
+        if (opts.check_content_length and !self.req.headers_only) {
             if (self.getContentLength()) |cl| {
                 if (cl > self.client.max_response_size) {
                     return error.ResponseTooLarge;
@@ -2537,6 +2739,7 @@ pub const Transfer = struct {
         try conn.setFollowLocation(false);
         try conn.setProxy(client.http_proxy);
         try conn.setTlsVerify(client.tls_verify, client.use_proxy);
+        try conn.setHttpVersion(client.http_version);
 
         try conn.setURL(req.url);
         try conn.setMethod(req.method);
@@ -2703,6 +2906,14 @@ pub const Transfer = struct {
             break :blk resolved;
         };
 
+        // When the redirect target is not same-origin with the current URL,
+        // the Authorization header must not follow the request to the new
+        // origin.
+        // _auth_challenge is always cleared thanks to detectAuthChallenge.
+        if (!URL.isSameOrigin(url, req.url)) {
+            transfer.removeHeader("Authorization");
+        }
+
         try transfer.updateURL(url);
         // 301, 302, 303 → change to GET, drop body.
         // 307, 308 → keep method and body.
@@ -2763,7 +2974,7 @@ pub const Transfer = struct {
     // setHeader/appendHeader let a source overwrite headers from its own or
     // a lower layer, never a higher one. .fixed is hardcoded and can't be
     // changed (Sec-Ch-Ua). For CORS, only script-set headers cause a preflight.
-    pub const HeaderSource = enum { user_agent, author, cdp, fixed };
+    pub const HeaderSource = enum { user_agent, author, cdp, cli, fixed };
 
     pub const HeaderOpts = struct {
         source: HeaderSource = .user_agent,
@@ -2864,6 +3075,12 @@ pub const Transfer = struct {
         for (self.client.baselineHeaders()) |hdr| {
             try self.addHeader(hdr.name, hdr.value, .{ .source = hdr.source });
         }
+
+        // --http-header extras; setHeader so a same-name header (e.g.
+        // Accept-Language) overrides the baseline instead of duplicating.
+        for (self.client.network.config.httpHeaders()) |hdr| {
+            try self.setHeader(hdr.name, hdr.value, .{ .source = .cli });
+        }
     }
 
     // CDP Fetch.continueRequest: the intercepting client supplies the
@@ -2926,13 +3143,14 @@ pub const Transfer = struct {
                 return @intCast(chunk_len);
             }
 
-            // Pre-size buffer from Content-Length.
-            if (transfer.getContentLength()) |cl| {
-                if (cl > transfer.client.max_response_size) {
-                    res.callback_error = error.ResponseTooLarge;
-                    return http.writefunc_error;
+            if (transfer.req.headers_only == false) {
+                if (transfer.getContentLength()) |cl| {
+                    if (cl > transfer.client.max_response_size) {
+                        res.callback_error = error.ResponseTooLarge;
+                        return http.writefunc_error;
+                    }
+                    res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
                 }
-                res.buffer.ensureTotalCapacityPrecise(transfer.arena.allocator(), cl) catch {};
             }
         }
 
@@ -2941,6 +3159,21 @@ pub const Transfer = struct {
         }
 
         res.bytes_received += chunk_len;
+
+        if (transfer.req.headers_only) {
+            // Plenty of images have no Content-Length to decide this up front, so
+            // decide it as the body arrives.
+            if (res.bytes_received <= Request.HEADERS_ONLY_DRAIN_MAX) {
+                return @intCast(chunk_len);
+            }
+
+            // Returning writefunc_error is the only way to end a transfer
+            // early from a write callback; processOneMessage recognises the
+            // flag and treats the resulting CURLE_WRITE_ERROR as a completed
+            // response with an empty body.
+            res.headers_only_abort = true;
+            return http.writefunc_error;
+        }
 
         const chunk = buffer[0..chunk_len];
 
@@ -3156,6 +3389,7 @@ pub const Transfer = struct {
                             .content_length = transfer._content_length,
                         });
                     }
+                    transfer._outcome_delivered = true;
                     req.done_callback(req.ctx) catch |err| {
                         return transfer.failDelivery(err);
                     };
@@ -3169,13 +3403,22 @@ pub const Transfer = struct {
         }
 
         if (transfer.state == .aborted or terminal) {
-            transfer.deinit();
+            transfer.finishDelivery();
             return;
         }
 
         // Mid-stream batch fully delivered; the conn is still receiving.
         transfer._events.clearRetainingCapacity();
         transfer.state = .inflight;
+    }
+
+    fn finishDelivery(self: *Transfer) void {
+        if (self.state == .aborted and self._outcome_delivered == false) {
+            // the transfer is aborted and hasn't had a done/error/shutdown
+            // callback called yet.
+            self.req.shutdown_callback(self.req.ctx);
+        }
+        self.deinit();
     }
 };
 
@@ -3197,6 +3440,12 @@ const Response = struct {
 
     skip_body: bool = false,
     first_data_received: bool = false,
+
+    // Set when dataCallback deliberately killed the transfer to satisfy
+    // `Request.headers_only`. processOneMessage uses it to tell our own
+    // abort apart from a real CURLE_WRITE_ERROR and deliver the response
+    // (headers, status, empty body) as a success.
+    headers_only_abort: bool = false,
 
     // Response body. Filled by dataCallback, consumed in processMessages.
     // See Stream.spare to see how this works in streaming mode
@@ -3268,11 +3517,17 @@ const Synthetic = struct {
             content_type = parsed.content_type;
             body = parsed.body;
         } else {
+            // Fetch: a blob: request with any other method is a network error.
+            if (transfer.req.method != .GET) {
+                return error.BlobMethodNotAllowed;
+            }
+
             const owner = transfer.owner orelse return error.BlobNotFound;
-            if (!Owner.Blob.urlBelongsToOrigin(url, owner.origin.*)) {
+            const key = url[0 .. std.mem.indexOfScalar(u8, url, '#') orelse url.len];
+            if (!Owner.Blob.urlBelongsToOrigin(key, owner.origin.*)) {
                 return error.BlobNotFound;
             }
-            const blob = (owner.blob_urls.get(url) orelse return error.BlobNotFound).blob;
+            const blob = (owner.blob_urls.get(key) orelse return error.BlobNotFound).blob;
             // blob can be removed by the time we run, dupe it.
             content_type = try arena.dupe(u8, blob._mime);
             body = try arena.dupe(u8, blob._slice);
@@ -3291,6 +3546,11 @@ const Synthetic = struct {
 };
 
 const testing = @import("../testing.zig");
+const AdBlocker = @import("adblock/AdBlocker.zig");
+
+// The Network every test client points at: only the fields a test actually
+// exercises are ever set, by initTestClient or by the test itself.
+var test_network: Network = undefined;
 
 test "HttpClient: isFetchInterceptionMethod matches the four Fetch methods" {
     try testing.expect(isFetchInterceptionMethod("Fetch.continueRequest"));
@@ -3449,6 +3709,8 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
     client.transfers = .empty;
     client.blocking_requests = .empty;
     client.pending_queue = .{};
+    client.delayed_queue = .{};
+    client.delayed_count = 0;
     client.dispatch_queue = .{};
     client.gated_queue = .{};
     client.ws_dispatch_queue = .{};
@@ -3456,14 +3718,22 @@ fn initTestClient(client: *Client, pool: *ArenaPool) void {
     client.graveyard = .{};
     client.dispatch_count = 0;
     client.intercepted = 0;
-    client.cache = null;
+    client.http_active = 0;
+    client.ws_active = 0;
+    client.cache = &Cache.noop;
     client.serve_mode = false;
     client.obey_robots = false;
+    client.http_version = .auto;
     client.robots = .{
         .network = undefined,
         .single_flight = .init(testing.allocator),
     };
     client.url_blocklist = null;
+    client.test_fail_submit = null;
+    // isUrlBlocked reaches through here for the adblocker; tests that want
+    // one assign it to `client.network` after this returns.
+    test_network.adblocker = null;
+    client.network = &test_network;
 }
 
 test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
@@ -3485,6 +3755,32 @@ test "HttpClient: setBlockedUrls owns, replaces, and clears patterns" {
 
     try client.setBlockedUrls(&.{});
     try testing.expectEqual(null, client.url_blocklist);
+}
+
+test "HttpClient: adblock verdicts apply per request hostname" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+
+    var blocker: AdBlocker = try .init(testing.allocator);
+    defer blocker.deinit();
+    var list: std.Io.Reader = .fixed(
+        \\||ads.example.com^
+        \\@@||good.ads.example.com^
+    );
+    try blocker.parse(&list);
+    client.network.adblocker = blocker;
+    defer client.network.adblocker = null;
+
+    try testing.expect(client.isUrlBlocked("https://ads.example.com/pixel.gif", false));
+    // Hostnames are matched case-insensitively and without the port.
+    try testing.expect(client.isUrlBlocked("https://SUB.ADS.EXAMPLE.COM:8443/x", false));
+    try testing.expect(!client.isUrlBlocked("https://good.ads.example.com/app.js", false));
+    try testing.expect(!client.isUrlBlocked("https://example.com/", false));
+    // Internal transfers (robots.txt, ...) are never adblocked.
+    try testing.expect(!client.isUrlBlocked("https://ads.example.com/", true));
 }
 
 test "HttpClient: URL blocking exempts internal transfers" {
@@ -3725,6 +4021,171 @@ test "HttpClient: fulfillIntercepted survives a done_callback that tears down th
     try testing.expectEqual(null, owner.transfers.first);
 }
 
+test "HttpClient: kill during done_callback does not also fire shutdown_callback" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    // Runs before pool.deinit (LIFO): retired arenas must go back first.
+    defer client.processGraveyard();
+    defer client.transfers.deinit(testing.allocator);
+
+    var owner: Owner = .init(undefined, undefined);
+
+    const Ctx = struct {
+        client: *Client,
+        owner: *Owner,
+        in_done: bool = false,
+        done_called: bool = false,
+        shutdown_called: bool = false,
+        shutdown_during_done: bool = false,
+
+        fn doneCallback(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.done_called = true;
+            self.in_done = true;
+            defer self.in_done = false;
+            // Navigation / page-close kicked off by JS inside done_callback.
+            self.client.abortOwner(self.owner);
+        }
+
+        fn shutdownCallback(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.shutdown_called = true;
+            self.shutdown_during_done = self.in_done;
+        }
+    };
+    var ctx = Ctx{ .client = &client, .owner = &owner };
+
+    const arena = try pool.acquire(.small, "test");
+    const transfer = try arena.create(Transfer);
+    transfer.* = .{
+        .arena = arena,
+        .owner = null,
+        .req = .{
+            .frame_id = 0,
+            .loader_id = 0,
+            .method = .GET,
+            .url = "http://example.com/",
+            .cookie_jar = null,
+            .cookie_origin = "",
+            .resource_type = .xhr,
+            .notification = undefined,
+            .shutdown_callback = Ctx.shutdownCallback,
+            .ctx = &ctx,
+            .done_callback = Ctx.doneCallback,
+        },
+        .client = &client,
+        .id = 1,
+        .start_time = 0,
+    };
+
+    try client.transfers.putNoClobber(testing.allocator, transfer.id, transfer);
+    owner.addTransfer(transfer);
+    transfer.owner = &owner;
+
+    transfer.park(.intercept_request);
+    client.intercepted += 1;
+    try client.fulfillIntercepted(transfer, 200, &.{}, "hello");
+    _ = client.dispatchCompleted(.all);
+
+    try testing.expect(ctx.done_called);
+    try testing.expectEqual(false, ctx.shutdown_during_done);
+    try testing.expectEqual(false, ctx.shutdown_called);
+
+    // Freed exactly once regardless.
+    try testing.expectEqual(0, client.intercepted);
+    try testing.expectEqual(0, client.transfers.count());
+    try testing.expectEqual(null, owner.transfers.first);
+}
+
+test "HttpClient: kill during a non-terminal callback defers shutdown_callback" {
+    // Same re-entrant kill, but from header_callback: the consumer has had no
+    // outcome yet, so it must still get shutdown — once, and only after its
+    // callback has returned. done_callback must not run on top of it.
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    // Runs before pool.deinit (LIFO): retired arenas must go back first.
+    defer client.processGraveyard();
+    defer client.transfers.deinit(testing.allocator);
+
+    var owner: Owner = .init(undefined, undefined);
+
+    const Ctx = struct {
+        client: *Client,
+        owner: *Owner,
+        in_header: bool = false,
+        done_called: bool = false,
+        shutdown_calls: u8 = 0,
+        shutdown_during_header: bool = false,
+
+        fn headerCallback(transfer: *Transfer) !Transfer.HeaderResult {
+            const self: *@This() = @ptrCast(@alignCast(transfer.req.ctx));
+            self.in_header = true;
+            defer self.in_header = false;
+            self.client.abortOwner(self.owner);
+            return .proceed;
+        }
+
+        fn doneCallback(ctx: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.done_called = true;
+        }
+
+        fn shutdownCallback(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.shutdown_calls += 1;
+            self.shutdown_during_header = self.in_header;
+        }
+    };
+    var ctx = Ctx{ .client = &client, .owner = &owner };
+
+    const arena = try pool.acquire(.small, "test");
+    const transfer = try arena.create(Transfer);
+    transfer.* = .{
+        .arena = arena,
+        .owner = null,
+        .req = .{
+            .frame_id = 0,
+            .loader_id = 0,
+            .method = .GET,
+            .url = "http://example.com/",
+            .cookie_jar = null,
+            .cookie_origin = "",
+            .resource_type = .xhr,
+            .notification = undefined,
+            .shutdown_callback = Ctx.shutdownCallback,
+            .ctx = &ctx,
+            .header_callback = Ctx.headerCallback,
+            .done_callback = Ctx.doneCallback,
+        },
+        .client = &client,
+        .id = 1,
+        .start_time = 0,
+    };
+
+    try client.transfers.putNoClobber(testing.allocator, transfer.id, transfer);
+    owner.addTransfer(transfer);
+    transfer.owner = &owner;
+
+    transfer.park(.intercept_request);
+    client.intercepted += 1;
+    try client.fulfillIntercepted(transfer, 200, &.{}, "hello");
+    _ = client.dispatchCompleted(.all);
+
+    try testing.expectEqual(1, ctx.shutdown_calls);
+    try testing.expectEqual(false, ctx.shutdown_during_header);
+    try testing.expectEqual(false, ctx.done_called);
+
+    try testing.expectEqual(0, client.intercepted);
+    try testing.expectEqual(0, client.transfers.count());
+    try testing.expectEqual(null, owner.transfers.first);
+}
+
 test "HttpClient: aborting a robots-parked transfer unlinks it from the gate" {
     // Regression: RobotsGate's single-flight map kept a raw *Transfer with
     // nothing removing it when a parked transfer was aborted out-of-band
@@ -3795,7 +4256,8 @@ test "HttpClient: fulfillIntercepted follows a 3xx redirect" {
     // Only network.config (httpMaxRedirects, which ignores its config),
     // network.cache and the (empty) connection pool are read on this path.
     var net: Network = undefined;
-    net.cache = null;
+    net.cache = Cache.noop;
+    net.adblocker = null;
     // An empty pool makes processTransfer queue the re-issued request
     // instead of putting it on the wire — the queue IS the capture.
     net.available = .{};
@@ -4145,4 +4607,122 @@ test "HttpClient: abort survives an error_callback that tears down the owner" {
         try testing.expectEqual(0, client.transfers.count());
         try testing.expectEqual(null, owner.transfers.first);
     }
+}
+
+test "HttpClient: throttled navigations wait for their per-host slot" {
+    var pool = ArenaPool.init(testing.allocator, .{});
+    defer pool.deinit();
+
+    var net: Network = undefined;
+    net.cache = Cache.noop;
+    net.adblocker = null;
+    net.web_bot_auth = null;
+    // An empty pool makes processTransfer queue a started transfer instead
+    // of putting it on the wire — .queued IS "entered the pipeline".
+    net.available = .{};
+    net.conn_mutex = .init;
+    net.rate_limiter = @import("RateLimiter.zig").init(testing.allocator, 60_000, 1);
+    defer net.rate_limiter.?.deinit();
+
+    var client: Client = undefined;
+    initTestClient(&client, &pool);
+    defer client.processGraveyard();
+    client.network = &net;
+    defer client.transfers.deinit(testing.allocator);
+
+    const Helper = struct {
+        fn newTransfer(c: *Client, p: *ArenaPool, id: u32, url: [:0]const u8, throttle: bool) !*Transfer {
+            const arena = try p.acquire(.small, "test");
+            const transfer = try arena.create(Transfer);
+            transfer.* = .{
+                .arena = arena,
+                .owner = null,
+                .req = .{
+                    .frame_id = 0,
+                    .loader_id = 0,
+                    .method = .GET,
+                    .url = url,
+                    .cookie_jar = null,
+                    .cookie_origin = "",
+                    .resource_type = .document,
+                    .notification = undefined,
+                    .shutdown_callback = noopShutdown,
+                    .ctx = undefined,
+                    .throttle = throttle,
+                },
+                .client = c,
+                .id = id,
+                .start_time = 0,
+            };
+            try c.transfers.putNoClobber(testing.allocator, transfer.id, transfer);
+            return transfer;
+        }
+    };
+
+    // First navigation to a host goes straight through.
+    const a1 = try Helper.newTransfer(&client, &pool, 1, "http://a.example.com/1", true);
+    try a1.submit();
+    try testing.expectEqual(true, a1.state == .queued);
+    try testing.expectEqual(0, client.delayed_count);
+
+    // Later ones to the same host wait, in reservation order.
+    const a2 = try Helper.newTransfer(&client, &pool, 2, "http://a.example.com/2", true);
+    try a2.submit();
+    try testing.expectEqual(true, a2.state == .delayed);
+    const a3 = try Helper.newTransfer(&client, &pool, 3, "http://A.EXAMPLE.COM/3", true);
+    try a3.submit();
+    try testing.expectEqual(true, a3.state == .delayed);
+    try testing.expectEqual(true, a2._run_at < a3._run_at);
+
+    // Other hosts are independent, and non-throttled requests never wait.
+    const b1 = try Helper.newTransfer(&client, &pool, 4, "http://b.example.com/1", true);
+    try b1.submit();
+    try testing.expectEqual(true, b1.state == .queued);
+    const b2 = try Helper.newTransfer(&client, &pool, 5, "http://b.example.com/2", true);
+    try b2.submit();
+    try testing.expectEqual(true, b2.state == .delayed);
+    const a4 = try Helper.newTransfer(&client, &pool, 6, "http://a.example.com/sub", false);
+    try a4.submit();
+    try testing.expectEqual(true, a4.state == .queued);
+
+    // delayed_queue is ordered by _run_at: a2 <= b2 < a3
+    try testing.expectEqual(3, client.delayed_count);
+    try testing.expectEqual(3, client.activity().http);
+    {
+        var node = client.delayed_queue.first;
+        var order: [3]u32 = undefined;
+        for (&order) |*o| {
+            const t: *Transfer = @fieldParentPtr("_node", node.?);
+            o.* = t.id;
+            node = node.?.next;
+        }
+        try testing.expectEqual(null, node);
+        try testing.expectEqual(.{ 2, 5, 3 }, order);
+    }
+
+    // The tick's poll never sleeps past the next slot.
+    const clamped = client.clampToDelayed(200);
+    try testing.expectEqual(true, clamped <= 200);
+    // and nothing is due yet
+    try client.startPending();
+    try testing.expectEqual(3, client.delayed_count);
+
+    // Tearing down a delayed transfer unlinks it.
+    b2.deinit();
+    try testing.expectEqual(2, client.delayed_count);
+
+    // Once its time comes, a delayed transfer enters the pipeline.
+    a2._run_at = 0;
+    try client.startPending();
+    try testing.expectEqual(true, a2.state == .queued);
+    try testing.expectEqual(true, a3.state == .delayed);
+    try testing.expectEqual(1, client.delayed_count);
+    try testing.expectEqual(a3, @as(*Transfer, @fieldParentPtr("_node", client.delayed_queue.first.?)));
+
+    for ([_]*Transfer{ a1, a2, a3, b1, a4 }) |t| {
+        t.deinit();
+    }
+    try testing.expectEqual(0, client.delayed_count);
+    try testing.expectEqual(null, client.delayed_queue.first);
+    try testing.expectEqual(null, client.pending_queue.first);
 }

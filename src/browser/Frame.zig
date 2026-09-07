@@ -79,6 +79,7 @@ const GlobalEventHandlersLookup = @import("webapi/global_event_handlers.zig").Lo
 
 pub const parse = @import("frame/parse.zig");
 pub const preload = @import("frame/preload.zig");
+pub const resource_load = @import("frame/resource_load.zig");
 pub const observers = @import("frame/observers.zig");
 pub const user_input = @import("frame/user_input.zig");
 pub const node_factory = @import("frame/node_factory.zig");
@@ -273,6 +274,12 @@ _notified_network_almost_idle: IdleNotification = .init,
 // A navigation event that happens from a script gets scheduled to run on the
 // next tick.
 _queued_navigation: ?*QueuedNavigation = null,
+
+// Is there a <meta http-equiv=refresh> we need to fire on "load"?
+// Exactly which we need to fire can change, so rather than keeping it in sync
+// it's easier to scan for it on "load", but this is hint to avoid that scan
+// for the very common case where we're sure there isn't any.
+_maybe_meta_refresh: bool = false,
 
 // The URL of the current frame
 url: [:0]const u8 = "about:blank",
@@ -500,7 +507,9 @@ pub fn deinit(self: *Frame) void {
     // Unregister CookieStore from session notifications before the JS
     // context (and thus the scheduler) is destroyed, otherwise a late
     // mutation could schedule a callback that never runs.
-    if (self.window._cookie_store) |cs| cs.detach();
+    if (self.window._cookie_store) |cs| {
+        cs.detach();
+    }
 
     const page = self._page;
 
@@ -553,6 +562,8 @@ pub fn deinit(self: *Frame) void {
         browser.reportJsHeap();
     }
 
+    // fired the last moment the js context is still alive
+    page.session.notification.dispatch(.frame_destroyed, self);
     browser.env.destroyContext(self.js);
 
     // Must be after context is destroyed. A finalizer can reach into the *Worker
@@ -827,6 +838,7 @@ pub fn navigate(self: *Frame, request_url: [:0]const u8, opts: NavigateOpts) !vo
         // don't cache top-level pages, most cases won't revisit this, and, if they
         // do, they probably don't want the cached version.
         .skip_cache = self.parent == null,
+        .throttle = self.parent == null,
         .cookie_jar = &session.cookie_jar,
         .cookie_origin = opts.initiator_url orelse self.url,
         .resource_type = .document,
@@ -1092,7 +1104,7 @@ pub fn makeRequest(self: *Frame, req: HttpClient.Request) !void {
         errdefer transfer.deinit();
         try self.headersForRequest(transfer);
     }
-    return transfer.submit();
+    transfer.submit() catch {};
 }
 
 // Two-phase variant; see HttpClient.newRequest for the ownership contract.
@@ -1197,7 +1209,7 @@ pub fn iframeCompletedLoading(self: *Frame, iframe: *IFrame, delays_load: bool) 
     }
 }
 
-fn pendingLoadCompleted(self: *Frame) void {
+pub fn pendingLoadCompleted(self: *Frame) void {
     const pending_loads = self._pending_loads;
     if (pending_loads == 1) {
         self._pending_loads = 0;
@@ -1229,6 +1241,11 @@ pub fn documentIsComplete(self: *Frame) void {
         error.JsException => {}, // already logged
         else => log.err(.frame, "document is complete", .{ .err = err, .type = self._type, .url = self.url }),
     };
+
+    if (self._maybe_meta_refresh) {
+        self._maybe_meta_refresh = false;
+        self.metaRefreshOnLoad();
+    }
 
     if (self.parent == null) {
         self._session.browser.reportJsHeap();
@@ -1284,6 +1301,28 @@ fn notifyParentLoadComplete(self: *Frame) void {
 
     self._parent_notified = true;
     parent.iframeCompletedLoading(self.iframe.?, self._delays_parent_load);
+}
+
+fn metaRefreshOnLoad(self: *Frame) void {
+    const root = self.document.getDocumentElement() orelse return;
+    var tw = TreeWalker.Full.init(root.asNode(), .{});
+    while (tw.next()) |node| {
+        const meta = node.is(Element.Html.Meta) orelse continue;
+        const target = meta.refreshTarget() orelse continue;
+        return self.metaRefresh(target) catch |err| {
+            log.err(.frame, "meta refresh", .{ .err = err, .type = self._type, .url = self.url });
+        };
+    }
+}
+
+pub fn metaRefresh(self: *Frame, target: []const u8) !void {
+    if (self.isGoingAway()) {
+        return;
+    }
+    return self.scheduleNavigation(target, .{
+        .reason = .script,
+        .kind = .{ .replace = null },
+    }, .{ .script = self });
 }
 
 fn frameHeaderDoneCallback(transfer: *HttpClient.Transfer) !HttpClient.Transfer.HeaderResult {
@@ -1607,16 +1646,18 @@ fn frameDataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
     switch (self._parse_state) {
         .html => |*html| try html.buffer.appendSlice(html.arena.allocator(), data),
         .text => |*buf| {
-            // we have to escape the data...
+            // The payload is text, not markup: `&` has to be escaped too, or
+            // the parser turns a literal "&#9733;" in the body into a star.
             var v = data;
             while (v.len > 0) {
-                const index = std.mem.indexOfAnyPos(u8, v, 0, &.{ '<', '>' }) orelse {
+                const index = std.mem.indexOfAnyPos(u8, v, 0, &.{ '<', '>', '&' }) orelse {
                     return buf.appendSlice(self.arena, v);
                 };
                 try buf.appendSlice(self.arena, v[0..index]);
                 switch (v[index]) {
                     '<' => try buf.appendSlice(self.arena, "&lt;"),
                     '>' => try buf.appendSlice(self.arena, "&gt;"),
+                    '&' => try buf.appendSlice(self.arena, "&amp;"),
                     else => unreachable,
                 }
                 v = v[index + 1 ..];
@@ -1806,12 +1847,17 @@ fn frameErrorCallback(ctx: *anyopaque, err: anyerror) void {
         return;
     };
 }
+
 pub fn isGoingAway(self: *const Frame) bool {
+    return self.js.env.terminatePending() or self.hasQueuedNavigation();
+}
+
+fn hasQueuedNavigation(self: *const Frame) bool {
     if (self._queued_navigation != null) {
         return true;
     }
     const parent = self.parent orelse return false;
-    return parent.isGoingAway();
+    return parent.hasQueuedNavigation();
 }
 
 pub fn scriptAddedCallback(self: *Frame, comptime from_parser: bool, script: *Element.Html.Script) !void {
@@ -1846,8 +1892,8 @@ pub fn iframeAddedCallback(self: *Frame, iframe: *IFrame) !void {
     if (iframe._executed) {
         return;
     }
-    if (!self._session.subframe_loading_enabled) {
-        // configured not to load frames
+    if (self._session.load_resources.iframe == false) {
+        log.warnDisabledIFrame();
         iframe._executed = true;
         return;
     }
@@ -2138,10 +2184,14 @@ pub fn removeElementId(self: *Frame, element: *Element, id: []const u8) void {
 
 pub fn removeElementIdWithMaps(self: *Frame, id_maps: ElementIdMaps, id: []const u8) void {
     if (id_maps.lookup.remove(id)) {
-        const owned_id = self.dupeString(id) catch return;
-        id_maps.removed_ids.put(self.arena, owned_id, {}) catch |err| {
+        const gop = id_maps.removed_ids.getOrPut(self.arena, id) catch |err| {
             log.warn(.frame, "removeElementIdWithMaps", .{ .err = err });
+            return;
         };
+        if (gop.found_existing == false) {
+            gop.key_ptr.* = self.dupeString(id) catch return;
+            gop.value_ptr.* = {};
+        }
     }
 }
 
@@ -2260,9 +2310,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
 
     const session = self._session;
 
-    // this feature is disabled by default, and can be turned on via a command
-    // line flag or via an CDP command
-    if (session.load_external_stylesheets == false) {
+    if (session.load_resources.stylesheet == false) {
         return self.queueLoad(Factory.protoOf(link));
     }
 
@@ -2323,7 +2371,7 @@ pub fn loadExternalStylesheet(self: *Frame, link: *Element.Html.Link, href: []co
     sm.is_evaluating = true;
     defer sm.endEvaluationWindow(was_evaluating);
 
-    var response = http_client.syncRequest(transfer) catch |err| {
+    var response = transfer.submitSync() catch |err| {
         log.warn(.http, "external stylesheet fetch", .{ .err = err, .url = resolved });
         return self.fireElementEvent(element, comptime .wrap("error"));
     };
@@ -2964,6 +3012,9 @@ pub fn attributeChange(self: *Frame, element: *Element, name: String, value: Str
     } else if (name.eql(comptime .wrap("popover"))) {
         const old = if (old_value) |o| o.str() else null;
         popover.attributeChanged(element, old, value.str(), self);
+    } else if (name.eql(comptime .wrap("style"))) {
+        element._flags.has_inline_style = true;
+        self.styleAttributeChanged(element, value.str());
     }
 }
 
@@ -2985,7 +3036,16 @@ pub fn attributeRemove(self: *Frame, element: *Element, name: String, old_value:
         }
     } else if (name.eql(comptime .wrap("popover"))) {
         popover.attributeChanged(element, old_value.str(), null, self);
+    } else if (name.eql(comptime .wrap("style"))) {
+        self.styleAttributeChanged(element, null);
     }
+}
+
+fn styleAttributeChanged(self: *Frame, element: *Element, value: ?[]const u8) void {
+    const style = element.getStyle(self) orelse return;
+    style.asCSSStyleDeclaration().styleAttributeChanged(value, self) catch |err| {
+        log.err(.frame, "style attribute reparse", .{ .err = err, .type = self._type, .url = self.url });
+    };
 }
 
 pub fn signalSlotChange(self: *Frame, slot: *Element.Html.Slot) void {
@@ -3128,6 +3188,12 @@ fn nodeIsReady(self: *Frame, comptime from_parser: bool, node: *Node) !void {
         const frame = if (comptime from_parser) self else node.ownerFrame(self);
         frame.iframeAddedCallback(iframe) catch |err| {
             log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "iframe", .type = frame._type, .url = frame.url });
+            return err;
+        };
+    } else if (node.is(Element.Html.Meta)) |meta| {
+        const frame = if (comptime from_parser) self else node.ownerFrame(self);
+        meta.processRefresh(frame) catch |err| {
+            log.err(.frame, "frame.nodeIsReady", .{ .err = err, .element = "meta", .type = frame._type, .url = frame.url });
             return err;
         };
     } else if (node.is(Element.Html.Link)) |link| {
@@ -3337,21 +3403,25 @@ pub const QueuedNavigation = struct {
     navigation_type: NavigationType,
 };
 
+pub const TargetFrame = union(enum) {
+    frame: *Frame,
+    blank,
+};
+
 /// Resolves a target attribute value (e.g., "_self", "_parent", "_top", or frame name)
-/// to the appropriateFrame to navigate.
-/// Returns null if the target is "_blank" (which would open a new window/tab).
+/// to the Frame to navigate.
 /// Note: Callers should handle empty target separately (for owner document resolution).
-pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
+pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) TargetFrame {
     if (std.ascii.eqlIgnoreCase(target_name, "_self")) {
-        return self;
+        return .{ .frame = self };
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_blank")) {
-        return null;
+        return .blank;
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_parent")) {
-        return self.parent orelse self;
+        return .{ .frame = self.parent orelse self };
     }
 
     if (std.ascii.eqlIgnoreCase(target_name, "_top")) {
@@ -3359,13 +3429,13 @@ pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
         while (frame.parent) |f| {
             frame = f;
         }
-        return frame;
+        return .{ .frame = frame };
     }
 
     // Named frame lookup: search current frame's descendants first, then from root
     // This follows the HTML spec's "implementation-defined" search order.
     if (findFrameByName(self, target_name)) |f| {
-        return f;
+        return .{ .frame = f };
     }
 
     // If not found in descendants, search from root (catches siblings and ancestors' descendants)
@@ -3375,21 +3445,43 @@ pub fn resolveTargetFrame(self: *Frame, target_name: []const u8) ?*Frame {
     }
     if (root != self) {
         if (findFrameByName(root, target_name)) |f| {
-            return f;
+            return .{ .frame = f };
         }
     }
 
     // If no frame found with that name, navigate in current frame
     // (this matches browser behavior - unknown targets act like _self)
-    return self;
+    return .{ .frame = self };
+}
+
+/// Per spec the opener is withheld unless the element has rel=opener.
+pub fn openBlankTarget(self: *Frame, element: *Element, url: []const u8) !*Frame {
+    return self.openPopup(.{
+        .url = url,
+        .name = "",
+        .opener = if (hasRelToken(element, "opener")) self.window else null,
+    });
+}
+
+fn hasRelToken(element: *Element, token: []const u8) bool {
+    const rel = element.getAttributeSafe(comptime .wrap("rel")) orelse return false;
+    var it = std.mem.tokenizeAny(u8, rel, &std.ascii.whitespace);
+    while (it.next()) |t| {
+        if (std.ascii.eqlIgnoreCase(t, token)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn findFrameByName(frame: *Frame, name: []const u8) ?*Frame {
     for (frame.child_frames.items) |f| {
         if (f.iframe) |iframe| {
-            const frame_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse "";
-            if (std.mem.eql(u8, frame_name, name)) {
-                return f;
+            if (iframe.asNode().isConnected()) {
+                const frame_name = iframe.asElement().getAttributeSafe(comptime .wrap("name")) orelse "";
+                if (std.mem.eql(u8, frame_name, name)) {
+                    return f;
+                }
             }
         }
         // Recursively search child frames
@@ -3442,14 +3534,11 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         break :blk form_element.getAttributeSafe(comptime .wrap("target"));
     };
 
-    const target_frame = blk: {
+    const target: TargetFrame = blk: {
         const target_name = target_name_ orelse {
-            break :blk form_element.ownerFrame(self);
+            break :blk .{ .frame = form_element.ownerFrame(self) };
         };
-        break :blk self.resolveTargetFrame(target_name) orelse {
-            log.warn(.not_implemented, "target", .{ .type = self._type, .url = self.url, .target = target_name });
-            return;
-        };
+        break :blk self.resolveTargetFrame(target_name);
     };
 
     if (submit_opts.fire_event) {
@@ -3502,7 +3591,20 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
 
     // The submitter can be an input box (if enter was entered on the box)
     // I don't think this is technically correct, but FormData handles it ok
-    const form_data = try FormData.init(form, submitter_, &self.js.execution);
+    // Resolved before the entry list is built: a hidden `_charset_` field
+    // takes the submission encoding's name as its value.
+    const charset: []const u8 = blk: {
+        if (form_element.getAttributeSafe(.wrap("accept-charset"))) |ac| {
+            // Normalize to canonical encoding name
+            const info = h5e.encoding_for_label(ac.ptr, ac.len);
+            if (info.isValid()) {
+                break :blk info.name();
+            }
+        }
+        break :blk self.charset;
+    };
+
+    const form_data = try FormData.initWithCharset(form, submitter_, charset, &self.js.execution);
     form_data.acquireRef();
     defer form_data.releaseRef(self._page);
 
@@ -3554,18 +3656,6 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     const arena = try self._session.getArena(.medium, "submitForm");
     errdefer arena.release();
 
-    // Get charset from accept-charset attribute or fall back to document charset
-    const charset: []const u8 = blk: {
-        if (form_element.getAttributeSafe(.wrap("accept-charset"))) |ac| {
-            // Normalize to canonical encoding name
-            const info = h5e.encoding_for_label(ac.ptr, ac.len);
-            if (info.isValid()) {
-                break :blk info.name();
-            }
-        }
-        break :blk self.charset;
-    };
-
     var boundary_buf: [36]u8 = undefined;
     // GET ignores enctype per HTML spec; only resolve the union for POST.
     const encoding: FormData.EncType = blk: {
@@ -3582,7 +3672,7 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
     };
 
     var buf = std.Io.Writer.Allocating.init(arena.allocator());
-    try form_data.write(.{ .encoding = encoding, .charset = charset, .allocator = arena.allocator() }, &buf.writer);
+    try form_data.write(arena.allocator(), .{ .encoding = encoding, .charset = charset }, &buf.writer);
 
     var action = blk: {
         if (submit_button) |s| {
@@ -3609,6 +3699,12 @@ pub fn submitForm(self: *Frame, submitter_: ?*Element, form_: ?*Element.Html.For
         action = try URL.concatQueryString(arena.allocator(), action, buf.written());
     }
 
+    // Opened only once the submission goes ahead, so an aborted one leaves
+    // no stray window.
+    const target_frame = switch (target) {
+        .frame => |f| f,
+        .blank => try form_element.ownerFrame(self).openBlankTarget(form_element, ""),
+    };
     return self.scheduleNavigationWithArena(arena, action, opts, .{ .form = target_frame });
 }
 
@@ -3704,6 +3800,84 @@ test "Page: isSameOrigin" {
     try testing.expectEqual(false, frame.isSameOrigin("//origin.com/foo"));
 }
 
+test "Frame: static immediate meta refresh navigates" {
+    const page = try testing.pageTest("fixtures/meta_refresh.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    try testing.expect(std.mem.endsWith(u8, frame.url, "/fixtures/meta_refresh_target.html"));
+    // the rest of the page, including scripts after the meta, still ran
+    try testing.expectString("ran=1", (try frame.getTitle()).?);
+}
+
+test "Frame: meta refresh in a detached tree is ignored" {
+    // a <template> child and a clone are both created with a full set of
+    // attributes, but neither is ever in the document
+    const page = try testing.pageTest("fixtures/meta_refresh_ignored.html", .{});
+    defer page.close();
+
+    const frame = page.frame().?;
+    try testing.expect(std.mem.endsWith(u8, frame.url, "/fixtures/meta_refresh_ignored.html"));
+}
+
+test "Frame: dynamic immediate meta refresh waits for the load event" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+    _ = try appendMetaRefresh(frame, "0; /target");
+
+    // still loading, so the navigation is held
+    try testing.expectEqual(null, frame._queued_navigation);
+    try testing.expect(frame._maybe_meta_refresh);
+
+    frame.documentIsComplete();
+    try testing.expectString("https://example.com/target", frame._queued_navigation.?.url);
+}
+
+test "Frame: meta refresh added after the load event navigates" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+    frame.documentIsComplete();
+
+    _ = try appendMetaRefresh(frame, "0; /target");
+    try testing.expectString("https://example.com/target", frame._queued_navigation.?.url);
+}
+
+test "Frame: meta refresh edited into something inert before the load event" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "https://example.com/source";
+
+    const first = try appendMetaRefresh(frame, "0; /first");
+    _ = try appendMetaRefresh(frame, "0; /second");
+
+    // no longer an immediate refresh, so the next one in the document wins
+    try first.setAttribute(comptime .wrap("content"), comptime .wrap("10; /first"), frame);
+
+    frame.documentIsComplete();
+    try testing.expectString("https://example.com/second", frame._queued_navigation.?.url);
+}
+
+fn appendMetaRefresh(frame: *Frame, content: []const u8) !*Element {
+    const head = blk: {
+        if (frame.document.getDocumentElement()) |html| {
+            break :blk html.asNode().firstChild().?.as(Element);
+        }
+        const html = try frame.document.createElement("html", null, frame);
+        _ = try frame.document.asNode().appendChild(html.asNode(), frame);
+        const head = try frame.document.createElement("head", null, frame);
+        _ = try html.asNode().appendChild(head.asNode(), frame);
+        break :blk head;
+    };
+
+    const meta = try frame.document.createElement("meta", null, frame);
+    try meta.setAttribute(comptime .wrap("http-equiv"), comptime .wrap("refresh"), frame);
+    try meta.setAttribute(comptime .wrap("content"), .wrap(content), frame);
+    _ = try head.asNode().appendChild(meta.asNode(), frame);
+    return meta;
+}
+
 test "Frame: httpMetadata after navigation" {
     testing.expectLog(&.{.http});
 
@@ -3736,4 +3910,56 @@ test "Frame: 401" {
     defer buf.deinit();
     try @import("dump.zig").root(frame.document, .{}, &buf.writer, frame);
     try testing.expectEqual("<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><pre>No</pre></body></html>", buf.written());
+}
+
+test "Frame: scriptAddedCallback does not run a module when termination is pending" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    // An inline module: classic scripts are already refused by js.Script.run,
+    // modules go through Module.evaluate which has no gate of its own.
+    const element = try frame.document.createElement("script", null, frame);
+    try element.setAttribute(comptime .wrap("type"), comptime .wrap("module"), frame);
+    try element.asNode().setTextContent("globalThis.__terminated_inline_ran = true", frame);
+
+    // Parsing is over, so the inline module is evaluated on insertion rather
+    // than queued behind the static scripts.
+    frame._script_manager.base.static_scripts_done = true;
+
+    // The sticky terminate is set but V8's own state was consumed by the
+    // JSEntry unwind of whatever the terminate landed in.
+    const env = frame.js.env;
+    env.terminate();
+    JS.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+
+    try frame.scriptAddedCallback(false, element.as(HtmlElement.Script));
+    env.cancelTerminate();
+
+    var ls: JS.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+    try testing.expectEqual(false, (try ls.local.exec("globalThis.__terminated_inline_ran === true", null)).toBool());
+}
+
+test "Frame: iframeAddedCallback does not create a frame when termination is pending" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const session = frame._session;
+    const subframe_loading_enabled = session.load_resources.iframe;
+    session.load_resources.iframe = true;
+    defer session.load_resources.iframe = subframe_loading_enabled;
+
+    const element = try frame.document.createElement("iframe", null, frame);
+    const iframe = element.as(HtmlElement.IFrame);
+
+    const env = frame.js.env;
+    const contexts_before = env.contexts.items.len;
+    env.terminate();
+    JS.v8.v8__Isolate__CancelTerminateExecution(env.isolate.handle);
+    defer env.cancelTerminate();
+
+    try frame.iframeAddedCallback(iframe);
+    try testing.expectEqual(contexts_before, env.contexts.items.len);
+    try testing.expectEqual(false, iframe._executed);
 }

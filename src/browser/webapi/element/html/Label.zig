@@ -22,14 +22,6 @@ pub fn asNode(self: *Label) *Node {
     return self.asElement().asNode();
 }
 
-pub fn getHtmlFor(self: *Label) []const u8 {
-    return self.asElement().getAttributeSafe(comptime .wrap("for")) orelse "";
-}
-
-pub fn setHtmlFor(self: *Label, value: []const u8, frame: *Frame) !void {
-    try self.asElement().setAttributeSafe(comptime .wrap("for"), .wrap(value), frame);
-}
-
 pub fn getControl(self: *Label, frame: *Frame) ?*Element {
     if (self.asElement().getAttributeSafe(comptime .wrap("for"))) |id| {
         const el = frame.getElementByIdFromNode(self.asElement().asNode(), id) orelse return null;
@@ -63,17 +55,6 @@ pub fn findWrappingLabel(control: *Element) ?*Element {
     while (current) |n| : (current = n._parent) {
         const el = n.is(Element) orelse continue;
         if (el.getTag() == .label) return el;
-    }
-    return null;
-}
-
-/// First `<label for="id">` descendant of `root`, if any.
-pub fn findLabelByFor(root: *Node, id: []const u8) ?*Element {
-    var it = TreeWalker.Full.Elements.init(root, .{});
-    while (it.next()) |el| {
-        if (el.getTag() != .label) continue;
-        const for_attr = el.getAttributeSafe(comptime .wrap("for")) orelse continue;
-        if (std.mem.eql(u8, for_attr, id)) return el;
     }
     return null;
 }
@@ -143,7 +124,9 @@ pub const JsApi = struct {
         pub var class_id: bridge.ClassId = undefined;
     };
 
-    pub const htmlFor = bridge.accessor(Label.getHtmlFor, Label.setHtmlFor, .{ .ce_reactions = true });
+    const reflect = Element.Reflect(Label);
+
+    pub const htmlFor = reflect.string("for");
     pub const control = bridge.accessor(Label.getControl, null, .{});
 };
 

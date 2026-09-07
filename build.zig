@@ -24,15 +24,13 @@ const min_zig_version = std.SemanticVersion.parse(@import("build.zig.zon").minim
 
 const Build = blk: {
     if (builtin.zig_version.order(min_zig_version) == .lt) {
-        const message = std.fmt.comptimePrint(
+        @compileError(std.fmt.comptimePrint(
             \\Zig version is too old:
             \\  current Zig version: {f}
             \\  minimum Zig version: {f}
-        , .{ builtin.zig_version, min_zig_version });
-        @compileError(message);
-    } else {
-        break :blk std.Build;
+        , .{ builtin.zig_version, min_zig_version }));
     }
+    break :blk std.Build;
 };
 
 pub fn build(b: *Build) !void {
@@ -75,8 +73,8 @@ pub fn build(b: *Build) !void {
         .cpu_arch = .x86_64,
         .os_tag = .linux,
         .abi = .gnu,
-        // https://codeberg.org/ziglang/zig/issues/31272
-        .glibc_version = .{ .major = 2, .minor = 43, .patch = 0 },
+        // Explicit version => bundled CRT, https://codeberg.org/ziglang/zig/issues/31272
+        .glibc_version = devFastGlibcVersion(b),
     }) else requested_target;
 
     // Without an explicit -Dprebuilt_v8_path, pick up whatever `make
@@ -84,9 +82,11 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
     const snapshot_path = b.option([]const u8, "snapshot_path", "Path to v8 snapshot");
     const wpt_extensions = b.option(bool, "wpt_extensions", "Extend WebAPI with WPT driver behavior") orelse false;
-    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse
-        (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
+    const shared_v8 = b.option(bool, "shared_v8", "Link V8 as a shared library") orelse (dev_fast or (prebuilt_v8_path != null and std.mem.endsWith(u8, prebuilt_v8_path.?, ".so")));
     const use_llvm = b.option(bool, "use_llvm", "Use the LLVM backend") orelse !dev_fast;
+    // Hot-code layout for the Linux release artifacts, see orderfile/README.md.
+    // Opt-in (CI passes it): it needs LLD and costs link time on every build.
+    const orderfile = b.option([]const u8, "orderfile", "Linker script packing hot sections, e.g. orderfile/lightpanda.ld (Linux/LLD release builds)");
 
     const version = resolveVersion(b);
     std.debug.print("Lightpanda {f}\n", .{version});
@@ -100,40 +100,36 @@ pub fn build(b: *Build) !void {
     opts.addOption(?[]const u8, "snapshot_path", snapshot_path);
     opts.addOption(bool, "wpt_extensions", wpt_extensions);
 
-    const lightpanda_module = blk: {
-        const mod = b.addModule("lightpanda", .{
-            .root_source_file = b.path("src/lightpanda.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .link_libcpp = true,
-            .sanitize_c = enable_csan,
-            .sanitize_thread = enable_tsan,
-        });
-        mod.addImport("lightpanda", mod); // allow circular "lightpanda" import
-        mod.addImport("build_config", opts.createModule());
+    const lightpanda_module = b.addModule("lightpanda", .{
+        .root_source_file = b.path("src/lightpanda.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+        .sanitize_c = enable_csan,
+        .sanitize_thread = enable_tsan,
+    });
+    lightpanda_module.addImport("lightpanda", lightpanda_module); // allow circular "lightpanda" import
+    lightpanda_module.addImport("build_config", opts.createModule());
 
-        // Format check
-        const fmt_step = b.step("fmt", "Check code formatting");
-        const fmt = b.addFmt(.{
-            .paths = &.{ "src", "build.zig", "build.zig.zon" },
-            .check = true,
-        });
-        fmt_step.dependOn(&fmt.step);
+    const fmt_step = b.step("fmt", "Check code formatting");
+    const fmt = b.addFmt(.{
+        .paths = &.{ "src", "build.zig", "build.zig.zon" },
+        .check = true,
+    });
+    fmt_step.dependOn(&fmt.step);
+    b.default_step.dependOn(fmt_step);
 
-        // Set default behavior
-        b.default_step.dependOn(fmt_step);
-
-        try linkV8(b, mod, enable_asan, enable_tsan, prebuilt_v8_path, shared_v8);
-        try linkCurl(b, mod, curl_impersonate_archive, curl_impersonate_include, macos_sdk_path);
-        try linkHtml5Ever(b, mod);
-        linkZenai(b, mod);
-        linkIsocline(b, mod);
-
-        break :blk mod;
-    };
-
-    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan);
+    // With an orderfile, the prebuilt V8 archive is rewritten so its hot
+    // functions' sections can be addressed by the linker script.
+    const v8_archive: ?Build.LazyPath = if (prebuilt_v8_path) |path| .{ .cwd_relative = path } else null;
+    const v8_for_link = if (orderfile != null and v8_archive != null and !shared_v8) markHotSections(b, v8_archive.?) else v8_archive;
+    linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8);
+    try linkCurl(b, lightpanda_module, curl_impersonate_archive, curl_impersonate_include, macos_sdk_path);
+    linkRust(b, lightpanda_module);
+    linkZenai(b, lightpanda_module);
+    linkIsocline(b, lightpanda_module);
+    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan, orderfile != null);
 
     // Check compilation
     const check = b.step("check", "Check if lightpanda compiles");
@@ -149,29 +145,21 @@ pub fn build(b: *Build) !void {
     // with `zig build extras`.
     const extras_step = b.step("extras", "Build snapshot_creator");
 
+    const exe_config: ExeConfig = .{
+        .check = check,
+        .lightpanda_module = lightpanda_module,
+        .target = target,
+        .optimize = optimize,
+        .use_llvm = use_llvm,
+        .orderfile = orderfile,
+        .sanitize_c = enable_csan,
+        .sanitize_thread = enable_tsan,
+    };
+
     {
         // browser
-        const exe = b.addExecutable(.{
-            .name = "lightpanda",
-            .use_llvm = use_llvm,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main.zig"),
-                .target = target,
-                .optimize = optimize,
-                .sanitize_c = enable_csan,
-                .sanitize_thread = enable_tsan,
-                .imports = &.{
-                    .{ .name = "lightpanda", .module = lightpanda_module },
-                },
-            }),
-        });
+        const exe = addExe(b, exe_config, "lightpanda", "lightpanda_exe_check", "src/main.zig");
         b.installArtifact(exe);
-
-        const exe_check = b.addLibrary(.{
-            .name = "lightpanda_exe_check",
-            .root_module = exe.root_module,
-        });
-        check.dependOn(&exe_check.step);
 
         const run_cmd = b.addRunArtifact(exe);
         if (b.args) |args| {
@@ -188,25 +176,8 @@ pub fn build(b: *Build) !void {
 
     {
         // snapshot creator
-        const exe = b.addExecutable(.{
-            .name = "lightpanda-snapshot-creator",
-            .use_llvm = use_llvm,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main_snapshot_creator.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "lightpanda", .module = lightpanda_module },
-                },
-            }),
-        });
+        const exe = addExe(b, exe_config, "lightpanda-snapshot-creator", "snapshot_creator_check", "src/main_snapshot_creator.zig");
         extras_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
-
-        const exe_check = b.addLibrary(.{
-            .name = "snapshot_creator_check",
-            .root_module = exe.root_module,
-        });
-        check.dependOn(&exe_check.step);
 
         const run_cmd = b.addRunArtifact(exe);
         if (b.args) |args| {
@@ -218,24 +189,7 @@ pub fn build(b: *Build) !void {
 
     {
         // skills generator
-        const exe = b.addExecutable(.{
-            .name = "lightpanda-skills",
-            .use_llvm = use_llvm,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main_skills.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{
-                    .{ .name = "lightpanda", .module = lightpanda_module },
-                },
-            }),
-        });
-
-        const exe_check = b.addLibrary(.{
-            .name = "skills_check",
-            .root_module = exe.root_module,
-        });
-        check.dependOn(&exe_check.step);
+        const exe = addExe(b, exe_config, "lightpanda-skills", "skills_check", "src/main_skills.zig");
 
         const run_cmd = b.addRunArtifact(exe);
         const out_dir = run_cmd.addOutputDirectoryArg("skills");
@@ -261,6 +215,58 @@ pub fn build(b: *Build) !void {
     }
 }
 
+const ExeConfig = struct {
+    check: *Build.Step,
+    lightpanda_module: *Build.Module,
+    target: Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    use_llvm: bool,
+    orderfile: ?[]const u8,
+    sanitize_c: ?std.zig.SanitizeC,
+    sanitize_thread: bool,
+};
+
+fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8, root_source_file: []const u8) *Build.Step.Compile {
+    const exe = b.addExecutable(.{
+        .name = name,
+        .use_llvm = config.use_llvm,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root_source_file),
+            .target = config.target,
+            .optimize = config.optimize,
+            .sanitize_c = config.sanitize_c,
+            .sanitize_thread = config.sanitize_thread,
+            .imports = &.{
+                .{ .name = "lightpanda", .module = config.lightpanda_module },
+            },
+        }),
+    });
+
+    if (config.orderfile) |path| {
+        // Per-function/per-datum sections exist only so the orderfile script
+        // can place individual hot functions; the self-hosted backend used by
+        // Debug builds does not support them on the C libraries, so they are
+        // gated on the orderfile being set (release/LLVM only).
+        exe.link_function_sections = true;
+        exe.link_data_sections = true;
+        exe.linker_script = .{ .cwd_relative = path };
+    }
+
+    const exe_check = b.addLibrary(.{
+        .name = check_name,
+        .root_module = exe.root_module,
+    });
+    config.check.dependOn(&exe_check.step);
+
+    return exe;
+}
+
+fn devFastGlibcVersion(b: *Build) std.SemanticVersion {
+    const host = b.graph.host.result.os.version_range.linux.glibc;
+    const newest_known: std.SemanticVersion = .{ .major = 2, .minor = 43, .patch = 0 };
+    return if (host.order(newest_known) == .gt) newest_known else host;
+}
+
 /// Looks for the prebuilt V8 that `make download-v8` caches. The cache
 /// path is keyed on the zig-v8 release tag, read from the install action so
 /// it cannot drift from CI (the Makefile reads the same source of truth).
@@ -278,32 +284,29 @@ fn findPrebuiltV8(b: *Build, target: Build.ResolvedTarget, dev_fast: bool) ?[]co
         return null;
     }
 
+    const cache_dir = b.pathFromRoot(".lp-cache");
     // The .so must keep the name the exe's DT_NEEDED records; the archive
     // name encodes V8 version, os and arch.
     const path = if (dev_fast)
-        b.fmt("{s}/prebuilt-v8/{s}/libc_v8.so", .{ b.pathFromRoot(".lp-cache"), tag })
+        b.pathJoin(&.{ cache_dir, "prebuilt-v8", tag, "libc_v8.so" })
     else blk: {
         const version = actionDefault(action, "v8:") orelse return null;
-        break :blk b.fmt("{s}/prebuilt-v8/{s}/libc_v8_{s}_{s}_{s}.a", .{
-            b.pathFromRoot(".lp-cache"),
-            tag,
+        break :blk b.pathJoin(&.{ cache_dir, "prebuilt-v8", tag, b.fmt("libc_v8_{s}_{s}_{s}.a", .{
             version,
             @tagName(target.result.os.tag),
             @tagName(target.result.cpu.arch),
-        });
+        }) });
     };
     std.Io.Dir.cwd().access(io, path, .{}) catch {
-        if (dev_fast) {
-            std.debug.print("No cached libc_v8.so; building V8 from source. `make download-v8` skips this.\n", .{});
-        }
+        std.debug.print("No prebuilt V8 at {s}; using the V8 source-build path. `make download-v8` fetches the prebuilt.\n", .{path});
         return null;
     };
     std.debug.print("Using prebuilt V8: {s}\n", .{path});
     return path;
 }
 
-// Returns the quoted `default:` value of a top-level `key` in the install
-// action's yaml.
+/// Returns the quoted `default:` value of a top-level `key` in the install
+/// action's yaml.
 fn actionDefault(action: []const u8, key: []const u8) ?[]const u8 {
     var in_key = false;
     var lines = std.mem.splitScalar(u8, action, '\n');
@@ -317,10 +320,41 @@ fn actionDefault(action: []const u8, key: []const u8) ?[]const u8 {
         if (std.mem.startsWith(u8, trimmed, "default:")) {
             var it = std.mem.splitScalar(u8, trimmed, '\'');
             _ = it.next();
-            return it.next();
+            if (it.next()) |value| return value;
+            break;
         }
     }
+    std.debug.print("Can't parse the `{s} default:` value from .github/actions/install/action.yml; prebuilt V8 discovery skipped.\n", .{key});
     return null;
+}
+
+/// Renames the hot V8 functions' sections (`.text` -> `.text.hot.<sym>`, see
+/// orderfile/mark_hot_sections.zig) so the orderfile script can gather them.
+fn markHotSections(b: *Build, archive: Build.LazyPath) Build.LazyPath {
+    const tool = b.addExecutable(.{
+        .name = "mark_hot_sections",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("orderfile/mark_hot_sections.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run = b.addRunArtifact(tool);
+    run.addFileArg(archive);
+    run.addFileArg(b.path("orderfile/v8.txt"));
+    return run.addOutputFileArg("libc_v8.a");
+}
+
+/// Per-function/per-datum sections let the -Dorderfile linker script place
+/// individual hot functions. Only enabled for orderfile (release/LLVM) builds:
+/// the self-hosted backend used by Debug builds fails to link the C libraries
+/// with them.
+fn sectionize(lib: *Build.Step.Compile, enabled: bool) *Build.Step.Compile {
+    if (enabled) {
+        lib.link_function_sections = true;
+        lib.link_data_sections = true;
+    }
+    return lib;
 }
 
 fn linkV8(
@@ -328,9 +362,9 @@ fn linkV8(
     mod: *Build.Module,
     is_asan: bool,
     is_tsan: bool,
-    prebuilt_v8_path: ?[]const u8,
+    prebuilt_v8_path: ?Build.LazyPath,
     shared_v8: bool,
-) !void {
+) void {
     const target = mod.resolved_target.?;
 
     const dep = b.dependency("v8", .{
@@ -347,47 +381,65 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkHtml5Ever(b: *Build, mod: *Build.Module) !void {
-    const is_debug = if (mod.optimize.? == .Debug) true else false;
+fn linkRust(b: *Build, mod: *Build.Module) void {
+    const is_debug = mod.optimize.? == .Debug;
 
+    // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
     const exec_cargo = b.addSystemCommand(&.{
         "cargo",           "build",
         "--profile",       if (is_debug) "dev" else "release",
         "--features",      if (is_debug) "memstats" else "",
-        "--manifest-path", "src/html5ever/Cargo.toml",
+        "--manifest-path", "src/rust/ffi/Cargo.toml",
     });
 
-    // Track Rust sources so edits invalidate the cargo step's cache.
-    // Without this, Zig keys the step on argv only and won't re-run cargo
-    // when lib.rs/Cargo.toml change.
-    for ([_][]const u8{
-        "src/html5ever/Cargo.toml",
-        "src/html5ever/Cargo.lock",
-        "src/html5ever/lib.rs",
-        "src/html5ever/sink.rs",
-        "src/html5ever/types.rs",
-        "src/html5ever/url.rs",
-    }) |path| {
-        exec_cargo.addFileInput(b.path(path));
-    }
+    addDirInputs(b, exec_cargo, "src/rust", "target") catch |err| {
+        std.debug.panic("walk src/rust: {t}", .{err});
+    };
+
+    // Cargo reports progress on stderr; left uncaptured, Zig prints it as a
+    // "failed command: ..." diagnostic on a successful build. A non-zero exit
+    // still surfaces the captured output.
+    _ = exec_cargo.captureStdErr(.{});
+
+    // don't let cargo's progress report (sent to stderr) cause Zig's build to
+    // print a 'failed command: ...' message. (non-zero status still outputs the error)
+    _ = exec_cargo.captureStdErr(.{});
 
     // TODO: We can prefer `--artifact-dir` once it become stable.
-    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "html5ever");
+    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "rust");
 
-    const html5ever_step = b.step("html5ever", "Install html5ever dependency (requires cargo)");
-    html5ever_step.dependOn(&exec_cargo.step);
+    const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
+    rust_step.dependOn(&exec_cargo.step);
 
-    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblitefetch_html5ever.a");
+    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblightpanda_ffi.a");
     mod.addObjectFile(obj);
 }
 
-fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool) void {
+/// Registers every file under `root` (relative to the build root) as an
+/// input of `run`, skipping the `skip_dir` subtree at any depth.
+fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []const u8) !void {
+    const io = b.graph.io;
+    var dir = try b.build_root.handle.openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+
+    var walker = try dir.walk(b.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => if (std.mem.eql(u8, entry.basename, skip_dir)) walker.leave(io),
+            .file => run.addFileInput(b.path(b.pathJoin(&.{ root, entry.path }))),
+            else => {},
+        }
+    }
+}
+
+fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
     const dep = b.dependency("sqlite3", .{
         .target = mod.resolved_target.?,
         .optimize = mod.optimize.?,
     });
 
-    const lib = dep.artifact("sqlite3");
+    const lib = sectionize(dep.artifact("sqlite3"), section);
     lib.root_module.sanitize_c = enable_csan;
     lib.root_module.sanitize_thread = is_tsan;
 
@@ -523,10 +575,8 @@ fn resolveVersion(b: *std.Build) std.SemanticVersion {
     else
         lightpanda_version;
 
-    // Only enrich versions that have a pre-release field and no explicit build metadata.
     if (version.pre == null or version.build != null) return version;
 
-    // For dev/nightly versions, calculate the commit count and hash
     const git_hash_raw = runGit(b, &.{ "rev-parse", "--short", "HEAD" }) catch return version;
     const commit_hash = std.mem.trim(u8, git_hash_raw, " \n\r");
 
@@ -542,13 +592,11 @@ fn resolveVersion(b: *std.Build) std.SemanticVersion {
     };
 }
 
-/// Helper function to run git commands and return stdout
 fn runGit(b: *std.Build, args: []const []const u8) ![]const u8 {
     var code: u8 = undefined;
-    const dir = b.pathFromRoot(".");
-    var command: std.ArrayList([]const u8) = .empty;
-    defer command.deinit(b.allocator);
-    try command.appendSlice(b.allocator, &.{ "git", "-C", dir });
-    try command.appendSlice(b.allocator, args);
-    return b.runAllowFail(command.items, &code, .ignore);
+    const command = try std.mem.concat(b.allocator, []const u8, &.{
+        &.{ "git", "-C", b.pathFromRoot(".") },
+        args,
+    });
+    return b.runAllowFail(command, &code, .ignore);
 }

@@ -674,7 +674,7 @@ pub fn evaluate(
     self: *Document,
     expression: []const u8,
     context_node: ?*Node,
-    resolver: ?js.Function,
+    resolver: ?js.Value,
     result_type: ?u16,
     result: ?*XPathResult,
     frame: *Frame,
@@ -697,7 +697,7 @@ pub fn evaluate(
 pub fn createExpression(
     _: *const Document,
     expression: []const u8,
-    resolver: ?js.Function,
+    resolver: ?js.Value,
     frame: *Frame,
 ) !*XPathExpression {
     _ = resolver;
@@ -916,16 +916,18 @@ fn elementFromPointImpl(self: *Document, x: f64, y: f64, ignore_x: bool, frame: 
 
         preorder_index += 1;
         if (node.is(Element)) |element| {
-            if (element.checkVisibilityCached(&visibility_cache, frame)) {
-                const dims = element.getElementDimensions(frame);
-                // x and y both come from preorder position in our faux layout.
-                const left = pos;
-                const top = pos;
-                const right = pos + dims.width;
-                const bottom = pos + dims.height;
-                const x_contained = ignore_x or (x >= left and x <= right);
-                if (x_contained and y >= top and y <= bottom) {
-                    topmost = element;
+            if (element.checkVisibilityCached(&visibility_cache, frame, .materialize)) {
+                if (y >= pos and y <= pos + element.boxAxis(frame, .height)) {
+                    if (ignore_x) {
+                        topmost = element;
+                    } else {
+                        // only bother calculating the horiziontal position for
+                        // elements contained by the vertical band
+                        const left = element.horizontalPosition(frame);
+                        if (x >= left and x <= left + element.boxAxis(frame, .width)) {
+                            topmost = element;
+                        }
+                    }
                 }
             }
         }

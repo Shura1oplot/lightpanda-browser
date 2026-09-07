@@ -25,14 +25,25 @@ const Execution = js.Execution;
 
 const PluginArray = @import("PluginArray.zig");
 const Permissions = @import("Permissions.zig");
+const ModelContext = @import("ModelContext.zig");
 const StorageManager = @import("StorageManager.zig");
 const NavigatorUAData = @import("NavigatorUAData.zig");
-const ModelContext = @import("ModelContext.zig");
+const Geolocation = @import("geolocation/Geolocation.zig");
 
 const Navigator = @This();
-_pad: bool = false,
+
+comptime {
+    // Ensure we don't cause an identity map conflict. Because _geolocation is
+    // lazy and, for now, Zig orders the highest-aligned field first, none of
+    // the other fields land at offset 0.
+    for ([_][]const u8{ "_plugins", "_permissions", "_storage", "_ua_data" }) |name| {
+        if (@offsetOf(Navigator, name) == 0) @compileError(name ++ " aliases the Navigator");
+    }
+}
+
 _plugins: PluginArray = .{},
 _permissions: Permissions = .{},
+_geolocation: ?*Geolocation = null,
 _storage: StorageManager = .{},
 _ua_data: NavigatorUAData = .{},
 
@@ -137,6 +148,15 @@ pub fn getPermissions(self: *Navigator) *Permissions {
     return &self._permissions;
 }
 
+pub fn getGeolocation(self: *Navigator, exec: *Execution) !*Geolocation {
+    if (self._geolocation) |g| {
+        return g;
+    }
+    const g = try exec._factory.create(Geolocation{});
+    self._geolocation = g;
+    return g;
+}
+
 pub fn getStorage(self: *Navigator) *StorageManager {
     return &self._storage;
 }
@@ -224,7 +244,6 @@ pub const JsApi = struct {
         pub const name = "Navigator";
         pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
-        pub const empty_with_no_proto = true;
     };
 
     pub const userAgent = bridge.accessor(Navigator.getUserAgent, null, .{});
@@ -246,16 +265,15 @@ pub const JsApi = struct {
     pub const globalPrivacyControl = bridge.accessor(Navigator.getGlobalPrivacyControl, null, .{});
 
     pub const javaEnabled = bridge.function(Navigator.javaEnabled, .{});
-    pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{ .exposed = .window, .noop = true });
+    pub const sendBeacon = bridge.function(Navigator.sendBeacon, .{ .noop = true });
     pub const permissions = bridge.accessor(Navigator.getPermissions, null, .{});
     pub const storage = bridge.accessor(Navigator.getStorage, null, .{});
     pub const userAgentData = bridge.accessor(Navigator.getUserAgentData, null, .{});
-
-    // window only
-    pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{ .exposed = .window });
-    pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{ .exposed = .window });
-    pub const registerProtocolHandler = bridge.function(Navigator.registerProtocolHandler, .{ .exposed = .window });
-    pub const unregisterProtocolHandler = bridge.function(Navigator.unregisterProtocolHandler, .{ .exposed = .window });
+    pub const plugins = bridge.accessor(Navigator.getPlugins, null, .{});
+    pub const geolocation = bridge.accessor(Navigator.getGeolocation, null, .{});
+    pub const modelContext = bridge.accessor(Navigator.getModelContext, null, .{});
+    pub const registerProtocolHandler = bridge.function(Navigator.registerProtocolHandler, .{});
+    pub const unregisterProtocolHandler = bridge.function(Navigator.unregisterProtocolHandler, .{});
 };
 
 const testing = @import("../../testing.zig");

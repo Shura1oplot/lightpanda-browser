@@ -170,6 +170,7 @@ pub const Function = struct {
     js_name: ?[:0]const u8 = null,
     exposed: Caller.Function.Opts.Exposed = .both,
     cache: ?Caller.Function.Opts.Caching = null,
+    rejects_bad_receiver: bool,
     func: *const fn (?*const v8.FunctionCallbackInfo) callconv(.c) void,
 
     fn init(comptime T: type, comptime func: anytype, comptime opts: Caller.Function.Opts) Function {
@@ -179,8 +180,7 @@ pub const Function = struct {
             .wpt_only = opts.wpt_only,
             .js_name = opts.js_name,
             .exposed = opts.exposed,
-            // Non-static methods receive `self` as their first param; static
-            // methods don't, so don't skip the first param for them.
+            .rejects_bad_receiver = returnsPromise(@TypeOf(func)),
             .arity = getArity(@TypeOf(func), if (opts.static) 0 else 1),
             .func = if (opts.noop) noopFunction else struct {
                 fn wrap(handle: ?*const v8.FunctionCallbackInfo) callconv(.c) void {
@@ -191,6 +191,14 @@ pub const Function = struct {
     }
 
     pub fn noopFunction(_: ?*const v8.FunctionCallbackInfo) callconv(.c) void {}
+
+    fn returnsPromise(comptime F: type) bool {
+        const R = @typeInfo(F).@"fn".return_type orelse return false;
+        return switch (@typeInfo(R)) {
+            .error_union => |eu| eu.payload,
+            else => R,
+        } == js.Promise;
+    }
 
     fn getArity(comptime T: type, comptime start: usize) usize {
         const Execution = js.Execution;
@@ -676,128 +684,132 @@ pub fn unknownWindowPropertyCallback(c_name: ?*const v8.Name, handle: ?*const v8
         .worker => {}, // no global lookup in a worker
     }
 
-    if (comptime lp.IS_DEBUG) {
-        if (std.mem.startsWith(u8, property, "__")) {
-            // some frameworks will extend built-in types using a __ prefix
-            // these should always be safe to ignore.
-            return js.Intercepted.no;
-        }
+    // @LOG-UNKNOWN-PROPERTY
+    // This was really useful when sites often broke because of an unimplemented
+    // feature. But it hasnt' been useful to me in ~6 months.
+    // if (comptime lp.IS_DEBUG) {
+    //     if (std.mem.startsWith(u8, property, "__")) {
+    //         // some frameworks will extend built-in types using a __ prefix
+    //         // these should always be safe to ignore.
+    //         return js.Intercepted.no;
+    //     }
 
-        const ignored = std.StaticStringMap(void).initComptime(.{
-            .{ "Deno", {} },
-            .{ "process", {} },
-            .{ "ShadyDOM", {} },
-            .{ "ShadyCSS", {} },
+    //     const ignored = std.StaticStringMap(void).initComptime(.{
+    //         .{ "Deno", {} },
+    //         .{ "process", {} },
+    //         .{ "ShadyDOM", {} },
+    //         .{ "ShadyCSS", {} },
 
-            // a lot of sites seem to like having their own window.config.
-            .{ "config", {} },
+    //         // a lot of sites seem to like having their own window.config.
+    //         .{ "config", {} },
 
-            .{ "litNonce", {} },
-            .{ "litHtmlVersions", {} },
-            .{ "litElementVersions", {} },
-            .{ "litHtmlPolyfillSupport", {} },
-            .{ "litElementHydrateSupport", {} },
-            .{ "litElementPolyfillSupport", {} },
-            .{ "reactiveElementVersions", {} },
+    //         .{ "litNonce", {} },
+    //         .{ "litHtmlVersions", {} },
+    //         .{ "litElementVersions", {} },
+    //         .{ "litHtmlPolyfillSupport", {} },
+    //         .{ "litElementHydrateSupport", {} },
+    //         .{ "litElementPolyfillSupport", {} },
+    //         .{ "reactiveElementVersions", {} },
 
-            .{ "recaptcha", {} },
-            .{ "grecaptcha", {} },
-            .{ "___grecaptcha_cfg", {} },
-            .{ "__recaptcha_api", {} },
-            .{ "__google_recaptcha_client", {} },
+    //         .{ "recaptcha", {} },
+    //         .{ "grecaptcha", {} },
+    //         .{ "___grecaptcha_cfg", {} },
+    //         .{ "__recaptcha_api", {} },
+    //         .{ "__google_recaptcha_client", {} },
 
-            .{ "CLOSURE_FLAGS", {} },
-            .{ "__REACT_DEVTOOLS_GLOBAL_HOOK__", {} },
-            .{ "ApplePaySession", {} },
-        });
-        if (!ignored.has(property)) {
-            var buf: [2048]u8 = undefined;
-            const key = std.fmt.bufPrint(&buf, "Window:{s}", .{property}) catch return js.Intercepted.no;
-            logUnknownProperty(local, key) catch return js.Intercepted.no;
-        }
-    }
+    //         .{ "CLOSURE_FLAGS", {} },
+    //         .{ "__REACT_DEVTOOLS_GLOBAL_HOOK__", {} },
+    //         .{ "ApplePaySession", {} },
+    //     });
+    //     if (!ignored.has(property)) {
+    //         var buf: [2048]u8 = undefined;
+    //         const key = std.fmt.bufPrint(&buf, "Window:{s}", .{property}) catch return js.Intercepted.no;
+    //         logUnknownProperty(local, key) catch return js.Intercepted.no;
+    //     }
+    // }
 
     return js.Intercepted.no;
 }
 
+// @LOG-UNKNOWN-PROPERTY
 // Only used for debugging
-pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8.Name, ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
-    if (comptime !lp.IS_DEBUG) {
-        @compileError("unknownObjectPropertyCallback should only be used in debug builds");
-    }
+// pub fn unknownObjectPropertyCallback(comptime JsApi: type) *const fn (?*const v8.Name, ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+//     if (comptime !lp.IS_DEBUG) {
+//         @compileError("unknownObjectPropertyCallback should only be used in debug builds");
+//     }
 
-    return struct {
-        fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
-            const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
+//     return struct {
+//         fn wrap(c_name: ?*const v8.Name, handle: ?*const v8.PropertyCallbackInfo) callconv(.c) u32 {
+//             const v8_isolate = v8.v8__PropertyCallbackInfo__GetIsolate(handle).?;
 
-            var caller: Caller = undefined;
-            if (!caller.init(v8_isolate)) {
-                return js.Intercepted.no;
-            }
-            defer caller.deinit();
+//             var caller: Caller = undefined;
+//             if (!caller.init(v8_isolate)) {
+//                 return js.Intercepted.no;
+//             }
+//             defer caller.deinit();
 
-            const local = &caller.local;
+//             const local = &caller.local;
 
-            var hs: js.HandleScope = undefined;
-            hs.init(local.isolate);
-            defer hs.deinit();
+//             var hs: js.HandleScope = undefined;
+//             hs.init(local.isolate);
+//             defer hs.deinit();
 
-            const property: []const u8 = js.String.toSlice(.{ .local = local, .handle = @ptrCast(c_name.?) }) catch {
-                return js.Intercepted.no;
-            };
+//             const property: []const u8 = js.String.toSlice(.{ .local = local, .handle = @ptrCast(c_name.?) }) catch {
+//                 return js.Intercepted.no;
+//             };
 
-            if (std.mem.startsWith(u8, property, "__")) {
-                // some frameworks will extend built-in types using a __ prefix
-                // these should always be safe to ignore.
-                return js.Intercepted.no;
-            }
+//             if (std.mem.startsWith(u8, property, "__")) {
+//                 // some frameworks will extend built-in types using a __ prefix
+//                 // these should always be safe to ignore.
+//                 return js.Intercepted.no;
+//             }
 
-            if (std.mem.startsWith(u8, property, "jQuery")) {
-                return js.Intercepted.no;
-            }
+//             if (std.mem.startsWith(u8, property, "jQuery")) {
+//                 return js.Intercepted.no;
+//             }
 
-            if (JsApi == @import("../webapi/cdata/Text.zig").JsApi or JsApi == @import("../webapi/cdata/Comment.zig").JsApi) {
-                if (std.mem.eql(u8, property, "tagName")) {
-                    // knockout does this, a lot.
-                    return js.Intercepted.no;
-                }
-            }
+//             if (JsApi == @import("../webapi/cdata/Text.zig").JsApi or JsApi == @import("../webapi/cdata/Comment.zig").JsApi) {
+//                 if (std.mem.eql(u8, property, "tagName")) {
+//                     // knockout does this, a lot.
+//                     return js.Intercepted.no;
+//                 }
+//             }
 
-            if (JsApi == @import("../webapi/element/Html.zig").JsApi or JsApi == @import("../webapi/Element.zig").JsApi or JsApi == @import("../webapi/element/html/Custom.zig").JsApi) {
-                // react ?
-                if (std.mem.eql(u8, property, "props")) return js.Intercepted.no;
-                if (std.mem.eql(u8, property, "hydrated")) return js.Intercepted.no;
-                if (std.mem.eql(u8, property, "isHydrated")) return js.Intercepted.no;
-            }
+//             if (JsApi == @import("../webapi/element/Html.zig").JsApi or JsApi == @import("../webapi/Element.zig").JsApi or JsApi == @import("../webapi/element/html/Custom.zig").JsApi) {
+//                 // react ?
+//                 if (std.mem.eql(u8, property, "props")) return js.Intercepted.no;
+//                 if (std.mem.eql(u8, property, "hydrated")) return js.Intercepted.no;
+//                 if (std.mem.eql(u8, property, "isHydrated")) return js.Intercepted.no;
+//             }
 
-            if (JsApi == @import("../webapi/Console.zig").JsApi) {
-                if (std.mem.eql(u8, property, "firebug")) return js.Intercepted.no;
-            }
+//             if (JsApi == @import("../webapi/Console.zig").JsApi) {
+//                 if (std.mem.eql(u8, property, "firebug")) return js.Intercepted.no;
+//             }
 
-            const ignored = std.StaticStringMap(void).initComptime(.{});
-            if (!ignored.has(property)) {
-                var buf: [2048]u8 = undefined;
-                const key = std.fmt.bufPrint(&buf, "{s}:{s}", .{ if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi), property }) catch return js.Intercepted.no;
-                logUnknownProperty(local, key) catch return js.Intercepted.no;
-            }
-            return js.Intercepted.no;
-        }
-    }.wrap;
-}
+//             const ignored = std.StaticStringMap(void).initComptime(.{});
+//             if (!ignored.has(property)) {
+//                 var buf: [2048]u8 = undefined;
+//                 const key = std.fmt.bufPrint(&buf, "{s}:{s}", .{ if (@hasDecl(JsApi.Meta, "name")) JsApi.Meta.name else @typeName(JsApi), property }) catch return js.Intercepted.no;
+//                 logUnknownProperty(local, key) catch return js.Intercepted.no;
+//             }
+//             return js.Intercepted.no;
+//         }
+//     }.wrap;
+// }
 
-fn logUnknownProperty(local: *const js.Local, key: []const u8) !void {
-    const ctx = local.ctx;
-    const gop = try ctx.unknown_properties.getOrPut(ctx.arena.allocator(), key);
-    if (gop.found_existing) {
-        gop.value_ptr.count += 1;
-    } else {
-        gop.key_ptr.* = try ctx.arena.dupe(u8, key);
-        gop.value_ptr.* = .{
-            .count = 1,
-            .first_stack = try ctx.arena.dupe(u8, (try local.stackTrace()) orelse "???"),
-        };
-    }
-}
+// fn logUnknownProperty(local: *const js.Local, key: []const u8) !void {
+//     const ctx = local.ctx;
+//     const gop = try ctx.unknown_properties.getOrPut(ctx.arena.allocator(), key);
+//     if (gop.found_existing) {
+//         gop.value_ptr.count += 1;
+//     } else {
+//         gop.key_ptr.* = try ctx.arena.dupe(u8, key);
+//         gop.value_ptr.* = .{
+//             .count = 1,
+//             .first_stack = try ctx.arena.dupe(u8, (try local.stackTrace()) orelse "???"),
+//         };
+//     }
+// }
 
 // Given a Type, returns the length of the prototype chain, including self
 fn prototypeChainLength(comptime T: type) usize {
@@ -1185,12 +1197,17 @@ pub const PageJsApis = flattenTypes(&.{
     @import("../webapi/storage/idb/idb.zig"),
     @import("../webapi/event/CookieChangeEvent.zig"),
     @import("../webapi/URL.zig"),
+    @import("../webapi/URLPattern.zig"),
     @import("../webapi/Window.zig"),
     @import("../webapi/Performance.zig"),
     @import("../webapi/EventCounts.zig"),
     @import("../webapi/PluginArray.zig"),
     @import("../webapi/MutationObserver.zig"),
     @import("../webapi/IntersectionObserver.zig"),
+    @import("../webapi/geolocation/Geolocation.zig"),
+    @import("../webapi/geolocation/GeolocationPosition.zig"),
+    @import("../webapi/geolocation/GeolocationCoordinates.zig"),
+    @import("../webapi/geolocation/GeolocationPositionError.zig"),
     @import("../webapi/CustomElementRegistry.zig"),
     @import("../webapi/ResizeObserver.zig"),
     @import("../webapi/IdleDeadline.zig"),
@@ -1228,7 +1245,7 @@ pub const PageJsApis = flattenTypes(&.{
 const worker_common_apis = [_]type{
     @import("../webapi/WorkerGlobalScope.zig"),
     @import("../webapi/WorkerLocation.zig"),
-    @import("../webapi/Navigator.zig"),
+    @import("../webapi/WorkerNavigator.zig"),
     @import("../webapi/NavigatorUAData.zig"),
     @import("../webapi/Permissions.zig"),
     @import("../webapi/StorageManager.zig"),
@@ -1275,6 +1292,7 @@ const worker_common_apis = [_]type{
     @import("../webapi/TaskSignal.zig"),
     @import("../webapi/event/TaskPriorityChangeEvent.zig"),
     @import("../webapi/URL.zig"),
+    @import("../webapi/URLPattern.zig"),
     @import("../webapi/canvas/OffscreenCanvas.zig"),
     @import("../webapi/canvas/OffscreenCanvasRenderingContext2D.zig"),
     @import("../webapi/net/XMLHttpRequest.zig"),
@@ -1283,6 +1301,7 @@ const worker_common_apis = [_]type{
     @import("../webapi/net/WebSocket.zig"),
     @import("../webapi/net/EventSource.zig"),
     @import("../webapi/FileReader.zig"),
+    @import("../webapi/FileReaderSync.zig"),
     @import("../webapi/ImageData.zig"),
     @import("../webapi/Performance.zig"),
     @import("../webapi/PerformanceObserver.zig"),
@@ -1308,10 +1327,13 @@ pub const SharedWorkerJsApis = flattenTypes(&([_]type{@import("../webapi/SharedW
 // subsets (PageJsApis, WorkerSnapshot.JsApis).
 pub const JsApis = blk: {
     const base = PageJsApis ++ [_]type{
+        // Worker-only, so it isn't in PageJsApis.
+        @import("../webapi/FileReaderSync.zig").JsApi,
         @import("../webapi/DedicatedWorkerGlobalScope.zig").JsApi,
         @import("../webapi/SharedWorkerGlobalScope.zig").JsApi,
         @import("../webapi/WorkerGlobalScope.zig").JsApi,
         @import("../webapi/WorkerLocation.zig").JsApi,
+        @import("../webapi/WorkerNavigator.zig").JsApi,
     };
     if (lp.build_config.wpt_extensions == false) {
         break :blk base;
