@@ -4,21 +4,21 @@ macOS arm64 обновлена на официальный стабильный 
 
 ## Состав
 
-| Файл                       | Версия                     | Размер, байт | SHA-256                                                            |
-| -------------------------- | -------------------------- | -----------: | ------------------------------------------------------------------ |
-| `lightpanda-aarch64-macos` | `0.4.0+d957d15dc`          |     83734296 | `a0bc53a40ec52e6ee63552c71ab1ad4abfd5ada7fa73545ee296edff4e766a8e` |
-| `lightpanda-aarch64-linux` | `1.0.0-dev.8694+5e43d40f6` |    179804152 | `e7771e8be76afb8075345487dc3a35eae8b25b427cbd4d2b915927ee17dd83d1` |
-| `lightpanda-x86_64-linux`  | `1.0.0-dev.8694+5e43d40f6` |    176049168 | `af8a6754fb967a92c46ca40fafa98d86fca3b86ee24e463548f984c8dd33ab2e` |
+| Платформа   | Путь от корня Zemlekop             | Версия                     |
+| ----------- | ---------------------------------- | -------------------------- |
+| macOS arm64 | `tools/bin/macos-arm64/lightpanda` | `0.4.0+d957d15dc`          |
+| Linux arm64 | `tools/bin/linux-arm64/lightpanda` | `1.0.0-dev.8694+5e43d40f6` |
+| Linux amd64 | `tools/bin/linux-amd64/lightpanda` | `1.0.0-dev.8694+5e43d40f6` |
 
-Предыдущий документ выпуска и файл macOS сохранены в `previous-2026-09-01`. Файлы `LICENSE` и `LICENSING.md` содержат условия лицензирования. `SHA256SUMS` проверяет состав текущего выпуска.
+14 сентября файлы перенесены по платформам без новой сборки. Учет контрольных сумм бинарных файлов удален. Предыдущий документ выпуска и прежний файл macOS сохранены в `previous-2026-09-01`. Файлы `LICENSE` и `LICENSING.md` содержат условия лицензирования.
 
 ## Исходный код macOS
 
 - Официальный выпуск [Lightpanda 0.4.0](https://github.com/lightpanda-io/browser/releases/tag/0.4.0) соответствует фиксации `3bab59c6a4ec45e3fecc237ba7b440e19cb1ea2b`.
 - Фиксация с изменениями владельца составляет `d957d15dc579eb1a870ae97169e7d72746c23f08`. Исходное дерево при сборке было чистым.
 - curl-impersonate `8.22.0` собран из фиксации `ba3ad317bef27fd75aac4f3585cbd0f1beb6574c`.
-- Полный статический архив curl-impersonate имеет SHA-256 `2748e172ced3935b16c1c15dc07063ce4d426878605300511cbe03cf712c0adb`. Параметры `CURL_IMPERSONATE_ENV_HOOK` и `USE_APPLE_SECTRUST` отключены.
-- V8 `14.9.207.35` из zig-v8 `v0.5.4` имеет SHA-256 `bf430343bf3ee3702bed284ad6e631ef8b251b593d9f6539912b976e7a3ab1e9`. Сумма совпала с данными официального выпуска.
+- В полном статическом архиве curl-impersonate параметры `CURL_IMPERSONATE_ENV_HOOK` и `USE_APPLE_SECTRUST` отключены.
+- Используется V8 `14.9.207.35` из zig-v8 `v0.5.4`.
 
 Сборка выполнена непосредственно на macOS `26.6.2`, arm64, с Zig `0.16.0`, Rust и Cargo `1.97.1` и SDK macOS `26.5`. Минимальная версия macOS в исполняемом файле составляет `12.0`.
 
@@ -42,18 +42,12 @@ macOS arm64 обновлена на официальный стабильный 
 
 ## Повторение сборки macOS
 
-Команды выполняются из корня репозитория Lightpanda после сборки статического curl-impersonate в соседнем репозитории:
+Текущий сценарий запускается из корня Zemlekop:
 
 ```bash
-make download-v8
-
-CURL_IMPERSONATE=lightpanda-invalid-profile \
-CURL_IMPERSONATE_HEADERS=no \
-make test CURL_IMPERSONATE_PREFIX=../curl-impersonate/build-static-lightpanda/install
-
-make build \
-  CURL_IMPERSONATE_PREFIX=../curl-impersonate/build-static-lightpanda/install \
-  ZIGFLAGS='-Dtarget=aarch64-macos.12.0 -Dversion=0.4.0+d957d15dc'
+scripts/build-lightpanda.sh
 ```
 
-Сборка выполнена один раз. Побайтовое воспроизведение двух независимых сборок этого обновления не проверялось. Linux в рамках этого обновления не собирался и не проверялся; его прежние свидетельства находятся в `previous-2026-09-01/RELEASE.md`. Платные серверы не создавались.
+Сценарий собирает текущую платформу, включая статический curl-impersonate, снимок V8 и тесты. Для Ubuntu amd64 из macOS используется `scripts/build-lightpanda-linux-amd64.sh`. Порядок и зависимости описаны в [`../../../scripts/README.md`](../../../scripts/README.md). Эти сценарии заменяют команды прежних отчетов о сборке.
+
+Сборка выполнена один раз. Побайтовое воспроизведение двух независимых сборок этого обновления не проверялось. Linux при этом обновлении не собирался и не проверялся; его прежние свидетельства находятся в `previous-2026-09-01/RELEASE.md`. Платные серверы не создавались.
