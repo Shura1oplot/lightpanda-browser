@@ -1599,9 +1599,10 @@ test "cdp: tick prioritizes terminal inbox over pending terminate" {
 
         ctx.driver.run();
 
-        var buf: [WS.CLOSE_PROTOCOL_ERROR.len]u8 = undefined;
+        const expected = [_]u8{ 0x88, 0x02, 0x03, 0xea }; // WebSocket close, code 1002
+        var buf: [expected.len]u8 = undefined;
         const n = try posix.read(ctx.socket, &buf);
-        try testing.expectEqualSlices(u8, &WS.CLOSE_PROTOCOL_ERROR, buf[0..n]);
+        try testing.expectEqualSlices(u8, &expected, buf[0..n]);
     }
 
     {
@@ -1620,9 +1621,10 @@ test "cdp: tick prioritizes terminal inbox over pending terminate" {
 
         // With no terminal message waiting, the client should receive a close
         // frame with code 1001 (going away), not just an abrupt socket close.
-        var buf: [WS.CLOSE_GOING_AWAY.len]u8 = undefined;
+        const expected = [_]u8{ 0x88, 0x02, 0x03, 0xe9 }; // WebSocket close, code 1001
+        var buf: [expected.len]u8 = undefined;
         const n = try posix.read(ctx.socket, &buf);
-        try testing.expectEqualSlices(u8, &WS.CLOSE_GOING_AWAY, buf[0..n]);
+        try testing.expectEqualSlices(u8, &expected, buf[0..n]);
     }
 }
 
