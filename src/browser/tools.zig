@@ -385,6 +385,7 @@ pub const Tool = enum {
                     \\    "selector": { "type": "string", "description": "Optional CSS selector. Render markdown for just that element's subtree." },
                     \\    "backendNodeId": { "type": "integer", "description": "Optional backend node ID. Render markdown for just that node's subtree. 0 is treated as omitted." },
                     \\    "maxBytes": { "type": "integer", "description": "Optional soft cap on output size in bytes. Content is truncated at a UTF-8 boundary and a short '[truncated]' marker is appended past the cap." },
+                    \\    "strip": { "type": "object", "description": "Optional. Omit element groups from the output; same groups as the html tool's strip. `shell` (page chrome by markup) and `clutter` (keep only the main content, in the manner of reader modes) are the ones that matter for reading; `ui` also drops images.", "properties": { "js": { "type": "boolean" }, "css": { "type": "boolean" }, "ui": { "type": "boolean" }, "invisible": { "type": "boolean" }, "shell": { "type": "boolean" }, "clutter": { "type": "boolean" } } },
                     \\    "url": { "type": "string", "description": "Optional URL to navigate to before rendering." },
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
                     \\  }
@@ -401,7 +402,7 @@ pub const Tool = enum {
                     \\    "selector": { "type": "string", "description": "Optional CSS selector. When set, dump only that element's outerHTML." },
                     \\    "backendNodeId": { "type": "integer", "description": "Optional backend node ID. When set, dump only that node's outerHTML. 0 is treated as omitted." },
                     \\    "maxBytes": { "type": "integer", "description": "Optional soft cap on output size in bytes. Content is truncated at a UTF-8 boundary and a short '[truncated]' marker is appended past the cap." },
-                    \\    "strip": { "type": "object", "description": "Optional. Omit element groups from the output: `js` (script, noscript, script preloads), `css` (style, stylesheet links), `ui` (css plus img, picture, video, audio, svg, canvas, iframe), `invisible` (elements an author rule or inline style sets to display:none). {\"js\":true,\"css\":true} keeps a page dump small.", "properties": { "js": { "type": "boolean" }, "css": { "type": "boolean" }, "ui": { "type": "boolean" }, "invisible": { "type": "boolean" } } },
+                    \\    "strip": { "type": "object", "description": "Optional. Omit element groups from the output: `js` (script, noscript, script preloads), `css` (style, stylesheet links), `ui` (css plus img, picture, video, audio, svg, canvas, iframe), `invisible` (elements an author rule or inline style sets to display:none), `shell` (nav, aside, dialog, page-level header/footer and the matching landmark roles; skipped when that would drop most of the text), `clutter` (keep only the main content, in the manner of reader modes; includes `shell` and `invisible`, and falls back to `shell` when it finds too little). {\"js\":true,\"css\":true} keeps a page dump small.", "properties": { "js": { "type": "boolean" }, "css": { "type": "boolean" }, "ui": { "type": "boolean" }, "invisible": { "type": "boolean" }, "shell": { "type": "boolean" }, "clutter": { "type": "boolean" } } },
                     \\    "url": { "type": "string", "description": "Optional URL to navigate to before dumping." },
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
                     \\  }
@@ -419,6 +420,7 @@ pub const Tool = enum {
                     \\    "selector": { "type": "string", "description": "Optional CSS selector. When set, render only that element." },
                     \\    "backendNodeId": { "type": "integer", "description": "Optional backend node ID. When set, render only that node. 0 is treated as omitted." },
                     \\    "fullPage": { "type": "boolean", "description": "Render the whole content height instead of one viewport. Defaults to false." },
+                    \\    "strip": { "type": "object", "description": "Optional. Omit element groups from the render; same groups as the html tool's strip (`js`, `css`, `ui`, `invisible`, `shell`, `clutter`).", "properties": { "js": { "type": "boolean" }, "css": { "type": "boolean" }, "ui": { "type": "boolean" }, "invisible": { "type": "boolean" }, "shell": { "type": "boolean" }, "clutter": { "type": "boolean" } } },
                     \\    "url": { "type": "string", "description": "Optional URL to navigate to before rendering." },
                     \\    "timeout": { "type": "integer", "description": "Optional timeout in milliseconds. Defaults to 10000." }
                     \\  }
@@ -564,7 +566,7 @@ pub const Tool = enum {
                     \\{
                     \\  "type": "object",
                     \\  "properties": {
-                    \\    "backendNodeId": { "type": "integer", "description": "Optional: The backend node ID of the element to scroll. If omitted (or 0), scrolls the window." },
+                    \\    "backendNodeId": { "type": "integer", "description": "Optional: The backend node ID of the element to scroll. If the element is not itself a scroll container, its nearest scrollable ancestor is scrolled instead. If omitted (or 0), scrolls the window." },
                     \\    "x": { "type": "integer", "description": "Optional: The horizontal scroll offset." },
                     \\    "y": { "type": "integer", "description": "Optional: The vertical scroll offset." }
                     \\  }
@@ -822,13 +824,13 @@ pub const ToolResult = struct {
     image: ?lp.screenshot.Prepared = null,
 };
 
-pub const GotoParams = struct {
+const GotoParams = struct {
     url: [:0]const u8,
     timeout: ?u32 = null,
     waitUntil: lp.Config.WaitUntil = default_nav_wait,
 };
 
-pub const UrlParams = struct {
+const UrlParams = struct {
     url: ?[:0]const u8 = null,
     timeout: ?u32 = null,
 };
@@ -855,8 +857,8 @@ pub const CallOpts = struct {
 
 // An inline screenshot is re-sent on every turn; keep it within what models
 // consume. Files written to `path` are full size.
-pub const inline_image_max_width = 1280;
-pub const inline_image_max_height = 4096;
+const inline_image_max_width = 1280;
+const inline_image_max_height = 4096;
 
 pub fn call(
     arena: std.mem.Allocator,
@@ -1030,7 +1032,7 @@ fn execGoto(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeRegis
     };
 }
 
-pub const SearchParams = struct {
+const SearchParams = struct {
     query: []const u8,
     timeout: ?u32 = null,
 };
@@ -1123,7 +1125,7 @@ fn engineKey(comptime engine: anytype) error{MissingApiKey}!?[]const u8 {
     return if (comptime isKeyless(engine.Client)) null else error.MissingApiKey;
 }
 
-pub const KeyStatus = struct {
+const KeyStatus = struct {
     env_var: [:0]const u8,
     state: enum { set, keyless, missing },
 };
@@ -1295,7 +1297,7 @@ fn writeSingleLine(w: *std.Io.Writer, text: []const u8) !void {
 
 fn renderFrameMarkdown(arena: std.mem.Allocator, frame: *lp.Frame) ToolError![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
-    lp.markdown.dump(frame.document.asNode(), .{}, &aw.writer, frame) catch
+    lp.markdown.dump(.{ .root = frame.document.asNode() }, .{}, &aw.writer, frame) catch
         return ToolError.InternalError;
     return aw.written();
 }
@@ -1305,6 +1307,7 @@ fn execMarkdown(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
         selector: ?[]const u8 = null,
         backendNodeId: ?NodeRegistry.Id = null,
         maxBytes: ?u32 = null,
+        strip: lp.dump.Opts.Strip = .{},
         url: ?[:0]const u8 = null,
         timeout: ?u32 = null,
     };
@@ -1312,9 +1315,10 @@ fn execMarkdown(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
     const page = try ensurePage(session, registry, args.url, args.timeout);
 
     const node = try resolveScope(session, registry, page, args.selector, args.backendNodeId);
+    const state = lp.RenderTree.resolve(arena, node, args.strip, page) catch return ToolError.OutOfMemory;
 
     var aw: std.Io.Writer.Allocating = .init(arena);
-    lp.markdown.dump(node, .{ .max_bytes = args.maxBytes }, &aw.writer, page) catch return ToolError.InternalError;
+    lp.markdown.dump(state, .{ .max_bytes = args.maxBytes }, &aw.writer, page) catch return ToolError.InternalError;
     return aw.written();
 }
 
@@ -1338,14 +1342,10 @@ fn execHtml(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeRegis
     const args = try parseArgsOrDefault(HtmlParams, arena, arguments);
     const page = try ensurePage(session, registry, args.url, args.timeout);
 
-    const opts: lp.dump.Opts = .{ .strip = args.strip, .max_bytes = args.maxBytes };
+    const target = try resolveScope(session, registry, page, args.selector, args.backendNodeId);
+    const state = lp.RenderTree.resolve(arena, target, args.strip, page) catch return ToolError.OutOfMemory;
     var aw: std.Io.Writer.Allocating = .init(arena);
-    if (args.selector == null and args.backendNodeId == null) {
-        lp.dump.root(page.document, opts, &aw.writer, page) catch return ToolError.InternalError;
-    } else {
-        const node = (try resolveTarget(session, registry, args.selector, args.backendNodeId)).node;
-        lp.dump.deep(node, opts, &aw.writer, page) catch return ToolError.InternalError;
-    }
+    lp.dump.render(state, .{ .max_bytes = args.maxBytes }, &aw.writer, page) catch return ToolError.InternalError;
     return aw.written();
 }
 
@@ -1355,6 +1355,7 @@ fn execScreenshot(arena: std.mem.Allocator, session: *lp.Session, registry: *Nod
         selector: ?[]const u8 = null,
         backendNodeId: ?NodeRegistry.Id = null,
         fullPage: bool = false,
+        strip: lp.dump.Opts.Strip = .{},
         url: ?[:0]const u8 = null,
         timeout: ?u32 = null,
     };
@@ -1365,8 +1366,10 @@ fn execScreenshot(arena: std.mem.Allocator, session: *lp.Session, registry: *Nod
         return .{ .text = "pass `path`: this client cannot display an inline image", .is_error = true };
     }
     const page = try ensurePage(session, registry, args.url, args.timeout);
-    const node = try resolveScope(session, registry, page, args.selector, args.backendNodeId);
-    var prepared = lp.screenshot.preparePng(arena, node, .fromViewport(page._page.getViewport(), args.fullPage), page) catch
+    const scope = try resolveScope(session, registry, page, args.selector, args.backendNodeId);
+    const state = lp.RenderTree.resolve(arena, scope, args.strip, page) catch return ToolError.OutOfMemory;
+    const opts: lp.screenshot.Opts = .fromViewport(page.page.getViewport(), args.fullPage);
+    var prepared = lp.screenshot.preparePng(arena, state, opts, page) catch
         return ToolError.InternalError;
 
     if (args.path) |path| {
@@ -1764,7 +1767,7 @@ fn awaitQueuedNavigation(session: *lp.Session, frame: *lp.Frame) ToolError!void 
     // Runner waits are keyed by Page root (a popup lives on its opener's
     // Page). Read it before processing: a synthetic root navigation frees
     // the Page in place.
-    const root_frame_id = frame._page.frame._frame_id;
+    const root_frame_id = frame.page.frame._frame_id;
     const navigated = session.processQueuedNavigation() catch return ToolError.InternalError;
     if (navigated == false) {
         return;
@@ -1791,7 +1794,7 @@ const ActionScope = struct {
 
 fn beginAction(session: *lp.Session) ActionScope {
     const frame = session.currentFrame();
-    return .{ .frame = frame, .popups = if (frame) |f| f._page.popups.items.len else 0 };
+    return .{ .frame = frame, .popups = if (frame) |f| f.page.popups.items.len else 0 };
 }
 
 /// Finish a state-changing action: drain any queued navigation triggered by
@@ -1810,14 +1813,14 @@ fn finalizeAction(arena: std.mem.Allocator, session: *lp.Session, registry: *Nod
     if (before != null and before.? != page) registry.reset();
 
     var note: []const u8 = "";
-    if (page._page.popups.items.len > scope.popups) {
+    if (page.page.popups.items.len > scope.popups) {
         // The action opened a new window (target=_blank or window.open).
         // Follow it, as a user whose click opened a tab would.
         var runner = session.runner(.{});
-        runner.waitForFrame(page._page.frame._frame_id, 10000, .{ .until = .done }) catch |err|
+        runner.waitForFrame(page.page.frame._frame_id, 10000, .{ .until = .done }) catch |err|
             return if (err == error.Cancelled) ToolError.Cancelled else ToolError.NavigationFailed;
         page = try requireFrame(session);
-        const popups = page._page.popups.items;
+        const popups = page.page.popups.items;
         if (popups.len > scope.popups) {
             page = popups[popups.len - 1];
             session.followPopup(page._frame_id);
@@ -1876,15 +1879,20 @@ fn execScroll(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeReg
         y: ?i32 = null,
     };
     const args = try parseArgsOrDefault(Params, arena, arguments);
+    const scope = beginAction(session);
     const page = try requireFrame(session);
     const target_node = try resolveOptionalNode(registry, args.backendNodeId);
 
-    lp.actions.scroll(target_node, args.x, args.y, page) catch |err| return mapActionError(err);
+    const result = lp.actions.scroll(target_node, args.x, args.y, page) catch |err| return mapActionError(err);
 
-    return std.fmt.allocPrint(arena, "Scrolled to x: {d}, y: {d}", .{
-        args.x orelse 0,
-        args.y orelse 0,
-    }) catch return ToolError.InternalError;
+    const body = (if (result.scrolled) |scrolled| blk: {
+        const moved: ActionTarget = .{ .backend_node_id = (registry.register(scrolled) catch return ToolError.InternalError).id };
+        break :blk if (scrolled == target_node)
+            std.fmt.allocPrint(arena, "Scrolled element ({f}) to x: {d}, y: {d}", .{ moved, result.x, result.y })
+        else
+            std.fmt.allocPrint(arena, "Scrolled scroll container ({f}) of element ({f}) to x: {d}, y: {d}", .{ moved, ActionTarget{ .backend_node_id = args.backendNodeId.? }, result.x, result.y });
+    } else std.fmt.allocPrint(arena, "Scrolled window to x: {d}, y: {d}", .{ result.x, result.y })) catch return ToolError.InternalError;
+    return finalizeAction(arena, session, registry, scope, body);
 }
 
 /// Default timeout for the `waitFor*` tools — short, since they wait on an
@@ -2152,14 +2160,6 @@ fn execGetUrl(session: *lp.Session) ToolError![]const u8 {
     return page.url;
 }
 
-/// URL of the active frame, or a stable placeholder when no page is loaded.
-/// Use from contexts that just want a string for display/logging; callers
-/// that need to react to "no page" should check `currentFrame()` directly.
-pub fn currentUrlOrPlaceholder(session: *lp.Session) []const u8 {
-    const frame = session.currentFrame() orelse return "(no page loaded)";
-    return frame.url;
-}
-
 fn execGetCookies(arena: std.mem.Allocator, session: *lp.Session, arguments: ?std.json.Value) ToolError![]const u8 {
     const Params = struct { url: ?[]const u8 = null, all: bool = false };
     const args = try parseArgsOrDefault(Params, arena, arguments);
@@ -2308,7 +2308,7 @@ fn resolveBySelector(session: *lp.Session, selector: []const u8) ToolError!NodeA
     return .{ .node = node, .page = page, .target = .{ .selector = selector } };
 }
 
-pub const ParseArgsError = error{ OutOfMemory, InvalidParams };
+const ParseArgsError = error{ OutOfMemory, InvalidParams };
 
 /// Surface field/value context for known typed args — `std.json`'s parse
 /// errors only carry the tag (`InvalidEnumTag`, …), not which field failed.

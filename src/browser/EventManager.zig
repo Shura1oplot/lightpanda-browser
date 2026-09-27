@@ -26,9 +26,11 @@ const EventManagerBase = @import("EventManagerBase.zig");
 const Node = @import("webapi/Node.zig");
 const Event = @import("webapi/Event.zig");
 const Window = @import("webapi/Window.zig");
-const EventTarget = @import("webapi/EventTarget.zig");
 const Element = @import("webapi/Element.zig");
 const ShadowRoot = @import("webapi/ShadowRoot.zig");
+const Performance = @import("webapi/Performance.zig");
+const EventTarget = @import("webapi/EventTarget.zig");
+const MediaQueryList = @import("webapi/css/MediaQueryList.zig");
 const XMLHttpRequestEventTarget = @import("webapi/net/XMLHttpRequestEventTarget.zig");
 
 const log = lp.log;
@@ -37,7 +39,7 @@ const Allocator = std.mem.Allocator;
 // Re-export types from EventManagerBase for API compatibility
 pub const RegisterOptions = EventManagerBase.RegisterOptions;
 pub const Callback = EventManagerBase.Callback;
-pub const Listener = EventManagerBase.Listener;
+const Listener = EventManagerBase.Listener;
 
 pub const EventManager = @This();
 
@@ -71,11 +73,11 @@ pub fn remove(self: *EventManager, target: *EventTarget, typ: []const u8, callba
 }
 
 // Re-export DispatchError from base
-pub const DispatchError = EventManagerBase.DispatchError;
+const DispatchError = EventManagerBase.DispatchError;
 
 pub fn dispatch(self: *EventManager, target: *EventTarget, event: *Event) DispatchError!void {
     event.acquireRef();
-    defer _ = event.releaseRef(self.frame._page);
+    defer _ = event.releaseRef(self.frame.page);
 
     // Increment event count for Event Timing API
     self.frame.window._performance._event_counts.increment(event._type_string.str());
@@ -87,9 +89,21 @@ pub fn dispatch(self: *EventManager, target: *EventTarget, event: *Event) Dispat
     switch (target._type) {
         .node => try self.dispatchNode(target.subtype(Node), event),
         .xhr => try self.dispatchDirect(target, event, target.subtype(XMLHttpRequestEventTarget).inlineHandler(event._type_string), .{ .context = "dispatch" }),
+        .media_query_list => try self.dispatchDirect(target, event, target.subtype(MediaQueryList).inlineHandler(event._type_string), .{ .context = "dispatch" }),
+        .performance => try self.dispatchDirect(target, event, target.subtype(Performance).inlineHandler(event._type_string), .{ .context = "dispatch" }),
         .window => try self.dispatchDirect(target, event, windowInlineHandler(target.subtype(Window), event._type_string), .{ .context = "dispatch" }),
         else => try self.dispatchDirect(target, event, null, .{ .context = "dispatch" }),
     }
+}
+
+/// dispatch() drops its reference, and with it the event, before returning;
+/// this keeps the event alive so the caller can learn whether a listener
+/// called preventDefault().
+pub fn dispatchCancelable(self: *EventManager, target: *EventTarget, event: *Event) DispatchError!bool {
+    event.acquireRef();
+    defer event.releaseRef(self.frame.page);
+    try self.dispatch(target, event);
+    return event.getDefaultPrevented();
 }
 
 // Resolves the Window's property event handler for the given event type.
@@ -126,7 +140,7 @@ pub fn dispatchDirect(self: *EventManager, target: *EventTarget, event: *Event, 
     window._current_event = event;
     defer window._current_event = prev_event;
 
-    try self.base.dispatchDirect(frame.call_arena, frame.js, target, event, handler, frame._page, opts);
+    try self.base.dispatchDirect(frame.call_arena, frame.js, target, event, handler, frame.page, opts);
 }
 
 /// Check if there are any listeners for a direct dispatch (non-DOM target).
@@ -319,7 +333,7 @@ fn dispatchNode(self: *EventManager, target: *Node, event: *Event) !void {
                 if (err == error.ExecutionTerminated) {
                     return error.ExecutionTerminated;
                 }
-                frame._page.recordJsError(err);
+                frame.page.recordJsError(err);
                 log.warn(.event, "inline handler", .{ .err = err, .caught = caught });
                 break :ret null;
             };
@@ -380,7 +394,7 @@ fn dispatchNode(self: *EventManager, target: *Node, event: *Event) !void {
                     if (err == error.ExecutionTerminated) {
                         return error.ExecutionTerminated;
                     }
-                    frame._page.recordJsError(err);
+                    frame.page.recordJsError(err);
                     log.warn(.event, "inline handler", .{ .err = err, .caught = caught });
                     break :ret null;
                 };
@@ -570,7 +584,7 @@ const AdjustedTargets = struct {
     }
 };
 
-pub const EventPath = struct {
+const EventPath = struct {
     len: usize,
     // Whether a shadow root sits on the path, i.e. whether an invocation can
     // see a target other than the one the event was dispatched at.
@@ -768,6 +782,9 @@ const ActivationState = struct {
                 prev_radio._checked = true;
                 prev_radio._checked_dirty = true;
             }
+            // Listeners ran between setChecked and here, so `:checked` state
+            // built during dispatch has to be stamped as stale.
+            frame.styleChanged();
             return;
         }
 
@@ -788,7 +805,7 @@ const ActivationState = struct {
     fn findCheckedRadioInGroup(input: *Input, frame: *Frame) !?*Input {
         const elem = input.asElement();
 
-        const name = elem.getAttributeSafe(comptime .wrap("name")) orelse return null;
+        const name = elem.getName() orelse return null;
         if (name.len == 0) {
             return null;
         }
@@ -815,7 +832,7 @@ const ActivationState = struct {
                 continue;
             }
 
-            const other_name = other_element.getAttributeSafe(comptime .wrap("name")) orelse continue;
+            const other_name = other_element.getName() orelse continue;
             if (!std.mem.eql(u8, name, other_name)) {
                 continue;
             }
@@ -844,7 +861,7 @@ const ActivationState = struct {
         const event = try Event.initTrusted(comptime .wrap(typ), .{
             .bubbles = true,
             .cancelable = false,
-        }, frame._page);
+        }, frame.page);
 
         const target = input.asElement().asEventTarget();
         try frame._event_manager.dispatch(target, event);

@@ -70,7 +70,7 @@ pub fn evaluate(arena: Allocator, expr: *const ast.Expr, context_node: *Node, fr
     return res;
 }
 
-pub const SearchError = Error || Parser.Error;
+const SearchError = Error || Parser.Error;
 
 /// Convenience for `DOM.performSearch`: parse + evaluate and unwrap the
 /// node-set. Top-level scalar expressions yield an empty slice
@@ -530,7 +530,7 @@ fn appendPreceding(self: *Evaluator, start: *Node, out: *std.ArrayList(*Node)) E
 fn appendAttributes(self: *Evaluator, node: *Node, out: *std.ArrayList(*Node)) Error!void {
     const el = node.is(Element) orelse return;
     for (el.attributeEntries()) |*entry| {
-        // Memoized via frame._attribute_lookup so repeated XPath queries
+        // Memoized via page.attribute_lookup so repeated XPath queries
         // (Capybara/Selenium polling) reuse the same *Attribute instead
         // of leaking fresh ones into page-lifetime storage on every call.
         const attribute = try el._attributes.getOrCreateAttribute(entry, el, self.frame);
@@ -769,7 +769,7 @@ fn predicateMatches(val: result.Result, position: usize) bool {
     };
 }
 
-pub fn sortDocOrder(nodes: []*Node) void {
+fn sortDocOrder(nodes: []*Node) void {
     if (nodes.len <= 1) return;
     std.mem.sort(*Node, nodes, {}, lessThanDocOrder);
 }

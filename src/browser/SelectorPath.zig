@@ -90,7 +90,7 @@ fn buildStrictPath(self: SelectorPath, target: *Element) !?[]const u8 {
 /// else its tag qualified by stable attributes and — when that still matches a
 /// sibling — a `:has()` distinguisher (preferred) or positional `:nth-of-type`.
 fn localSegment(self: SelectorPath, el: *Element) ![]const u8 {
-    if (el.getAttributeSafe(comptime .wrap("id"))) |id| {
+    if (el.getId()) |id| {
         if (id.len != 0) {
             const id_sel = try std.fmt.allocPrint(self.arena, "#{s}", .{try CSS.escape(id, self.frame)});
             if (self.isFirstMatch(el, id_sel)) return id_sel;
@@ -170,7 +170,7 @@ fn siblingMatches(self: SelectorPath, el: *Element, sel: []const u8) bool {
 fn matchCount(self: SelectorPath, candidate: []const u8) usize {
     const root = self.frame.window._document.asNode();
     const list = Selector.querySelectorAllUncached(root, candidate, self.frame) catch return 0;
-    defer list.deinit(self.frame._page);
+    defer list.deinit(self.frame.page);
     return list.getLength();
 }
 

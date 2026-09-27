@@ -46,7 +46,7 @@ pub fn assignedNodes(self: *Slot, opts_: ?AssignedNodesOptions, frame: *Frame) !
     return nodes.items;
 }
 
-pub fn assignedElements(self: *Slot, opts_: ?AssignedNodesOptions, frame: *Frame) ![]const *Element {
+fn assignedElements(self: *Slot, opts_: ?AssignedNodesOptions, frame: *Frame) ![]const *Element {
     var elements: std.ArrayList(*Element) = .empty;
     const opts = opts_ orelse AssignedNodesOptions{};
     if (!opts.flatten) {
@@ -119,13 +119,14 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
         entry.* = node;
     }
 
+    const page = frame.page;
     for (self._manually_assigned.items) |node| {
-        _ = frame._manual_slot_assignments.remove(node);
+        _ = page._manual_slot_assignments.remove(node);
     }
     self._manually_assigned.clearRetainingCapacity();
 
     for (nodes) |node| {
-        const gop = try frame._manual_slot_assignments.getOrPut(frame.arena, node);
+        const gop = try page._manual_slot_assignments.getOrPut(page.frame_arena, node);
         if (gop.found_existing) {
             const other = gop.value_ptr.*;
             if (other == self) {
@@ -150,7 +151,7 @@ pub fn assign(self: *Slot, values: []const js.Value, frame: *Frame) !void {
 }
 
 pub fn getName(self: *const Slot) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("name")) orelse "";
+    return self.asConstElement().getName() orelse "";
 }
 
 pub const JsApi = struct {

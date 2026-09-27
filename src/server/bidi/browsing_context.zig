@@ -25,7 +25,6 @@ const js = @import("../../browser/js/js.zig");
 const URL = @import("../../browser/URL.zig");
 const Node = @import("../../browser/webapi/Node.zig");
 const Frame = @import("../../browser/Frame.zig");
-const Session = @import("../../browser/Session.zig");
 const Selector = @import("../../browser/webapi/selector/Selector.zig");
 const xpath = @import("../../browser/xpath/Evaluator.zig");
 const XPathParser = @import("../../browser/xpath/Parser.zig");
@@ -342,7 +341,7 @@ fn locateNodes(cmd: *const BiDi.Command) !void {
                     const list = Selector.querySelectorAll(root, selector, frame) catch |err| {
                         return invalidSelector(cmd, "css", selector, err);
                     };
-                    defer list.deinit(frame._page);
+                    defer list.deinit(frame.page);
                     try appendNodes(&remotes, arena, &serializer, list._nodes, max);
                 }
             },

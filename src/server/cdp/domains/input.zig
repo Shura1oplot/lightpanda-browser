@@ -150,6 +150,36 @@ fn insertText(cmd: *CDP.Command) !void {
 const lp = @import("lightpanda");
 const testing = @import("../testing.zig");
 
+test "cdp.input: insertText is a user edit for tooLong" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    _ = try ls.local.compileAndRun(
+        \\const inp = document.getElementById('inp');
+        \\inp.maxLength = 3;
+        \\inp.value = 'abcdef';
+        \\inp.focus();
+    , null);
+    try testing.expect((try ls.local.compileAndRun("inp.validity.tooLong === false", null)).isTrue());
+
+    try ctx.processMessage(.{ .id = 1, .method = "Input.insertText", .params = .{ .text = "g" } });
+    try testing.expect((try ls.local.compileAndRun("inp.value === 'abcdefg' && inp.validity.tooLong === true", null)).isTrue());
+
+    _ = try ls.local.compileAndRun("inp.value = 'abcdefgh'", null);
+    try testing.expect((try ls.local.compileAndRun("inp.validity.tooLong === false", null)).isTrue());
+}
+
 test "cdp.input: dispatchMouseEvent mouseMoved fires hover events" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -229,6 +259,60 @@ test "cdp.input: dispatchMouseEvent mouseReleased fires mouseup" {
     try testing.expect(result.isTrue());
 }
 
+test "cdp.input: dispatchMouseEvent mousePressed honors preventDefault for focus" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    // The toolbar idiom: preventDefault() on mousedown keeps focus where it is.
+    _ = try ls.local.compileAndRun(
+        \\document.getElementById('hoverTarget')
+        \\  .addEventListener('mousedown', (e) => { e.preventDefault(); });
+        \\document.getElementById('inp').focus();
+    , null);
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().y", null)).toF64();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = rect_x, .y = rect_y, .button = "left", .clickCount = 1 },
+    });
+
+    const kept = try ls.local.compileAndRun("document.activeElement.id === 'inp'", null);
+    try testing.expect(kept.isTrue());
+
+    // Without preventDefault the same press moves focus, so the assertion above
+    // is testing the gate and not just an inert default action.
+    const focus_x = try (try ls.local.compileAndRun("document.getElementById('focusTarget').getBoundingClientRect().x", null)).toF64();
+    const focus_y = try (try ls.local.compileAndRun("document.getElementById('focusTarget').getBoundingClientRect().y", null)).toF64();
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mousePressed", .x = focus_x, .y = focus_y, .button = "left", .clickCount = 1 },
+    });
+
+    const moved = try ls.local.compileAndRun("document.activeElement.id === 'focusTarget'", null);
+    try testing.expect(moved.isTrue());
+}
+
 test "cdp.input: dispatchMouseEvent mouseWheel fires wheel event" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -264,6 +348,102 @@ test "cdp.input: dispatchMouseEvent mouseWheel fires wheel event" {
     });
 
     const result = try ls.local.compileAndRun("window.wheelDeltaY === 40", null);
+    try testing.expect(result.isTrue());
+}
+
+test "cdp.input: dispatchMouseEvent mouseWheel scrolls a scroll container, not the viewport" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('scrollbox').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('scrollbox').getBoundingClientRect().y", null)).toF64();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaY = 40 },
+    });
+
+    const box = try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop === 40 && window.scrollY === 0", null);
+    try testing.expect(box.isTrue());
+
+    // The scroll event is scheduled, not fired inline with the wheel.
+    var runner = bc.session.runner(.{});
+    try runner.waitForScript(frame._frame_id, "window.scrolled === true", 1000);
+
+    // Per axis: x is not scrollable on the box, so it goes to the viewport.
+    _ = try ls.local.compileAndRun("document.getElementById('scrollbox').style.overflow = 'hidden scroll'", null);
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaX = 30, .deltaY = 10 },
+    });
+    const split = try ls.local.compileAndRun("document.getElementById('scrollbox').scrollTop === 50 && document.getElementById('scrollbox').scrollLeft === 0 && window.scrollX === 30 && window.scrollY === 0", null);
+    try testing.expect(split.isTrue());
+}
+
+test "cdp.input: dispatchMouseEvent mouseWheel on page content scrolls the viewport" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    const rect_x = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().x", null)).toF64();
+    const rect_y = try (try ls.local.compileAndRun("document.getElementById('hoverTarget').getBoundingClientRect().y", null)).toF64();
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaX = 5, .deltaY = 600 },
+    });
+    var result = try ls.local.compileAndRun("window.scrollX === 5 && window.scrollY === 600", null);
+    try testing.expect(result.isTrue());
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseWheel", .x = rect_x, .y = rect_y, .deltaY = -200 },
+    });
+    result = try ls.local.compileAndRun("window.scrollY === 400", null);
+    try testing.expect(result.isTrue());
+
+    // No element under the point.
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Input.dispatchMouseEvent",
+        .params = .{ .type = "mouseWheel", .x = 100_000, .y = 100_000, .deltaY = 100 },
+    });
+    result = try ls.local.compileAndRun("window.scrollY === 500", null);
     try testing.expect(result.isTrue());
 }
 
@@ -375,4 +555,229 @@ test "cdp.input: dispatchKeyEvent Tab runs sequential focus navigation" {
         .params = .{ .type = "keyDown", .key = "Tab", .code = "Tab", .modifiers = 8 },
     });
     try testing.expect((try ls.local.compileAndRun("document.activeElement.id === 'b1'", null)).isTrue());
+}
+
+test "cdp.input: dispatchKeyEvent beforeinput can veto the edit" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+    try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{
+        .reason = .address_bar,
+        .kind = .{ .push = null },
+    });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // A listener that rejects every keystroke, the way masked-input libraries
+    // do. Records what it saw so we can assert the event was cancelable.
+    _ = try ls.local.compileAndRun(
+        \\const inp = document.getElementById('inp');
+        \\inp.value = 'ab';
+        \\inp.focus();
+        \\window.seen = [];
+        \\inp.addEventListener('beforeinput', (e) => {
+        \\  window.seen.push(['beforeinput', e.cancelable].join(':'));
+        \\  e.preventDefault();
+        \\  window.seen.push(['defaultPrevented', e.defaultPrevented].join(':'));
+        \\});
+        \\inp.addEventListener('input', () => window.seen.push('input'));
+    , null);
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "c", .text = "c" },
+    });
+
+    // The veto held: no character inserted and no `input` event followed.
+    try testing.expect((try ls.local.compileAndRun(
+        \\inp.value === 'ab' &&
+        \\window.seen.join(',') === 'beforeinput:true,defaultPrevented:true'
+    , null)).isTrue());
+
+    // Backspace goes through the same pre-edit gate.
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "Backspace", .code = "Backspace" },
+    });
+    try testing.expect((try ls.local.compileAndRun("inp.value === 'ab'", null)).isTrue());
+
+    // Without the veto, the edit goes through and `input` is dispatched — and
+    // `input` itself is not cancelable.
+    _ = try ls.local.compileAndRun(
+        \\const clone = inp.cloneNode(true);
+        \\inp.replaceWith(clone);
+        \\clone.focus();
+        \\window.seen = [];
+        \\clone.addEventListener('input', (e) => window.seen.push(['input', e.cancelable].join(':')));
+    , null);
+
+    try ctx.processMessage(.{
+        .id = 3,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "c", .text = "c" },
+    });
+    try testing.expect((try ls.local.compileAndRun(
+        \\clone.value === 'abc' && window.seen.join(',') === 'input:false'
+    , null)).isTrue());
+}
+
+test "cdp.input: editing keys honor the selection of a default-valued textarea" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    try frame.navigate("http://localhost:9582/src/browser/tests/mcp_actions.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    // This <textarea>'s value comes from its child text node — nothing assigns
+    // to `value` — so the selection has to clamp against the parsed text.
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML = '<textarea id="ta">abcdef</textarea>';
+        \\const ta = document.getElementById('ta');
+        \\ta.focus();
+        \\ta.setSelectionRange(2, 4);
+    , null);
+    try testing.expect((try ls.local.compileAndRun("ta.selectionStart === 2 && ta.selectionEnd === 4", null)).isTrue());
+
+    // Backspace over a range deletes the range, leaving the caret at its start.
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "Backspace", .code = "Backspace" },
+    });
+    try testing.expect((try ls.local.compileAndRun("ta.value === 'abef'", null)).isTrue());
+    try testing.expect((try ls.local.compileAndRun("ta.selectionStart === 2 && ta.selectionEnd === 2", null)).isTrue());
+
+    // Collapsed caret: Backspace removes the character on its left.
+    _ = try ls.local.compileAndRun("ta.setSelectionRange(3, 3)", null);
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "Backspace", .code = "Backspace" },
+    });
+    try testing.expect((try ls.local.compileAndRun("ta.value === 'abf'", null)).isTrue());
+}
+
+test "cdp.input: dispatchKeyEvent caret movement keys move the text entry cursor" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    const frame = page.frame().?;
+
+    const url = "http://localhost:9582/src/browser/tests/mcp_actions.html";
+    try frame.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    var ls: lp.js.Local.Scope = undefined;
+    frame.js.localScope(&ls);
+    defer ls.deinit();
+
+    var try_catch: lp.js.TryCatch = undefined;
+    try_catch.init(&ls.local);
+    defer try_catch.deinit();
+
+    _ = try ls.local.compileAndRun(
+        \\document.body.innerHTML = '<input id="t" type="text"><textarea id="ta"></textarea>';
+        \\const t = document.getElementById('t');
+        \\const ta = document.getElementById('ta');
+        \\const sel = (e) => [e.selectionStart, e.selectionEnd, e.selectionDirection].join(',');
+        \\t.focus(); t.value = 'abcdef'; t.setSelectionRange(6, 6);
+    , null);
+
+    const Step = struct { key: []const u8, modifiers: u4 = 0, expect: []const u8 };
+    const shift = 8;
+
+    // <input>: plain moves collapse, Shift extends from the anchor, a plain
+    // arrow on a selection collapses to its edge, ArrowUp/ArrowDown reach the
+    // ends of a single-line value.
+    const input_steps = [_]Step{
+        .{ .key = "ArrowLeft", .expect = "5,5,none" },
+        .{ .key = "ArrowRight", .expect = "6,6,none" },
+        .{ .key = "Home", .expect = "0,0,none" },
+        .{ .key = "End", .expect = "6,6,none" },
+        .{ .key = "ArrowUp", .expect = "0,0,none" },
+        .{ .key = "ArrowDown", .expect = "6,6,none" },
+        .{ .key = "ArrowRight", .expect = "6,6,none" },
+        .{ .key = "ArrowLeft", .modifiers = shift, .expect = "5,6,backward" },
+        .{ .key = "Home", .modifiers = shift, .expect = "0,6,backward" },
+        .{ .key = "ArrowLeft", .expect = "0,0,none" },
+        .{ .key = "ArrowLeft", .expect = "0,0,none" },
+        .{ .key = "End", .modifiers = shift, .expect = "0,6,forward" },
+        .{ .key = "ArrowLeft", .modifiers = shift, .expect = "0,5,forward" },
+        .{ .key = "ArrowRight", .expect = "5,5,none" },
+    };
+    var id: u32 = 1;
+    for (input_steps) |step| {
+        try ctx.processMessage(.{
+            .id = id,
+            .method = "Input.dispatchKeyEvent",
+            .params = .{ .type = "keyDown", .key = step.key, .code = step.key, .modifiers = step.modifiers },
+        });
+        id += 1;
+        const got = try (try ls.local.compileAndRun("sel(t)", null)).toStringSlice();
+        try testing.expectEqualSlices(u8, step.expect, got);
+    }
+
+    // Type-then-correct: move back two characters and insert in the middle.
+    _ = try ls.local.compileAndRun("t.setSelectionRange(6, 6)", null);
+    for (0..2) |_| {
+        try ctx.processMessage(.{
+            .id = id,
+            .method = "Input.dispatchKeyEvent",
+            .params = .{ .type = "keyDown", .key = "ArrowLeft", .code = "ArrowLeft" },
+        });
+        id += 1;
+    }
+    try ctx.processMessage(.{ .id = id, .method = "Input.insertText", .params = .{ .text = "X" } });
+    id += 1;
+    try testing.expect((try ls.local.compileAndRun("t.value === 'abcdXef' && sel(t) === '5,5,none'", null)).isTrue());
+
+    // Moves step over whole UTF-8 sequences, never landing inside one.
+    _ = try ls.local.compileAndRun("t.value = 'aé'; t.setSelectionRange(t.value.length, t.value.length)", null);
+    try ctx.processMessage(.{
+        .id = id,
+        .method = "Input.dispatchKeyEvent",
+        .params = .{ .type = "keyDown", .key = "ArrowLeft", .code = "ArrowLeft" },
+    });
+    id += 1;
+    try ctx.processMessage(.{ .id = id, .method = "Input.insertText", .params = .{ .text = "X" } });
+    id += 1;
+    try testing.expect((try ls.local.compileAndRun("t.value === 'aXé'", null)).isTrue());
+
+    // <textarea>: Home/End stop at the enclosing line break, ArrowLeft crosses it.
+    _ = try ls.local.compileAndRun("ta.focus(); ta.value = 'ab\\ncd'; ta.setSelectionRange(5, 5)", null);
+    const textarea_steps = [_]Step{
+        .{ .key = "Home", .expect = "3,3,none" },
+        .{ .key = "End", .expect = "5,5,none" },
+        .{ .key = "Home", .modifiers = shift, .expect = "3,5,backward" },
+        .{ .key = "ArrowLeft", .expect = "3,3,none" },
+        .{ .key = "ArrowLeft", .expect = "2,2,none" },
+    };
+    for (textarea_steps) |step| {
+        try ctx.processMessage(.{
+            .id = id,
+            .method = "Input.dispatchKeyEvent",
+            .params = .{ .type = "keyDown", .key = step.key, .code = step.key, .modifiers = step.modifiers },
+        });
+        id += 1;
+        const got = try (try ls.local.compileAndRun("sel(ta)", null)).toStringSlice();
+        try testing.expectEqualSlices(u8, step.expect, got);
+    }
 }

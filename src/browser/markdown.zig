@@ -18,23 +18,20 @@
 
 const std = @import("std");
 
-const Frame = @import("Frame.zig");
-const StyleManager = @import("StyleManager.zig");
 const URL = @import("URL.zig");
+const Frame = @import("Frame.zig");
+const RenderTree = @import("RenderTree.zig");
+const StyleManager = @import("StyleManager.zig");
 
 const Node = @import("webapi/Node.zig");
 const Element = @import("webapi/Element.zig");
-const TreeWalker = @import("webapi/TreeWalker.zig");
 const Slot = @import("webapi/element/html/Slot.zig");
 
-const isAllWhitespace = @import("../string.zig").isAllWhitespace;
 const LimitedWriter = @import("../LimitedWriter.zig");
-const dump_html = @import("dump.zig");
-const Strip = dump_html.Opts.Strip;
+const isAllWhitespace = @import("../string.zig").isAllWhitespace;
 
 pub const Opts = struct {
     max_bytes: ?u32 = null,
-    strip: Strip = .{},
 };
 
 const truncation_marker = LimitedWriter.truncation_marker;
@@ -62,107 +59,15 @@ fn shouldAddSpacing(tag: Element.Tag) bool {
     };
 }
 
-fn isLayoutBlock(tag: Element.Tag) bool {
-    return switch (tag) {
-        .main, .section, .article, .nav, .aside, .header, .footer, .div, .ul, .ol => true,
-        else => false,
-    };
-}
-
-pub fn isStandaloneAnchor(el: *Element, frame: *Frame) bool {
-    const node = el.asNode();
-    const parent = node.parentNode() orelse return false;
-    const parent_el = parent.is(Element) orelse return false;
-
-    if (!isLayoutBlock(parent_el.getTag())) return false;
-
-    var prev = node.previousSibling();
-    while (prev) |p| : (prev = p.previousSibling()) {
-        if (isSignificantText(p)) return false;
-        if (p.is(Element)) |pe| {
-            if (isVisibleElement(pe, frame)) break;
-        }
-    }
-
-    var next = node.nextSibling();
-    while (next) |n| : (next = n.nextSibling()) {
-        if (isSignificantText(n)) return false;
-        if (n.is(Element)) |ne| {
-            if (isVisibleElement(ne, frame)) break;
-        }
-    }
-
-    return true;
-}
-
-fn isSignificantText(node: *Node) bool {
-    const text = node.is(Node.CData.Text) orelse return false;
-    return !isAllWhitespace(text.ownData());
-}
-
-// Own state only; the dump root is exempt so a scoped dump of a hidden
-// subtree still renders it.
-fn isVisibleElement(el: *Element, frame: *Frame) bool {
-    return visibleDisplay(el, frame) != null;
-}
-
-/// Null when the element doesn't render.
-fn visibleDisplay(el: *Element, frame: *Frame) ?StyleManager.Display {
-    const tag = el.getTag();
-    if (tag.isMetadata() or tag == .svg) return null;
-    const display = frame._style_manager.display(el, .scan);
-    if (display == .none) return null;
-    if (el.getAttributeSafe(comptime .wrap("aria-hidden"))) |v| {
-        if (std.ascii.eqlIgnoreCase(v, "true")) return null;
-    }
-    return display;
-}
-
 fn getAnchorLabel(el: *Element) ?[]const u8 {
-    return el.getAttributeSafe(comptime .wrap("aria-label")) orelse el.getAttributeSafe(comptime .wrap("title"));
-}
-
-pub const ContentInfo = struct {
-    has_visible: bool,
-    has_block: bool,
-};
-
-pub fn analyzeContent(root: *Node, frame: *Frame) ContentInfo {
-    var result: ContentInfo = .{ .has_visible = false, .has_block = false };
-    var tw = TreeWalker.FullExcludeSelf.init(root, .{});
-    while (tw.next()) |node| {
-        if (isSignificantText(node)) {
-            result.has_visible = true;
-            if (result.has_block) return result;
-        } else if (node.is(Element)) |el| {
-            if (!isVisibleElement(el, frame)) {
-                tw.skipChildren();
-            } else {
-                const tag = el.getTag();
-                if (tag == .img) {
-                    result.has_visible = true;
-                    if (result.has_block) return result;
-                }
-                if (tag.isBlock()) {
-                    result.has_block = true;
-                    if (result.has_visible) return result;
-                }
-            }
-        }
-    }
-    return result;
+    return el.getAttributeInterned("aria-label") orelse el.getAttributeInterned("title");
 }
 
 const Context = struct {
     state: State,
     writer: *std.Io.Writer,
     frame: *Frame,
-    root: *Node,
-    strip: Strip,
-
-    // When there's a slot-attribute, we skip rendering, unless this flag has
-    // bet set to true.
-    force_slot: bool = false,
+    tree: RenderTree,
 
     fn ensureNewline(self: *Context) !void {
         if (!self.state.last_char_was_newline) {
@@ -171,89 +76,57 @@ const Context = struct {
         }
     }
 
-    fn getRenderDisplay(self: *Context, el: *Element, force_slot: bool) ?StyleManager.Display {
-        const display = visibleDisplay(el, self.frame) orelse {
-            if (el.asNode() == self.root) {
-                return StyleManager.Display.other;
-            } else {
-                return null;
-            }
-        };
-        if (dump_html.shouldStripElement(el, self.strip, self.frame)) return null;
-        if (!force_slot and el.getAttributeSafe(comptime .wrap("slot")) != null) return null;
-        return display;
-    }
-
     fn render(self: *Context, node: *Node) error{WriteFailed}!void {
         switch (node._type) {
-            .document, .document_fragment => {
-                try self.renderChildren(node, false);
-            },
-            .element => {
-                const el = node.subtype(Node.Element);
-                if (self.getRenderDisplay(el, self.force_slot)) |display| {
-                    try self.renderElement(el, display);
+            .document, .document_fragment => try self.renderChildren(node, false),
+            else => {
+                if (self.tree.classify(node, .{})) |child| {
+                    try self.renderChild(child);
                 }
             },
-            .cdata => {
-                if (node.is(Node.CData.Text)) |_| {
-                    var text = node.subtype(Node.CData).getData().str();
-                    if (self.state.pre_node) |pre| {
-                        if (node.parentNode() == pre and node.nextSibling() == null) {
-                            text = std.mem.trimEnd(u8, text, " \t\r\n");
-                        }
-                    }
-                    try self.renderText(text);
-                }
-            },
-            else => {},
         }
     }
 
-    /// `boxed`: flex/grid items are separate boxes however inline their tags
-    /// are, and the whitespace between them doesn't render.
-    fn renderChildren(self: *Context, parent: *Node, boxed: bool) error{WriteFailed}!void {
-        var it = parent.childrenIterator();
-        var separate = false;
-        while (it.next()) |child| {
-            if (!boxed) {
-                try self.render(child);
-                continue;
-            }
-            if (child.is(Element)) |el| {
-                const display = self.getRenderDisplay(el, self.force_slot) orelse continue;
-                if (separate and !el.getTag().isBlock() and !self.state.last_char_was_newline) {
+    fn renderChild(self: *Context, child: RenderTree.Child) error{WriteFailed}!void {
+        switch (child.what) {
+            .element => |display| {
+                const el = child.node.subtype(Node.Element);
+                if (child.separated and !el.getTag().isBlock() and !self.state.last_char_was_newline) {
                     try self.writer.writeByte(' ');
                 }
                 try self.renderElement(el, display);
-            } else if (child.is(Node.CData.Text)) |_| {
-                const text = std.mem.trim(u8, child.subtype(Node.CData).getData().str(), &std.ascii.whitespace);
-                if (text.len == 0) continue;
-                if (separate and !self.state.last_char_was_newline) try self.writer.writeByte(' ');
+            },
+            .text => |text| {
+                if (child.separated and !self.state.last_char_was_newline) {
+                    try self.writer.writeByte(' ');
+                }
                 try self.renderText(text);
-            } else continue;
-            separate = true;
+            },
         }
     }
 
-    // Render a <slot>'s assigned light-DOM nodes, or its own children as
-    // fallback. Same as dump's dumpSlotContent.
-    fn renderSlotContent(self: *Context, slot: *Slot) !void {
-        const assigned = slot.assignedNodes(null, self.frame) catch return;
-        if (assigned.len == 0) {
-            return self.renderChildren(slot.asNode(), false);
+    fn renderChildren(self: *Context, parent: *Node, boxed: bool) error{WriteFailed}!void {
+        var it = self.tree.children(parent, boxed);
+        while (it.next()) |child| {
+            try self.renderChild(child);
         }
-        for (assigned) |node| {
-            // ensures that we don't skip this element when rending it.
-            self.force_slot = true;
-            try self.render(node);
+    }
+
+    fn renderContent(self: *Context, el: *Element, boxed: bool) error{WriteFailed}!void {
+        var it = self.tree.content(el, boxed);
+        while (it.next()) |child| {
+            try self.renderChild(child);
         }
-        self.force_slot = false;
+    }
+
+    fn renderSlotContent(self: *Context, slot: *Slot) error{WriteFailed}!void {
+        var it = self.tree.slotted(slot);
+        while (it.next()) |child| {
+            try self.renderChild(child);
+        }
     }
 
     fn renderElement(self: *Context, el: *Element, display: StyleManager.Display) !void {
-        self.force_slot = false;
-
         const tag = el.getTag();
         const boxed = display == .flex or display == .grid;
 
@@ -355,11 +228,11 @@ const Context = struct {
             },
             .img => {
                 try self.writer.writeAll("![");
-                if (el.getAttributeSafe(comptime .wrap("alt"))) |alt| {
+                if (el.getAttributeInterned("alt")) |alt| {
                     try self.escape(alt);
                 }
                 try self.writer.writeAll("](");
-                if (el.getAttributeSafe(comptime .wrap("src"))) |src| {
+                if (el.getAttributeInterned("src")) |src| {
                     const frame = self.frame;
                     const absolute_src = URL.resolve(frame.call_arena, frame.base(), src, .{ .encoding = frame.charset }) catch src;
                     try self.writer.writeAll(absolute_src);
@@ -370,16 +243,16 @@ const Context = struct {
             },
             .anchor => {
                 const frame = self.frame;
-                const info = analyzeContent(el.asNode(), frame);
+                const info = RenderTree.analyzeContent(el.asNode(), frame);
                 const label = getAnchorLabel(el);
-                const href_raw = el.getAttributeSafe(comptime .wrap("href"));
+                const href_raw = el.getAttributeInterned("href");
 
                 if (!info.has_visible and label == null and href_raw == null) return;
 
                 const href = if (href_raw) |h| URL.resolve(frame.local_arena, frame.base(), h, .{ .encoding = frame.charset }) catch h else null;
 
                 if (info.has_block) {
-                    try self.renderChildren(el.asNode(), boxed);
+                    try self.renderContent(el, boxed);
                     if (href) |h| {
                         if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
                         try self.writer.writeByte('[');
@@ -392,13 +265,13 @@ const Context = struct {
                     return;
                 }
 
-                const standalone = isStandaloneAnchor(el, frame);
+                const standalone = RenderTree.isStandaloneAnchor(el, frame);
                 if (standalone) {
                     if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
                 }
                 try self.writer.writeByte('[');
                 if (info.has_visible) {
-                    try self.renderChildren(el.asNode(), boxed);
+                    try self.renderContent(el, boxed);
                 } else {
                     try self.writer.writeAll(label orelse "");
                 }
@@ -416,9 +289,9 @@ const Context = struct {
                 return;
             },
             .input => {
-                const type_attr = el.getAttributeSafe(comptime .wrap("type")) orelse return;
+                const type_attr = el.getAttributeInterned("type") orelse return;
                 if (std.ascii.eqlIgnoreCase(type_attr, "checkbox")) {
-                    const checked = el.getAttributeSafe(comptime .wrap("checked")) != null;
+                    const checked = el.getAttributeInterned("checked") != null;
                     try self.writer.writeAll(if (checked) "[x] " else "[ ] ");
                     self.state.last_char_was_newline = false;
                 }
@@ -428,17 +301,7 @@ const Context = struct {
             else => {},
         }
 
-        // Composed tree: a shadow host renders its shadow tree in place of its
-        // light-DOM children (light DOM is visible only through <slot>). Applies
-        // to open and closed roots alike. markdown is always a rendered-content
-        // path (cf. dump.zig's default .rendered mode), so we always pierce; the
-        // early-return tags above can never be valid shadow hosts, so only this
-        // generic path needs the check.
-        if (el.hostedShadowRoot(self.frame)) |shadow| {
-            try self.renderChildren(shadow.asNode(), boxed);
-        } else {
-            try self.renderChildren(el.asNode(), boxed);
-        }
+        try self.renderContent(el, boxed);
 
         switch (tag) {
             .pre => {
@@ -552,15 +415,15 @@ const Context = struct {
     }
 };
 
-pub fn dump(node: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
+    const node = state.root;
     if (opts.max_bytes) |limit| {
         var lw = LimitedWriter.init(writer, limit);
         var ctx: Context = .{
             .state = .{},
             .writer = &lw.writer,
             .frame = frame,
-            .root = node,
-            .strip = opts.strip,
+            .tree = .{ .frame = frame, .state = state },
         };
         ctx.render(node) catch |err| switch (err) {
             error.WriteFailed => {
@@ -579,8 +442,7 @@ pub fn dump(node: *Node, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !voi
         .state = .{},
         .writer = writer,
         .frame = frame,
-        .root = node,
-        .strip = opts.strip,
+        .tree = .{ .frame = frame, .state = state },
     };
     try ctx.render(node);
     if (!ctx.state.last_char_was_newline) {
@@ -602,7 +464,7 @@ fn testMarkdownHTML(html: []const u8, expected: []const u8) !void {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(div.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = div.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString(expected, aw.written());
 }
@@ -669,7 +531,7 @@ test "browser.markdown: flex from a stylesheet" {
     const frame = page.frame().?;
 
     var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
-    try dump(frame.window._document.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = frame.window._document.asNode() }, .{}, &aw.writer, frame);
     try testing.expectString(
         \\[Title **Aug 04 2026**](http://127.0.0.1:9582/p)
         \\
@@ -837,7 +699,7 @@ test "browser.markdown: resolve links" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(div.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = div.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString(
         \\[Link](https://example.com/a/b)
@@ -888,7 +750,7 @@ test "browser.markdown: stylesheet display:none is skipped" {
     const frame = page.frame().?;
 
     var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
-    try dump(frame.window._document.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = frame.window._document.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString(
         \\
@@ -920,7 +782,7 @@ test "browser.markdown: scoped dump of a hidden subtree still renders it" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(modal, .{}, &aw.writer, frame);
+    try dump(.{ .root = modal }, .{}, &aw.writer, frame);
 
     try testing.expectString("\ndialog text\n", aw.written());
 }
@@ -936,9 +798,25 @@ test "browser.markdown: strip.ui drops images and other visual elements" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(div.asNode(), .{ .strip = .{ .ui = true } }, &aw.writer, frame);
+    try dump(.{ .root = div.asNode(), .strip = .{ .ui = true } }, .{}, &aw.writer, frame);
 
     try testing.expectString("\nText  more\n", aw.written());
+}
+
+test "browser.markdown: strip.shell drops page chrome" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    frame.url = "http://localhost/";
+
+    const doc = frame.window._document;
+    const div = try doc.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<nav><a href=\"/\">Home</a></nav><main><p>Body</p></main><footer>Legal</footer>");
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try dump(.{ .root = div.asNode(), .strip = .{ .shell = true } }, .{}, &aw.writer, frame);
+
+    try testing.expectString("\nBody\n", aw.written());
 }
 
 test "browser.markdown: max_bytes leaves output untouched when under cap" {
@@ -952,7 +830,7 @@ test "browser.markdown: max_bytes leaves output untouched when under cap" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(div.asNode(), .{ .max_bytes = 1024 }, &aw.writer, frame);
+    try dump(.{ .root = div.asNode() }, .{ .max_bytes = 1024 }, &aw.writer, frame);
 
     try testing.expectString("\nShort\n", aw.written());
 }
@@ -968,7 +846,7 @@ test "browser.markdown: max_bytes truncates with marker" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(div.asNode(), .{ .max_bytes = 50 }, &aw.writer, frame);
+    try dump(.{ .root = div.asNode() }, .{ .max_bytes = 50 }, &aw.writer, frame);
 
     const out = aw.written();
     try testing.expect(std.mem.endsWith(u8, out, "[truncated]\n"));
@@ -995,7 +873,7 @@ fn testMarkdownShadow(light: []const u8, shadow: []const u8, expected: []const u
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(host.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = host.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString(expected, aw.written());
 }
@@ -1045,7 +923,7 @@ test "browser.markdown: declarative shadow DOM renders through piercing" {
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    try dump(host.asNode(), .{}, &aw.writer, frame);
+    try dump(.{ .root = host.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString("\nshadow content\n", aw.written());
 }

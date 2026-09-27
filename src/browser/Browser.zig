@@ -21,7 +21,6 @@ const lp = @import("lightpanda");
 
 const App = @import("../App.zig");
 const Watchdog = @import("../Watchdog.zig");
-const Driver = @import("../server/Driver.zig");
 const Notification = @import("../Notification.zig");
 const HttpClient = @import("../network/HttpClient.zig");
 
@@ -29,6 +28,8 @@ const js = @import("js/js.zig");
 const Page = @import("Page.zig");
 const Session = @import("Session.zig");
 const Viewport = @import("Viewport.zig");
+const DocumentRegistry = @import("DocumentRegistry.zig");
+
 const Selector = @import("webapi/selector/Selector.zig");
 const Geolocation = @import("webapi/geolocation/Geolocation.zig");
 const PermissionState = @import("webapi/Permissions.zig").State;
@@ -56,6 +57,7 @@ arena_account: lp.Arena.Account = .{},
 
 // Our isolate's heap size as of the last reportJsHeap().
 last_reported_js_bytes: usize = 0,
+last_js_heap_sample_ms: u64 = 0,
 
 // Permission state set via CDP Browser.grantPermissions / setPermission /
 // resetPermissions, keyed by permission name (e.g. "geolocation"). Read back
@@ -72,6 +74,11 @@ renderer: ?*lp.screenshot.Renderer = null,
 
 // Runtime geolocation override
 geolocation_override: ?Geolocation.Override = null,
+
+// Every Document allocated in this browser session, allows nodes to refer to
+// documents by their index. (TODO: this will probably eventually be moved
+// to the Page, but we need other changes first)
+documents: DocumentRegistry,
 
 // used by sessions to allocate pages.
 page_pool: std.heap.MemoryPool(Page),
@@ -112,7 +119,7 @@ pub fn nextFrameId(self: *Browser) u32 {
     return id;
 }
 
-pub fn init(self: *Browser, app: *App, opts: InitOpts, driver: ?Driver) !void {
+pub fn init(self: *Browser, app: *App, opts: InitOpts) !void {
     const allocator = app.allocator;
 
     var env = try js.Env.init(app, opts.env);
@@ -123,6 +130,7 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts, driver: ?Driver) !void {
         .env = env,
         .session = null,
         .page_pool = .empty,
+        .documents = .init(allocator),
         .allocator = allocator,
         .arena_pool = &app.arena_pool,
         .http_client = undefined,
@@ -131,7 +139,7 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts, driver: ?Driver) !void {
         .watchdog_entry = undefined,
     };
     self.env.protectHeapLimit();
-    try self.http_client.init(app, driver);
+    try self.http_client.init(app);
 
     self.watchdog_entry = .{
         .env = &self.env,
@@ -143,24 +151,30 @@ pub fn init(self: *Browser, app: *App, opts: InitOpts, driver: ?Driver) !void {
 pub fn deinit(self: *Browser) void {
     const allocator = self.allocator;
 
+    self.prepareForTeardown();
+
     self.closeSession();
 
     lp.metrics.js_heap_physical_bytes.add(-@as(i64, @intCast(self.last_reported_js_bytes)));
     self.last_reported_js_bytes = 0;
 
-    // After this returns, the watchdog thread holds no reference to our env
-    // or http_client — required before either is torn down.
-    self.app.watchdog.unregister(&self.watchdog_entry);
     self.env.deinit();
     // After env.deinit() the Isolate is gone, so no further weak finalizer can
     // fire — only now is it safe to free the pool backing their parameters.
     self.fc_identity_pool.deinit(allocator);
     self.page_pool.deinit(allocator);
+    self.documents.deinit();
     self.http_client.deinit();
     if (self.renderer) |r| r.deinit();
     self.clearPermissions();
     self.permissions.deinit(allocator);
     self.selector_cache.deinit();
+}
+
+// Wait out a watchdog scan before clearing its termination request.
+pub fn prepareForTeardown(self: *Browser) void {
+    self.app.watchdog.unregister(&self.watchdog_entry);
+    self.env.cancelTerminate();
 }
 
 // Set (or overwrite) the stored state for a permission. The name is duped into
@@ -189,6 +203,12 @@ pub fn clearPermissions(self: *Browser) void {
 
 // The viewport every consumer should read: the runtime override if set,
 // otherwise the compile-time default.
+pub fn setViewportOverride(self: *Browser, viewport: ?Viewport) void {
+    self.viewport_override = viewport;
+    const session = &(self.session orelse return);
+    for (session.pages.items) |page| page.viewportChanged();
+}
+
 pub fn getViewport(self: *const Browser) Viewport {
     return self.viewport_override orelse Viewport.default;
 }
@@ -224,6 +244,18 @@ pub fn reportJsHeap(self: *Browser) void {
     const bytes = self.env.isolate.getHeapStatistics().total_physical_size;
     lp.metrics.js_heap_physical_bytes.add(@as(i64, @intCast(bytes)) - @as(i64, @intCast(self.last_reported_js_bytes)));
     self.last_reported_js_bytes = bytes;
+}
+
+// Called every Runner tick
+pub fn sampleJsHeap(self: *Browser) void {
+    const now = lp.datetime.milliTimestamp(.boot);
+    if (now - self.last_js_heap_sample_ms < 1000) {
+        // a busy page ticks often, we don't need to track this more than once
+        // per second
+        return;
+    }
+    self.last_js_heap_sample_ms = now;
+    self.reportJsHeap();
 }
 
 pub fn runMicrotasks(self: *Browser) void {

@@ -97,12 +97,12 @@ pub const SameSite = enum {
     Lax,
     None,
 };
-pub const CookiePriority = enum {
+const CookiePriority = enum {
     Low,
     Medium,
     High,
 };
-pub const CookieSourceScheme = enum {
+const CookieSourceScheme = enum {
     Unset,
     NonSecure,
     Secure,
@@ -191,7 +191,7 @@ pub const CookieWriter = struct {
         if (self.urls) |urls| {
             for (self.cookies) |*cookie| {
                 for (urls) |*url| {
-                    if (cookie.appliesTo(url, true, true, true)) { // TBD same_site, should we compare to the pages url?
+                    if (cookie.appliesTo(url, .{ .same_site = true, .is_http = true, .kind = .navigation })) { // TBD same_site, should we compare to the pages url?
                         try writeCookie(cookie, w);
                         break;
                     }
@@ -205,7 +205,7 @@ pub const CookieWriter = struct {
         try w.endArray();
     }
 };
-pub fn writeCookie(cookie: *const Cookie, w: anytype) !void {
+fn writeCookie(cookie: *const Cookie, w: anytype) !void {
     try w.beginObject();
     {
         try w.objectField("name");

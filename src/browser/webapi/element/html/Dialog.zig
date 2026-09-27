@@ -38,7 +38,7 @@ pub fn show(self: *Dialog, frame: *Frame) !void {
 /// Focus trap, backdrop, and top-layer placement are no-ops — Lightpanda has
 /// no layout/compositor; [open] reflecting through to selectors is what
 /// downstream consumers rely on.
-pub fn showModal(self: *Dialog, frame: *Frame) !void {
+fn showModal(self: *Dialog, frame: *Frame) !void {
     if (self.getOpen()) return error.InvalidStateError;
     try self.asElement().setAttributeSafe(comptime .wrap("open"), .wrap(""), frame);
 }
@@ -52,7 +52,7 @@ pub fn close(self: *Dialog, return_value: ?[]const u8, frame: *Frame) !void {
     if (return_value) |v| {
         try self.asElement().setAttributeSafe(comptime .wrap("returnvalue"), .wrap(v), frame);
     }
-    const event = try Event.init("close", .{ .bubbles = false, .cancelable = false }, frame._page);
+    const event = try Event.init("close", .{ .bubbles = false, .cancelable = false }, frame.page);
     try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
 }
 

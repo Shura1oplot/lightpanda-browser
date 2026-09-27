@@ -77,6 +77,15 @@ pub fn build(b: *Build) !void {
         .glibc_version = devFastGlibcVersion(b),
     }) else requested_target;
 
+    // Dependencies never follow -Doptimize, and they build for the requested
+    // target rather than the dev_fast bundled-CRT query, so debug and release
+    // builds share one set of dependency objects in the cache.
+    const debug_deps = b.option(bool, "debug_deps", "Build the C and Rust dependencies in Debug instead of ReleaseFast") orelse false;
+    const deps: Deps = .{
+        .target = requested_target,
+        .optimize = if (debug_deps) .Debug else .ReleaseFast,
+    };
+
     // Without an explicit -Dprebuilt_v8_path, pick up whatever `make
     // download-v8` cached rather than building V8 from source.
     const prebuilt_v8_path = prebuilt_v8_path_option orelse if (enable_tsan or enable_asan) null else findPrebuiltV8(b, target, dev_fast);
@@ -126,10 +135,11 @@ pub fn build(b: *Build) !void {
     const v8_for_link = if (orderfile != null and v8_archive != null and !shared_v8) markHotSections(b, v8_archive.?) else v8_archive;
     linkV8(b, lightpanda_module, enable_asan, enable_tsan, v8_for_link, shared_v8);
     try linkCurl(b, lightpanda_module, curl_impersonate_archive, curl_impersonate_include, macos_sdk_path);
-    linkRust(b, lightpanda_module);
+    linkRust(b, lightpanda_module, deps);
     linkZenai(b, lightpanda_module);
     linkIsocline(b, lightpanda_module);
-    linkSqlite(b, lightpanda_module, enable_csan, enable_tsan, orderfile != null);
+    linkSqlite(b, lightpanda_module, deps, enable_csan, enable_tsan, orderfile != null);
+    linkPcre2(b, lightpanda_module, deps, enable_csan, enable_tsan, orderfile != null);
 
     // Check compilation
     const check = b.step("check", "Check if lightpanda compiles");
@@ -214,6 +224,11 @@ pub fn build(b: *Build) !void {
         test_step.dependOn(&run_tests.step);
     }
 }
+
+const Deps = struct {
+    target: Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+};
 
 const ExeConfig = struct {
     check: *Build.Step,
@@ -381,14 +396,14 @@ fn linkV8(
     mod.addImport("v8", dep.module("v8"));
 }
 
-fn linkRust(b: *Build, mod: *Build.Module) void {
-    const is_debug = mod.optimize.? == .Debug;
+fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
+    // Cargo's "dev" profile writes to target/debug.
+    const profile, const out_subdir = if (deps.optimize == .Debug) .{ "dev", "debug" } else .{ "release", "release" };
 
     // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
     const exec_cargo = b.addSystemCommand(&.{
         "cargo",           "build",
-        "--profile",       if (is_debug) "dev" else "release",
-        "--features",      if (is_debug) "memstats" else "",
+        "--profile",       profile,
         "--manifest-path", "src/rust/ffi/Cargo.toml",
     });
 
@@ -401,17 +416,13 @@ fn linkRust(b: *Build, mod: *Build.Module) void {
     // still surfaces the captured output.
     _ = exec_cargo.captureStdErr(.{});
 
-    // don't let cargo's progress report (sent to stderr) cause Zig's build to
-    // print a 'failed command: ...' message. (non-zero status still outputs the error)
-    _ = exec_cargo.captureStdErr(.{});
-
     // TODO: We can prefer `--artifact-dir` once it become stable.
     const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "rust");
 
     const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
     rust_step.dependOn(&exec_cargo.step);
 
-    const obj = out_dir.path(b, if (is_debug) "debug" else "release").path(b, "liblightpanda_ffi.a");
+    const obj = out_dir.path(b, out_subdir).path(b, "liblightpanda_ffi.a");
     mod.addObjectFile(obj);
 }
 
@@ -433,10 +444,10 @@ fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []c
     }
 }
 
-fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
+fn linkSqlite(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
     const dep = b.dependency("sqlite3", .{
-        .target = mod.resolved_target.?,
-        .optimize = mod.optimize.?,
+        .target = deps.target,
+        .optimize = deps.optimize,
     });
 
     const lib = sectionize(dep.artifact("sqlite3"), section);
@@ -489,6 +500,27 @@ fn linkSqlite(b: *Build, mod: *Build.Module, enable_csan: ?std.zig.SanitizeC, is
         .optimize = mod.optimize.?,
     });
     mod.addImport("sqlite3", translate_c.createModule());
+}
+
+fn linkPcre2(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
+    const dep = b.dependency("pcre2", .{
+        .target = deps.target,
+        .optimize = deps.optimize,
+        .linkage = .static,
+    });
+
+    const lib = sectionize(dep.artifact("pcre2-8"), section);
+    lib.root_module.sanitize_c = enable_csan;
+    lib.root_module.sanitize_thread = is_tsan;
+    mod.linkLibrary(lib);
+
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = lib.getEmittedIncludeTree().path(b, "pcre2.h"),
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize.?,
+    });
+    translate_c.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
+    mod.addImport("pcre2", translate_c.createModule());
 }
 
 fn linkCurl(

@@ -44,11 +44,11 @@ const WebDriver = @This();
 
 _pad: bool = false,
 
-pub fn deleteAllCookies(_: *const WebDriver, page: *Page) void {
+fn deleteAllCookies(_: *const WebDriver, page: *Page) void {
     page.session.cookie_jar.clearRetainingCapacity();
 }
 
-pub fn getComputedLabel(_: *const WebDriver, element: *Element, frame: *Frame) ![]const u8 {
+fn getComputedLabel(_: *const WebDriver, element: *Element, frame: *Frame) ![]const u8 {
     const AXNode = @import("../../server/cdp/AXNode.zig");
     const axnode = AXNode.fromNode(element.asNode());
     var labels: Label.LabelByForIndex = .{};
@@ -64,20 +64,16 @@ pub fn getComputedLabel(_: *const WebDriver, element: *Element, frame: *Frame) !
 pub fn click(_: *const WebDriver, element: *Element, frame: *Frame) !void {
     if (element.is(Element.Html)) |html| {
         switch (html._type) {
-            inline .button, .input, .textarea, .select => |tag| {
-                if (html.subtype(Element.Html.Subtype(tag)).getDisabled()) {
-                    return;
-                }
-            },
+            .button, .input, .textarea, .select, .option, .optgroup => if (element.isDisabled()) return,
             else => {},
         }
     }
 
     dispatchPointer(element, "pointerdown", 0, 1, frame);
-    dispatchMouse(element, "mousedown", 0, 1, 1, frame);
+    _ = dispatchMouse(element, "mousedown", 0, 1, 1, frame);
     dispatchPointer(element, "pointerup", 0, 0, frame);
-    dispatchMouse(element, "mouseup", 0, 0, 1, frame);
-    dispatchMouse(element, "click", 0, 0, 1, frame);
+    _ = dispatchMouse(element, "mouseup", 0, 0, 1, frame);
+    _ = dispatchMouse(element, "click", 0, 0, 1, frame);
 }
 
 const WebDriverCookie = struct {
@@ -92,7 +88,7 @@ const WebDriverCookie = struct {
 };
 
 // Unlike the script-facing CookieStore, WebDriver can see HttpOnly cookies.
-pub fn getNamedCookie(_: *const WebDriver, name: []const u8, frame: *Frame) ?WebDriverCookie {
+fn getNamedCookie(_: *const WebDriver, name: []const u8, frame: *Frame) ?WebDriverCookie {
     const jar = &frame._session.cookie_jar;
     const target = Cookie.PreparedUri.init(frame.url);
     if (target.host.len == 0) {
@@ -101,7 +97,7 @@ pub fn getNamedCookie(_: *const WebDriver, name: []const u8, frame: *Frame) ?Web
 
     jar.removeExpired(null);
     for (jar.cookies.items) |*cookie| {
-        if (cookie.appliesTo(&target, true, true, true) == false) {
+        if (cookie.appliesTo(&target, .{ .same_site = true, .is_http = true, .kind = .navigation }) == false) {
             continue;
         }
         if (std.mem.eql(u8, cookie.name, name) == false) {
@@ -277,11 +273,11 @@ fn performPointerSource(source: js.Object, frame: *Frame) !void {
             } else {
                 Frame.user_input.updateHoverTarget(frame, el, .{
                     .buttons = pressed_mask,
-                    .modifiers = frame._page.input_modifiers,
+                    .modifiers = frame.page.input_modifiers,
                     .with_pointer = true,
                 });
                 dispatchPointer(el, "pointermove", 0, pressed_mask, frame);
-                dispatchMouse(el, "mousemove", 0, pressed_mask, 0, frame);
+                _ = dispatchMouse(el, "mousemove", 0, pressed_mask, 0, frame);
             }
         } else if (action_type.eql(comptime .wrap("pointerDown"))) {
             const el = target orelse continue;
@@ -298,10 +294,12 @@ fn performPointerSource(source: js.Object, frame: *Frame) !void {
             if (is_touch) {
                 dispatchTouch(el, "touchstart", frame);
             } else {
-                dispatchMouse(el, "mousedown", button, buttonsMask(button), click_count, frame);
-                Frame.user_input.focusEditingHostForMouseDown(frame, el) catch |err| {
-                    log.warn(.app, "webdriver editable focus", .{ .err = err });
-                };
+                const suppressed = dispatchMouse(el, "mousedown", button, buttonsMask(button), click_count, frame);
+                if (!suppressed) {
+                    Frame.user_input.focusForMouseDown(frame, el) catch |err| {
+                        log.warn(.app, "webdriver mousedown focus", .{ .err = err });
+                    };
+                }
             }
         } else if (action_type.eql(comptime .wrap("pointerUp"))) {
             const el = target orelse continue;
@@ -312,20 +310,20 @@ fn performPointerSource(source: js.Object, frame: *Frame) !void {
             if (is_touch) {
                 dispatchTouch(el, "touchend", frame);
             } else {
-                dispatchMouse(el, "mouseup", button, 0, click_count, frame);
+                _ = dispatchMouse(el, "mouseup", button, 0, click_count, frame);
                 const click_target = commonClickTarget(down_target orelse el, el);
                 last_click_button = button;
                 last_click_target = click_target;
                 if (button == 0) {
-                    dispatchMouse(click_target, "click", button, 0, click_count, frame);
+                    _ = dispatchMouse(click_target, "click", button, 0, click_count, frame);
                     if (click_count % 2 == 0) {
-                        dispatchMouse(click_target, "dblclick", button, 0, click_count, frame);
+                        _ = dispatchMouse(click_target, "dblclick", button, 0, click_count, frame);
                     }
                 } else {
                     if (button == 2) {
-                        dispatchMouse(click_target, "contextmenu", button, 0, click_count, frame);
+                        _ = dispatchMouse(click_target, "contextmenu", button, 0, click_count, frame);
                     }
-                    dispatchMouse(click_target, "auxclick", button, 0, click_count, frame);
+                    _ = dispatchMouse(click_target, "auxclick", button, 0, click_count, frame);
                 }
             }
             down_target = null;
@@ -423,7 +421,7 @@ fn performKeySource(source: js.Object, frame: *Frame) !void {
 
         // A modifier's own keydown already carries its flag; its keyup no
         // longer does.
-        setModifier(&frame._page.input_modifiers, key, is_down);
+        setModifier(&frame.page.input_modifiers, key, is_down);
 
         // Key actions have no explicit target; they go to the focused element,
         // or the document if nothing is focused. Resolved per action since a
@@ -519,7 +517,7 @@ fn setModifier(modifiers: *Modifiers, key: []const u8, pressed: bool) void {
 }
 
 fn dispatchKey(target: *EventTarget, typ: lp.String, key: []const u8, frame: *Frame) void {
-    const modifiers = frame._page.input_modifiers;
+    const modifiers = frame.page.input_modifiers;
     const event = KeyboardEvent.initTrusted(typ, .{
         .bubbles = true,
         .cancelable = true,
@@ -545,7 +543,7 @@ fn readI32(obj: js.Object, key: []const u8, default: i32) i32 {
 }
 
 fn dispatchPointer(el: *Element, comptime typ: []const u8, button: i32, buttons: u16, frame: *Frame) void {
-    const modifiers = frame._page.input_modifiers;
+    const modifiers = frame.page.input_modifiers;
     const event = PointerEvent.initTrusted(typ, .{
         .bubbles = true,
         .cancelable = true,
@@ -566,8 +564,8 @@ fn dispatchPointer(el: *Element, comptime typ: []const u8, button: i32, buttons:
     dispatch(el.asEventTarget(), event.asEvent(), frame, typ);
 }
 
-fn dispatchMouse(el: *Element, comptime typ: []const u8, button: i32, buttons: u16, detail: u32, frame: *Frame) void {
-    const modifiers = frame._page.input_modifiers;
+fn dispatchMouse(el: *Element, comptime typ: []const u8, button: i32, buttons: u16, detail: u32, frame: *Frame) bool {
+    const modifiers = frame.page.input_modifiers;
     const event = MouseEvent.initTrusted(comptime .wrap(typ), .{
         .bubbles = true,
         .cancelable = true,
@@ -581,9 +579,12 @@ fn dispatchMouse(el: *Element, comptime typ: []const u8, button: i32, buttons: u
         .metaKey = modifiers.meta,
     }, frame) catch |err| {
         log.warn(.app, "webdriver mouse event", .{ .err = err, .type = typ });
-        return;
+        return false;
     };
-    dispatch(el.asEventTarget(), event.asEvent(), frame, typ);
+    return frame._event_manager.dispatchCancelable(el.asEventTarget(), event.asEvent()) catch |err| {
+        log.warn(.app, "webdriver dispatch", .{ .err = err, .type = typ });
+        return false;
+    };
 }
 
 fn dispatchWheel(el: *Element, delta_x: i32, delta_y: i32, frame: *Frame) void {
@@ -603,7 +604,7 @@ fn dispatchWheel(el: *Element, delta_x: i32, delta_y: i32, frame: *Frame) void {
 
     // Keep the event alive past dispatch so we can read _prevent_default.
     event.asEvent().acquireRef();
-    defer _ = event.asEvent().releaseRef(frame._page);
+    defer _ = event.asEvent().releaseRef(frame.page);
     dispatch(el.asEventTarget(), event.asEvent(), frame, "wheel");
 
     // Blink also fires the legacy mousewheel event.
@@ -618,24 +619,16 @@ fn dispatchWheel(el: *Element, delta_x: i32, delta_y: i32, frame: *Frame) void {
         return;
     };
     legacy.asEvent().acquireRef();
-    defer _ = legacy.asEvent().releaseRef(frame._page);
+    defer _ = legacy.asEvent().releaseRef(frame.page);
     dispatch(el.asEventTarget(), legacy.asEvent(), frame, "mousewheel");
 
     if (event.asEvent()._prevent_default or legacy.asEvent()._prevent_default) {
         return;
     }
 
-    // Apply the scroll and fire a trusted scroll event, mirroring actions.scroll.
-    const new_left: i32 = @as(i32, @intCast(el.getScrollLeft(frame))) + delta_x;
-    const new_top: i32 = @as(i32, @intCast(el.getScrollTop(frame))) + delta_y;
-    el.setScrollLeft(new_left, frame) catch {};
-    el.setScrollTop(new_top, frame) catch {};
-
-    const scroll_evt = Event.initTrusted(comptime .wrap("scroll"), .{ .bubbles = true }, frame._page) catch |err| {
-        log.warn(.app, "webdriver scroll event", .{ .err = err });
-        return;
+    Frame.user_input.wheelScroll(el, delta_x, delta_y, frame) catch |err| {
+        log.warn(.app, "webdriver scroll", .{ .err = err });
     };
-    dispatch(el.asEventTarget(), scroll_evt, frame, "scroll");
 }
 
 fn dispatch(target: *EventTarget, event: *Event, frame: *Frame, typ: []const u8) void {
@@ -648,7 +641,7 @@ fn hasNonPassiveListener(el: *Element, typ: []const u8, frame: *Frame) bool {
     // Listeners live in the event manager of the element's own frame (and the
     // propagation path ends at that frame's window), which is not the caller's
     // frame when the element belongs to e.g. an iframe's document.
-    const owner = el.ownerFrame(frame);
+    const owner = el.ownerFrame(frame) orelse return false;
     const base = &owner._event_manager.base;
     var current: ?*@import("Node.zig") = el.asNode();
     while (current) |node| : (current = node.parentNode()) {
