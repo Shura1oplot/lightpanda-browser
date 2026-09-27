@@ -592,20 +592,21 @@ fn linkIsocline(b: *Build, mod: *Build.Module) void {
 /// - If the flag contains a simple string (e.g., `nightly`), it replaces only
 ///   the pre-release tag of the base version (e.g., `1.0.0-dev` -> `1.0.0-nightly`).
 ///
-/// For versions that have a pre-release tag and no explicit build metadata,
-/// this function automatically enriches the version with the git commit count
-/// and short hash (e.g., `1.0.0-dev.5243+dbe45229`).
+/// Explicit full semantic versions are returned unchanged. For implicit or
+/// shorthand versions with a pre-release tag and no build metadata, append
+/// the git commit count and short hash (e.g., `1.0.0-dev.5243+dbe45229`).
 fn resolveVersion(b: *std.Build) std.SemanticVersion {
     const opt_version = b.option([]const u8, "version", "Override the version of this build");
 
-    const version = if (opt_version) |v|
-        std.SemanticVersion.parse(v) catch blk: {
+    const version = if (opt_version) |v| blk: {
+        if (std.SemanticVersion.parse(v)) |explicit| {
+            return explicit;
+        } else |_| {
             var fallback = lightpanda_version;
             fallback.pre = v;
             break :blk fallback;
         }
-    else
-        lightpanda_version;
+    } else lightpanda_version;
 
     if (version.pre == null or version.build != null) return version;
 
