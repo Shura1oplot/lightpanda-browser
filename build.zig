@@ -547,6 +547,15 @@ fn linkPcre2(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.Sa
     mod.addImport("pcre2", translator.mod);
 }
 
+fn cLibModule(b: *Build, target: Build.ResolvedTarget, optimize: std.lang.Optimize, is_tsan: bool) *Build.Module {
+    return b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_thread = is_tsan,
+    });
+}
+
 fn linkCurl(
     b: *Build,
     mod: *Build.Module,
