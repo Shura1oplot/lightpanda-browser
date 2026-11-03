@@ -3740,6 +3740,13 @@ pub const Transfer = struct {
         for (self.req_headers.items) |hdr| {
             try conn.addHeader(arena, hdr.name, hdr.value);
         }
+        // curl-impersonate supplies navigation defaults. Metadata omitted by
+        // Fetch must stay absent on the wire, including non-navigation User.
+        inline for (.{ "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-User", "Sec-Fetch-Dest" }) |name| {
+            if (self.findRequestHeader(name) == null) {
+                try conn.addRawHeader(name ++ ":");
+            }
+        }
         if (req.body != null and self.findRequestHeader("content-type") == null) {
             // Prevent libcurl from always setting application/x-www-form-urlencoded
             try conn.addRawHeader("Content-Type:");
