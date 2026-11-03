@@ -19,11 +19,14 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
-const js = @import("../../js/js.zig");
 const http = @import("../../../network/http.zig");
+const CorsGate = @import("../../../network/CorsGate.zig");
+
+const Page = @import("../../Page.zig");
+const js = @import("../../js/js.zig");
+const referrer = @import("../../referrer.zig");
 
 const URL = @import("../URL.zig");
-const Page = @import("../../Page.zig");
 const Blob = @import("../Blob.zig");
 const AbortSignal = @import("../AbortSignal.zig");
 const ReadableStream = @import("../streams/ReadableStream.zig");
@@ -31,9 +34,10 @@ const ReadableStream = @import("../streams/ReadableStream.zig");
 const Headers = @import("Headers.zig");
 const FormData = @import("FormData.zig");
 const body_init = @import("body_init.zig");
-const BodyInit = body_init.BodyInit;
+const TextDecoderStream = @import("../encoding/TextDecoderStream.zig");
 
 const Execution = js.Execution;
+const BodyInit = body_init.BodyInit;
 
 const Request = @This();
 
@@ -43,12 +47,15 @@ _method: http.Method,
 _headers: ?*Headers,
 _body: ?[]const u8,
 _body_stream: ?*ReadableStream = null, // drained into `_body` on first use.
+_body_view: ?*ReadableStream = null, // lazily-created, exposed via the `body` getter
 _arena: *lp.Arena,
 _cache: Cache,
 _credentials: Credentials,
 _redirect: Redirect,
 _mode: Mode,
 _signal: ?*AbortSignal,
+_referrer: ReferrerValue,
+_referrer_policy: ?referrer.Policy,
 _body_used: bool = false,
 
 pub const Input = union(enum) {
@@ -58,14 +65,22 @@ pub const Input = union(enum) {
 
 pub const InitOpts = struct {
     body: ?BodyInit = null,
-    cache: Cache = .default,
-    credentials: Credentials = .@"same-origin",
+    cache: ?Cache = null,
+    credentials: ?Credentials = null,
     headers: ?Headers.InitOpts = null,
     method: ?[]const u8 = null,
-    mode: Mode = .cors,
+    mode: ?Mode = null,
     priority: ?[]const u8 = null,
-    redirect: Redirect = .follow,
+    redirect: ?Redirect = null,
+    referrer: ?[]const u8 = null,
+    referrerPolicy: ?[]const u8 = null,
     signal: ?*AbortSignal = null,
+};
+
+pub const ReferrerValue = union(enum) {
+    client,
+    none,
+    url: [:0]const u8,
 };
 
 const Priority = enum { high, low, auto };
@@ -108,7 +123,7 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
 
     const url = switch (input) {
         .url => |u| try URL.resolve(arena.allocator(), exec.base(), u, .{ .encoding = exec.charset.* }),
-        .request => |r| try arena.dupeZ(u8, r._url),
+        .request => |r| try arena.dupeSentinel(u8, r._url, 0),
     };
 
     const opts = opts_ orelse InitOpts{};
@@ -119,15 +134,39 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
     }
 
     const method = if (opts.method) |m|
-        try parseMethod(m, exec)
+        try parseMethod(m)
     else switch (input) {
         .url => .GET,
         .request => |r| r._method,
     };
 
-    const mode = switch (input) {
-        .url => opts.mode,
-        .request => |r| if (opts_ != null) opts.mode else r._mode,
+    // Absent init members inherit from the input Request.
+    const mode: Mode = if (opts.mode) |m| blk: {
+        if (m == .navigate) {
+            return error.TypeError;
+        }
+        break :blk m;
+    } else switch (input) {
+        .url => .cors,
+        .request => |r| if (r._mode == .navigate and opts_ != null) .@"same-origin" else r._mode,
+    };
+    // https://fetch.spec.whatwg.org/#dom-request
+    if (mode == .@"no-cors" and !CorsGate.isSafelistedMethod(method)) {
+        return switch (method) {
+            inline else => |m| exec.js.typeError("'" ++ @tagName(m) ++ "' is unsupported in no-cors mode"),
+        };
+    }
+    const cache: Cache = opts.cache orelse switch (input) {
+        .url => .default,
+        .request => |r| r._cache,
+    };
+    const credentials: Credentials = opts.credentials orelse switch (input) {
+        .url => .@"same-origin",
+        .request => |r| r._credentials,
+    };
+    const redirect: Redirect = opts.redirect orelse switch (input) {
+        .url => .follow,
+        .request => |r| r._redirect,
     };
 
     const guard = headerGuard(mode);
@@ -173,19 +212,44 @@ pub fn init(input: Input, opts_: ?InitOpts, exec: *const Execution) !*Request {
         .request => |r| r._signal,
     };
 
+    const referrer_value: ReferrerValue = if (opts.referrer) |r| blk: {
+        if (r.len == 0) break :blk .none;
+        if (std.mem.eql(u8, r, "about:client")) break :blk .client;
+        const resolved = try URL.resolve(arena.allocator(), exec.base(), r, .{ .encoding = exec.charset.* });
+        if (!exec.isSameOrigin(resolved)) break :blk .client;
+        break :blk .{ .url = resolved };
+    } else if (opts_ != null) .client else switch (input) {
+        .url => .client,
+        .request => |r| switch (r._referrer) {
+            .url => |u| .{ .url = try arena.dupeSentinel(u8, u, 0) },
+            else => r._referrer,
+        },
+    };
+
+    // Per spec, an unrecognized policy string is ignored
+    // referrer.parse already returns null for that case.
+    const referrer_policy: ?referrer.Policy = if (opts.referrerPolicy) |rp|
+        referrer.parse(rp)
+    else if (opts_ != null) null else switch (input) {
+        .url => null,
+        .request => |r| r._referrer_policy,
+    };
+
     const self = try arena.create(Request);
     self.* = .{
         ._url = url,
         ._arena = arena,
         ._method = method,
         ._headers = headers,
-        ._cache = opts.cache,
-        ._credentials = opts.credentials,
-        ._redirect = opts.redirect,
+        ._cache = cache,
+        ._credentials = credentials,
+        ._redirect = redirect,
         ._mode = mode,
         ._body = body,
         ._body_stream = body_stream,
         ._signal = signal,
+        ._referrer = referrer_value,
+        ._referrer_policy = referrer_policy,
     };
     arena.report();
     return self;
@@ -203,14 +267,8 @@ pub fn acquireRef(self: *Request) void {
     self._rc.acquire();
 }
 
-fn parseMethod(method: []const u8, exec: *const Execution) !http.Method {
-    if (method.len > "propfind".len) {
-        return error.InvalidMethod;
-    }
-
-    const lower = std.ascii.lowerString(exec.buf, method);
-
-    const method_lookup = std.StaticStringMap(http.Method).initComptime(.{
+fn parseMethod(method: []const u8) !http.Method {
+    const method_lookup = std.StaticStringMapWithEql(http.Method, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
         .{ "get", .GET },
         .{ "post", .POST },
         .{ "delete", .DELETE },
@@ -220,7 +278,7 @@ fn parseMethod(method: []const u8, exec: *const Execution) !http.Method {
         .{ "options", .OPTIONS },
         .{ "propfind", .PROPFIND },
     });
-    return method_lookup.get(lower) orelse return error.InvalidMethod;
+    return method_lookup.get(method) orelse return error.TypeError;
 }
 
 pub fn getUrl(self: *const Request) []const u8 {
@@ -273,34 +331,108 @@ fn getBodyUsed(self: *const Request) bool {
 }
 
 pub fn bodyBytes(self: *Request) !?[]const u8 {
-    if (self._body_stream) |stream| {
-        // drain the stram on first use, TypeError if it can't.
+    if (self._body) |body| {
+        return body;
+    } else if (self._body_stream) |stream| {
         self._body = try stream.collectBodyBytes(self._arena.allocator());
         self._body_stream = null;
+        // `body` keeps returning the original stream once it's drained.
+        if (self._body_view == null) {
+            self._body_view = stream;
+        }
+        return self._body;
+    } else return null;
+}
+
+// A TypeError if the body is disturbed or its exposed `body` stream is locked.
+fn checkUnusable(self: *const Request, local: *const js.Local) !void {
+    if (self._body_used) {
+        return local.typeError("Body has already been read");
     }
-    return self._body;
+    const stream = self._body_view orelse return;
+    if (stream._disturbed or stream.getLocked()) {
+        return local.typeError("Body is disturbed or locked");
+    }
+}
+
+// A consumed body's stream stays locked and disturbed.
+fn lockStream(stream: *ReadableStream, exec: *const Execution) !void {
+    _ = try stream.getReader(exec);
+    stream._disturbed = true;
 }
 
 // Marks a present body consumed and returns it
-fn consume(self: *Request, local: *const js.Local) ![]const u8 {
+fn consume(self: *Request, exec: *const Execution) ![]const u8 {
+    const local = exec.js.local.?;
     if (self._body == null and self._body_stream == null) {
         return "";
     }
 
-    if (self._body_used) {
-        return local.typeError("Body has already been read");
-    }
+    try self.checkUnusable(local);
     const body = self.bodyBytes() catch |err| switch (err) {
         error.TypeError => return local.typeError("Failed to read ReadableStream body"),
         else => return err,
     };
     self._body_used = true;
+    if (self._body_view) |stream| {
+        try lockStream(stream, exec);
+    }
     return body orelse "";
+}
+
+// https://fetch.spec.whatwg.org/#dom-body-body
+pub fn getBody(self: *Request, exec: *const Execution) !?*ReadableStream {
+    // If we already have a body, we just return that.
+    if (self._body_view) |stream| {
+        return stream;
+    }
+
+    // If our body is a stream, we should just return it.
+    if (self._body_stream) |stream| {
+        self._body_view = stream;
+        if (self._body_used) {
+            try lockStream(stream, exec);
+        }
+
+        return stream;
+    }
+
+    // This creates a new ReadableStream for the other types of body.
+    const body = try self.bodyBytes() orelse return null;
+    const stream = blk: {
+        if (body.len == 0) {
+            const stream = try ReadableStream.init(null, null, exec);
+            try stream._controller.close();
+            break :blk stream;
+        }
+        break :blk try ReadableStream.initWithData(body, exec);
+    };
+    self._body_view = stream;
+    if (self._body_used) {
+        try lockStream(stream, exec);
+    }
+    return stream;
+}
+
+// Returns a ReadableStream that decodes the body as UTF-8.
+pub fn textStream(self: *Request, exec: *const Execution) !*ReadableStream {
+    const local = exec.js.local.?;
+    try self.checkUnusable(local);
+
+    const byte_stream = try self.getBody(exec) orelse {
+        const stream = try ReadableStream.init(null, null, exec);
+        try stream._controller.close();
+        return stream;
+    };
+    self._body_used = true;
+
+    const decoder = try TextDecoderStream.init(null, null, exec);
+    return byte_stream.pipeThrough(.{ .readable = decoder.getReadable(), .writable = decoder.getWritable() }, exec);
 }
 
 pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
 
     const headers = try self.getHeaders(exec);
     const content_type = try headers.get("content-type", exec) orelse "";
@@ -311,13 +443,13 @@ pub fn blob(self: *Request, exec: *const Execution) !js.Promise {
 
 pub fn text(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
     return local.resolvePromise(body_init.stripUtf8Bom(body));
 }
 
 pub fn json(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
 
     const value = local.parseJSON(body_init.stripUtf8Bom(body)) catch {
         return local.rejectPromise(.{ .syntax_error = "failed to parse" });
@@ -327,20 +459,20 @@ pub fn json(self: *Request, exec: *const Execution) !js.Promise {
 
 pub fn arrayBuffer(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
     return local.resolvePromise(js.ArrayBuffer{ .values = body });
 }
 
 pub fn bytes(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
     return local.resolvePromise(js.TypedArray(u8){ .values = body });
 }
 
 pub fn formData(self: *Request, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
     // Per Fetch, a null body acts as an empty byte sequence.
-    const body = try self.consume(local);
+    const body = try self.consume(exec);
 
     const headers = try self.getHeaders(exec);
     const content_type = try headers.get("content-type", exec);
@@ -362,19 +494,46 @@ pub fn clone(self: *Request, exec: *const Execution) !*Request {
 
     const request = try arena.create(Request);
     request.* = .{
-        ._url = try arena.dupeZ(u8, self._url),
+        ._url = try arena.dupeSentinel(u8, self._url, 0),
         ._arena = arena,
         ._method = self._method,
-        ._headers = self._headers,
+        ._headers = if (self._headers) |h| try Headers.initGuarded(.{ .obj = h }, h._guard, exec) else null,
         ._cache = self._cache,
         ._credentials = self._credentials,
         ._redirect = self._redirect,
         ._mode = self._mode,
         ._body = if (body) |b| try arena.dupe(u8, b) else null,
         ._signal = self._signal,
+        ._referrer = switch (self._referrer) {
+            .url => |u| .{ .url = try arena.dupeSentinel(u8, u, 0) },
+            else => self._referrer,
+        },
+        ._referrer_policy = self._referrer_policy,
     };
     arena.report();
     return request;
+}
+
+pub fn getReferrer(self: *Request) []const u8 {
+    return switch (self._referrer) {
+        .client => "about:client",
+        .none => "",
+        .url => |url| url,
+    };
+}
+
+pub fn getReferrerPolicy(self: *Request) []const u8 {
+    const policy = self._referrer_policy orelse return "";
+    return switch (policy) {
+        .no_referrer => "no-referrer",
+        .no_referrer_when_downgrade => "no-referrer-when-downgrade",
+        .origin => "origin",
+        .origin_when_cross_origin => "origin-when-cross-origin",
+        .same_origin => "same-origin",
+        .strict_origin => "strict-origin",
+        .strict_origin_when_cross_origin => "strict-origin-when-cross-origin",
+        .unsafe_url => "unsafe-url",
+    };
 }
 
 pub const JsApi = struct {
@@ -382,7 +541,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Request";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -396,13 +554,17 @@ pub const JsApi = struct {
     pub const mode = bridge.accessor(Request.getMode, null, .{});
     pub const signal = bridge.accessor(Request.getSignal, null, .{});
     pub const bodyUsed = bridge.accessor(Request.getBodyUsed, null, .{});
+    pub const body = bridge.accessor(Request.getBody, null, .{});
     pub const blob = bridge.function(Request.blob, .{});
     pub const text = bridge.function(Request.text, .{});
     pub const json = bridge.function(Request.json, .{});
     pub const arrayBuffer = bridge.function(Request.arrayBuffer, .{});
     pub const bytes = bridge.function(Request.bytes, .{});
     pub const formData = bridge.function(Request.formData, .{});
+    pub const textStream = bridge.function(Request.textStream, .{});
     pub const clone = bridge.function(Request.clone, .{});
+    pub const referrer = bridge.accessor(Request.getReferrer, null, .{});
+    pub const referrerPolicy = bridge.accessor(Request.getReferrerPolicy, null, .{});
 };
 
 const testing = @import("../../../testing.zig");

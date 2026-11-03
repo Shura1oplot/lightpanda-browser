@@ -714,7 +714,7 @@ pub fn collapse(self: *Selection, _node: ?*Node, _offset: ?u32, frame: *Frame) !
 
 pub fn toString(self: *const Selection, frame: *Frame) ![]const u8 {
     const range = self._range orelse return "";
-    return try range.toString(frame);
+    return try range.toSelectionString(frame);
 }
 
 fn setRange(self: *Selection, new_range: ?*Range, frame: *Frame) void {
@@ -732,7 +732,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Selection";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

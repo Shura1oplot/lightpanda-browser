@@ -384,7 +384,7 @@ fn deleteData(self: *CData, offset: usize, count: usize, frame: *Frame) !void {
         self._data = try frame.dupeSSO(old_value[0..range.start]);
     } else {
         // Deleting from middle - concat prefix and suffix
-        self._data = try String.concat(frame.arena, &.{
+        self._data = try String.concat(frame.page_arena, &.{
             old_value[0..range.start],
             old_value[range.end..],
         });
@@ -400,7 +400,7 @@ fn insertData(self: *CData, offset: usize, data: []const u8, frame: *Frame) !voi
 
     const old_value = self._data;
     const existing = old_value.str();
-    self._data = try String.concat(frame.arena, &.{
+    self._data = try String.concat(frame.page_arena, &.{
         existing[0..byte_offset],
         data,
         existing[byte_offset..],
@@ -419,7 +419,7 @@ pub fn replaceData(self: *CData, offset: usize, count: usize, data: []const u8, 
 
     const old_value = self._data;
     const existing = old_value.str();
-    self._data = try String.concat(frame.arena, &.{
+    self._data = try String.concat(frame.page_arena, &.{
         existing[0..range.start],
         data,
         existing[range.end..],
@@ -439,44 +439,29 @@ pub fn remove(self: *CData, frame: *Frame) !void {
     _ = try parent.removeChild(node, frame);
 }
 
-pub fn before(self: *CData, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn before(self: *CData, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const node = self.asNode();
     const parent = node.parentNode() orelse return;
 
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(node.getDocument(frame));
         _ = try parent.insertBefore(child, node, frame);
     }
 }
 
-pub fn after(self: *CData, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn after(self: *CData, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const node = self.asNode();
     const parent = node.parentNode() orelse return;
-    const viable_next = Node.NodeOrText.viableNextSibling(node, nodes);
+    const viable_next = Node.NodeOrText.viableNextSibling(node, nodes.values);
 
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(node.getDocument(frame));
         _ = try parent.insertBefore(child, viable_next, frame);
     }
 }
 
-pub fn replaceWith(self: *CData, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    const ref_node = self.asNode();
-    const parent = ref_node.parentNode() orelse return;
-
-    var rm_ref_node = true;
-    for (nodes) |node_or_text| {
-        const child = try node_or_text.toNode(ref_node.getDocument(frame));
-        if (child == ref_node) {
-            rm_ref_node = false;
-            continue;
-        }
-        _ = try parent.insertBefore(child, ref_node, frame);
-    }
-
-    if (rm_ref_node) {
-        _ = try parent.removeChild(ref_node, frame);
-    }
+pub fn replaceWith(self: *CData, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceWithNodes(nodes.values, frame);
 }
 
 pub fn nextElementSibling(self: *CData) ?*Node.Element {
@@ -502,7 +487,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "CharacterData";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

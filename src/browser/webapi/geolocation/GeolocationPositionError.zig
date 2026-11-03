@@ -64,7 +64,7 @@ pub fn releaseRef(self: *GeolocationPositionError, page: *Page) void {
 }
 
 fn getCode(self: *const GeolocationPositionError) u16 {
-    return @intFromEnum(self._code);
+    return @backingInt(self._code);
 }
 
 fn getMessage(self: *const GeolocationPositionError) []const u8 {
@@ -76,14 +76,13 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "GeolocationPositionError";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const code = bridge.accessor(GeolocationPositionError.getCode, null, .{});
     pub const message = bridge.accessor(GeolocationPositionError.getMessage, null, .{});
 
-    pub const PERMISSION_DENIED = bridge.property(@intFromEnum(Code.permission_denied), .{ .template = true });
-    pub const POSITION_UNAVAILABLE = bridge.property(@intFromEnum(Code.position_unavailable), .{ .template = true });
-    pub const TIMEOUT = bridge.property(@intFromEnum(Code.timeout), .{ .template = true });
+    pub const PERMISSION_DENIED = bridge.property(@backingInt(Code.permission_denied), .{ .template = true });
+    pub const POSITION_UNAVAILABLE = bridge.property(@backingInt(Code.position_unavailable), .{ .template = true });
+    pub const TIMEOUT = bridge.property(@backingInt(Code.timeout), .{ .template = true });
 };

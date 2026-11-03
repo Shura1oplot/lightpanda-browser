@@ -99,7 +99,7 @@ pub fn registerTool(
         }
     }
 
-    const arena = exec.arena;
+    const arena = exec.page_arena;
     const entry = try arena.create(Tool);
     entry.* = .{
         .ctx = self,
@@ -206,7 +206,6 @@ pub const ModelContextClient = struct {
 
         pub const Meta = struct {
             pub const name = "ModelContextClient";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
             pub const empty_with_no_proto = true;
         };
@@ -223,7 +222,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ModelContext";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

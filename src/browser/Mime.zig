@@ -17,6 +17,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const repeat = @import("../string.zig").repeat;
 const Allocator = std.mem.Allocator;
 
 const Mime = @This();
@@ -28,8 +29,14 @@ charset_len: usize = default_charset_len,
 is_default_charset: bool = true,
 
 /// String "UTF-8" continued by null characters.
-const default_charset = .{ 'U', 'T', 'F', '-', '8' } ++ .{0} ** 36;
+const default_charset = charsetBuf("UTF-8");
 const default_charset_len = 5;
+
+fn charsetBuf(comptime name: []const u8) [41]u8 {
+    var buf: [41]u8 = @splat(0);
+    @memcpy(buf[0..name.len], name);
+    return buf;
+}
 
 /// Mime with unknown Content-Type, empty params and empty charset.
 pub const unknown = Mime{ .content_type = .{ .unknown = {} } };
@@ -108,7 +115,7 @@ pub const ContentTypeIterator = struct {
         // Skip whitespace.
         const trimmed = std.mem.trimStart(u8, content_type, &.{ ' ', '\t' });
         // Find semicolon delimiter; or just use the end position.
-        const end = std.mem.indexOfScalar(u8, trimmed, ';') orelse trimmed.len;
+        const end = std.mem.findScalar(u8, trimmed, ';') orelse trimmed.len;
         const essence = std.mem.trimEnd(u8, trimmed[0..end], &.{ ' ', '\t' });
 
         // Rest of the parameters.
@@ -127,12 +134,12 @@ pub const ContentTypeIterator = struct {
         while (self.rest.len > 0) {
             // `rest` always sits at the `;` that introduced this parameter.
             var param = self.rest[1..];
-            const end = std.mem.indexOfScalar(u8, param, ';') orelse param.len;
+            const end = std.mem.findScalar(u8, param, ';') orelse param.len;
             self.rest = param[end..];
             param = std.mem.trim(u8, param[0..end], " \t");
 
             // Parameters without `=` are malformed; skip them.
-            const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, param, '=') orelse continue;
             const key = std.mem.trimEnd(u8, param[0..eq], " \t");
             if (key.len == 0) {
                 continue;
@@ -167,6 +174,11 @@ fn charsetStringZ(mime: *const Mime) [:0]const u8 {
 
 pub fn charsetString(mime: *const Mime) []const u8 {
     return mime.charset[0..mime.charset_len];
+}
+
+/// The charset parameter, if the input gave one.
+pub fn explicitCharset(mime: *const Mime) ?[]const u8 {
+    return if (mime.is_default_charset) null else mime.charsetString();
 }
 
 pub fn parse(input: []const u8) !Mime {
@@ -240,7 +252,7 @@ pub fn prescanCharset(html: []const u8) ?[]const u8 {
     var pos: usize = 0;
     while (pos < data.len) {
         // Find next '<'
-        pos = std.mem.indexOfScalarPos(u8, data, pos, '<') orelse return null;
+        pos = std.mem.findScalarPos(u8, data, pos, '<') orelse return null;
         pos += 1;
         if (pos >= data.len) return null;
 
@@ -262,7 +274,7 @@ pub fn prescanCharset(html: []const u8) ?[]const u8 {
         }
 
         // Scan attributes within this meta tag
-        const tag_end = std.mem.indexOfScalarPos(u8, data, pos, '>') orelse return null;
+        const tag_end = std.mem.findScalarPos(u8, data, pos, '>') orelse return null;
         const attrs = data[pos..tag_end];
 
         // Look for charset= attribute directly
@@ -282,6 +294,42 @@ pub fn prescanCharset(html: []const u8) ?[]const u8 {
         }
 
         pos = tag_end + 1;
+    }
+    return null;
+}
+
+/// The encoding named by an XML declaration:
+///   <?xml version="1.0" encoding="X"?>
+/// optionally at the very start of `xml`
+pub fn xmlDeclarationEncoding(xml: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, xml, "<?xml") == false) {
+        return null;
+    }
+    const end = std.mem.findPos(u8, xml, 5, "?>") orelse return null;
+    const decl = xml[5..end];
+
+    var pos: usize = 0;
+    while (std.mem.findPos(u8, decl, pos, "encoding")) |index| {
+        pos = index + "encoding".len;
+        // Only as an attribute name: "1.0" or "standalone" values can't
+        // contain it, but a pseudo-attribute like "xencoding" could.
+        if (index == 0 or std.ascii.isWhitespace(decl[index - 1]) == false) {
+            continue;
+        }
+        var rest = std.mem.trimStart(u8, decl[pos..], " \t\r\n");
+        if (rest.len == 0 or rest[0] != '=') {
+            continue;
+        }
+        rest = std.mem.trimStart(u8, rest[1..], " \t\r\n");
+        if (rest.len == 0 or (rest[0] != '"' and rest[0] != '\'')) {
+            return null;
+        }
+        const close = std.mem.findScalarPos(u8, rest, 1, rest[0]) orelse return null;
+        const encoding = rest[1..close];
+        if (encoding.len == 0 or encoding.len > 40) {
+            return null;
+        }
+        return encoding;
     }
     return null;
 }
@@ -376,7 +424,7 @@ pub fn sniff(body: []const u8) ?Mime {
             // UTF-16 big-endian BOM
             return .{
                 .content_type = .{ .text_plain = {} },
-                .charset = .{ 'U', 'T', 'F', '-', '1', '6', 'B', 'E' } ++ .{0} ** 33,
+                .charset = comptime charsetBuf("UTF-16BE"),
                 .charset_len = 8,
                 .is_default_charset = false,
             };
@@ -385,7 +433,7 @@ pub fn sniff(body: []const u8) ?Mime {
             // UTF-16 little-endian BOM
             return .{
                 .content_type = .{ .text_plain = {} },
-                .charset = .{ 'U', 'T', 'F', '-', '1', '6', 'L', 'E' } ++ .{0} ** 33,
+                .charset = comptime charsetBuf("UTF-16LE"),
                 .charset_len = 8,
                 .is_default_charset = false,
             };
@@ -459,7 +507,7 @@ pub fn isText(mime: *const Mime) bool {
 
 // we expect value to be lowercase
 fn parseContentType(value: []const u8) !struct { ContentType, usize } {
-    const end = std.mem.indexOfScalarPos(u8, value, 0, ';') orelse value.len;
+    const end = std.mem.findScalarPos(u8, value, 0, ';') orelse value.len;
     const type_name = trimRight(value[0..end]);
     const attribute_start = end + 1;
 
@@ -503,7 +551,7 @@ fn parseContentType(value: []const u8) !struct { ContentType, usize } {
         return .{ ct, attribute_start };
     }
 
-    const separator = std.mem.indexOfScalarPos(u8, type_name, 0, '/') orelse return error.Invalid;
+    const separator = std.mem.findScalarPos(u8, type_name, 0, '/') orelse return error.Invalid;
 
     const main_type = value[0..separator];
     const sub_type = trimRight(value[separator + 1 .. end]);
@@ -552,14 +600,14 @@ pub fn serialize(arena: Allocator, input: []const u8) ![]const u8 {
     }
 
     // type "/" subtype
-    const slash = std.mem.indexOfScalarPos(u8, trimmed, 0, '/') orelse return "";
+    const slash = std.mem.findScalarPos(u8, trimmed, 0, '/') orelse return "";
     const type_name = trimmed[0..slash];
     if (isHttpToken(type_name) == false) {
         return "";
     }
 
     var rest = trimmed[slash + 1 ..];
-    const subtype_end = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+    const subtype_end = std.mem.findScalar(u8, rest, ';') orelse rest.len;
     const subtype = std.mem.trimEnd(u8, rest[0..subtype_end], &HTTP_WHITESPACE);
     if (isHttpToken(subtype) == false) {
         return "";
@@ -1017,7 +1065,7 @@ test "Mime: parse charset (WHATWG parameter semantics)" {
     try expect(.{ .content_type = .{ .text_html = {} }, .charset = "UTF-8" }, "text/html;charset =gbk");
 
     // A long preceding parameter doesn't hide a later charset.
-    try expect(.{ .content_type = .{ .text_html = {} }, .charset = "gbk" }, "text/html;" ++ ("a" ** 130) ++ "=x;charset=gbk");
+    try expect(.{ .content_type = .{ .text_html = {} }, .charset = "gbk" }, "text/html;" ++ (repeat("a", 130)) ++ "=x;charset=gbk");
 }
 
 test "Mime: isHTML" {
@@ -1054,6 +1102,29 @@ test "Mime: isXML" {
     try assert(false, "application/json");
     try assert(false, "application/xmlfoo");
     try assert(false, "text/xm");
+}
+
+test "Mime: xmlDeclarationEncoding" {
+    const assert = struct {
+        fn assert(expected: ?[]const u8, input: []const u8) !void {
+            const actual = Mime.xmlDeclarationEncoding(input);
+            if (expected) |e| {
+                try testing.expectEqual(e, actual.?);
+            } else {
+                try testing.expectEqual(null, actual);
+            }
+        }
+    }.assert;
+    try assert("ISO-8859-1", "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><html/>");
+    try assert("windows-1252", "<?xml version='1.0' encoding = 'windows-1252' standalone='yes'?>");
+    try assert("utf-8", "<?xml version=\"1.0\"\n\tencoding=\"utf-8\"?>");
+    try assert(null, "<?xml version=\"1.0\"?><html/>");
+    try assert(null, "<?xml version=\"1.0\" xencoding=\"utf-8\"?>");
+    try assert(null, "<?xml version=\"1.0\" encoding=utf-8?>");
+    try assert(null, "<?xml version=\"1.0\" encoding=\"\"?>");
+    try assert(null, " <?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    try assert(null, "<html><?xml version=\"1.0\" encoding=\"utf-8\"?>");
+    try assert(null, "<?xml version=\"1.0\" encoding=\"utf-8\"");
 }
 
 test "Mime: sniff" {

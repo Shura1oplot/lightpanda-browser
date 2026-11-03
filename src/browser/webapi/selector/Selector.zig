@@ -214,7 +214,7 @@ pub fn classAttributeContains(class_attr: []const u8, class_name: []const u8) bo
     // single compare, and a token whose first byte differs is rejected without
     // any boundary or length work.
     //
-    // Deliberately not std.mem.indexOfScalarPos: its vector setup costs more
+    // Deliberately not std.mem.findScalarPos: its vector setup costs more
     // than it saves at class-attribute lengths. Measured against it on both the
     // benchmark shape (~12 bytes) and tailwind-style values (~105 bytes), this
     // loop wins on every case but one.
@@ -262,6 +262,8 @@ pub const Part = union(enum) {
     universal, // '*' any element
     pseudo_class: PseudoClass,
     attribute: Attribute,
+    // Matches no element.
+    pseudo_element,
 };
 
 pub const Attribute = struct {
@@ -271,7 +273,15 @@ pub const Attribute = struct {
     // foreign (SVG/MathML) elements, whose attributes are stored unnormalized.
     original_name: String,
     matcher: AttributeMatcher,
-    case_insensitive: bool,
+    value_case: AttributeValueCase,
+};
+
+pub const AttributeValueCase = enum {
+    sensitive,
+    insensitive,
+    // No flag on an attribute whose value HTML compares without case: case
+    // insensitive on HTML elements only.
+    html_legacy,
 };
 
 pub const AttributeMatcher = union(enum) {
@@ -330,6 +340,8 @@ pub const PseudoClass = union(enum) {
     only_of_type,
     nth_child: NthPattern,
     nth_last_child: NthPattern,
+    nth_child_of: NthOf, // :nth-child(An+B of S)
+    nth_last_child_of: NthOf, // :nth-last-child(An+B of S)
     nth_of_type: NthPattern,
     nth_last_of_type: NthPattern,
 
@@ -353,6 +365,12 @@ pub const NthPattern = struct {
     // even: a=2, b=0
     // 3n+1: a=3, b=1
     // 5: a=0, b=5
+};
+
+// :nth-child(An+B of S) counts only the siblings matching S
+pub const NthOf = struct {
+    pattern: NthPattern,
+    selectors: []const Selector,
 };
 
 // Combinator represents the relationship between two compound selectors
@@ -388,6 +406,7 @@ pub const Compound = struct {
             .attribute => {
                 try writer.writeAll("TODO");
             },
+            .pseudo_element => try writer.writeAll("::pseudo-element"),
         };
     }
 };
@@ -421,6 +440,12 @@ pub const Selector = struct {
         return self.segments[self.segments.len - 1].compound;
     }
 
+    /// Such a selector matches no element.
+    pub fn hasPseudoElement(self: Selector) bool {
+        const parts = self.rightmost().parts;
+        return parts[parts.len - 1] == .pseudo_element;
+    }
+
     pub fn format(self: Selector, writer: *std.Io.Writer) !void {
         try self.first.format(writer);
         for (self.segments) |segment| {
@@ -434,17 +459,22 @@ pub fn query(selectors: []const Selector, root: *Node, frame: *Frame) !?*Node.El
     defer nth.deinit();
 
     for (selectors) |selector| {
-        // Fast path: single compound with only an ID selector
+        // Fast path: single compound with only an ID selector. With
+        // duplicate ids, the general walk below finds the first one under root.
         if (selector.segments.len == 0 and selector.first.parts.len == 1) {
             const first = selector.first.parts[0];
             if (first == .id) {
-                const el = frame.getElementByIdFromNode(root, first.id) orelse continue;
-                // Check if the element is within the root subtree
-                const node = el.asNode();
-                if (node != root and root.contains(node)) {
-                    return el;
+                switch (Frame.getUniqueElementByIdFromNode(root, first.id)) {
+                    .none => continue,
+                    .one => |el| {
+                        const node = el.asNode();
+                        if (node != root and root.contains(node)) {
+                            return el;
+                        }
+                        continue;
+                    },
+                    .many => {},
                 }
-                continue;
             }
         }
 

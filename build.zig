@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const Translator = @import("translate_c").Translator;
 
 const lightpanda_version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable;
 const min_zig_version = std.SemanticVersion.parse(@import("build.zig.zon").minimum_zig_version) catch unreachable;
@@ -49,18 +50,18 @@ pub fn build(b: *Build) !void {
     const prebuilt_v8_path_option = b.option([]const u8, "prebuilt_v8_path", "Path to a prebuilt libc_v8.a or libc_v8.so");
 
     const dev_fast = b.option(bool, "dev_fast", "Linux debug builds: shared V8 + self-hosted backend. Implies -Dshared_v8, -Duse_llvm=false and a bundled-CRT target") orelse
-        (builtin.os.tag == .linux and builtin.cpu.arch == .x86_64 and
-            optimize == .Debug and requested_target.query.isNative() and
+        (builtin.target.os.tag == .linux and builtin.target.cpu.arch == .x86_64 and
+            optimize == .debug and requested_target.query.isNative() and
             !enable_tsan and !enable_asan and
             (prebuilt_v8_path_option == null or std.mem.endsWith(u8, prebuilt_v8_path_option.?, ".so")));
 
     if (dev_fast) {
-        if (builtin.os.tag != .linux) {
-            std.debug.print("-Ddev_fast is Linux-only (host is {s})\n", .{@tagName(builtin.os.tag)});
+        if (builtin.target.os.tag != .linux) {
+            std.debug.print("-Ddev_fast is Linux-only (host is {s})\n", .{@tagName(builtin.target.os.tag)});
             return error.DevFastUnsupportedHost;
         }
-        if (optimize != .Debug) {
-            std.debug.print("-Ddev_fast is Debug-only (optimize is {s})\n", .{@tagName(optimize)});
+        if (optimize != .debug) {
+            std.debug.print("-Ddev_fast is debug-only (optimize is {s})\n", .{@tagName(optimize)});
             return error.DevFastRequiresDebug;
         }
         if (!requested_target.query.isNative()) {
@@ -80,10 +81,10 @@ pub fn build(b: *Build) !void {
     // Dependencies never follow -Doptimize, and they build for the requested
     // target rather than the dev_fast bundled-CRT query, so debug and release
     // builds share one set of dependency objects in the cache.
-    const debug_deps = b.option(bool, "debug_deps", "Build the C and Rust dependencies in Debug instead of ReleaseFast") orelse false;
+    const debug_deps = b.option(bool, "debug_deps", "Build the C and Rust dependencies in debug instead of fast") orelse false;
     const deps: Deps = .{
         .target = requested_target,
-        .optimize = if (debug_deps) .Debug else .ReleaseFast,
+        .optimize = if (debug_deps) .debug else .fast,
     };
 
     // Without an explicit -Dprebuilt_v8_path, pick up whatever `make
@@ -123,7 +124,7 @@ pub fn build(b: *Build) !void {
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt = b.addFmt(.{
-        .paths = &.{ "src", "build.zig", "build.zig.zon" },
+        .paths = b.pathList(&.{ "src", "build.zig", "build.zig.zon" }),
         .check = true,
     });
     fmt_step.dependOn(&fmt.step);
@@ -172,9 +173,7 @@ pub fn build(b: *Build) !void {
         b.installArtifact(exe);
 
         const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
         const run_step = b.step("run", "Run the app");
         run_step.dependOn(&run_cmd.step);
 
@@ -190,27 +189,13 @@ pub fn build(b: *Build) !void {
         extras_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
         const run_cmd = b.addRunArtifact(exe);
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        run_cmd.addPassthruArgs();
         const run_step = b.step("snapshot_creator", "Generate a v8 snapshot");
         run_step.dependOn(&run_cmd.step);
     }
 
-    {
-        // skills generator
-        const exe = addExe(b, exe_config, "lightpanda-skills", "skills_check", "src/main_skills.zig");
-
-        const run_cmd = b.addRunArtifact(exe);
-        const out_dir = run_cmd.addOutputDirectoryArg("skills");
-        const install = b.addInstallDirectory(.{
-            .source_dir = out_dir,
-            .install_dir = .prefix,
-            .install_subdir = "skills",
-        });
-        const skills_step = b.step("skills", "Generate LLM skill docs (zig-out/skills/<name>/SKILL.md)");
-        skills_step.dependOn(&install.step);
-    }
+    addGenerator(b, exe_config, "skills", "Generate LLM skill docs (zig-out/skills/<name>/SKILL.md)");
+    addGenerator(b, exe_config, "docs", "Generate reference partials for the docs site (zig-out/docs/*.mdx)");
 
     {
         // test
@@ -223,23 +208,60 @@ pub fn build(b: *Build) !void {
         const test_step = b.step("test", "Run unit tests");
         test_step.dependOn(&run_tests.step);
     }
+
+    {
+        // kcov can't read line info from the self-hosted backend's DWARF.
+        const cov_tests = b.addTest(.{
+            .root_module = lightpanda_module,
+            .use_llvm = true,
+            .test_runner = .{ .path = b.path("src/test_runner.zig"), .mode = .simple },
+        });
+        const kcov = b.addSystemCommand(&.{ "kcov", "--clean" });
+        // Otherwise stdio is checked and the runner's stderr summary fails the step.
+        kcov.has_side_effects = true;
+        kcov.addPrefixedDirectoryArg("--include-path=", b.path("src"));
+        const report = kcov.addOutputDirectoryArg("coverage");
+        kcov.addArtifactArg(cov_tests);
+        // Shards are separate processes, each with its own report.
+        kcov.setEnvironmentVariable("TEST_JOBS", "1");
+        // Part of the cache key, so each filter gets a fresh report directory.
+        kcov.setEnvironmentVariable("TEST_FILTER", b.graph.environ_map.get("TEST_FILTER") orelse "");
+
+        const install = b.addInstallDirectory(.{ .source_dir = report, .install_dir = .prefix, .install_subdir = "coverage" });
+        const coverage_step = b.step("coverage", "Run unit tests under kcov (zig-out/coverage/index.html)");
+        coverage_step.dependOn(&install.step);
+    }
 }
 
 const Deps = struct {
     target: Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 };
 
 const ExeConfig = struct {
     check: *Build.Step,
     lightpanda_module: *Build.Module,
     target: Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     use_llvm: bool,
     orderfile: ?[]const u8,
     sanitize_c: ?std.zig.SanitizeC,
     sanitize_thread: bool,
 };
+
+/// A `zig build <name>` step that runs `src/main_<name>.zig` with an output
+/// directory and installs what it writes to `zig-out/<name>`.
+fn addGenerator(b: *Build, config: ExeConfig, comptime name: []const u8, description: []const u8) void {
+    const exe = addExe(b, config, "lightpanda-" ++ name, name ++ "_check", "src/main_" ++ name ++ ".zig");
+    const run_cmd = b.addRunArtifact(exe);
+    const out_dir = run_cmd.addOutputDirectoryArg2(name, .{});
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_dir,
+        .install_dir = .prefix,
+        .install_subdir = name,
+    });
+    b.step(name, description).dependOn(&install.step);
+}
 
 fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8, root_source_file: []const u8) *Build.Step.Compile {
     const exe = b.addExecutable(.{
@@ -260,7 +282,7 @@ fn addExe(b: *Build, config: ExeConfig, name: []const u8, check_name: []const u8
     if (config.orderfile) |path| {
         // Per-function/per-datum sections exist only so the orderfile script
         // can place individual hot functions; the self-hosted backend used by
-        // Debug builds does not support them on the C libraries, so they are
+        // debug builds does not support them on the C libraries, so they are
         // gated on the orderfile being set (release/LLVM only).
         exe.link_function_sections = true;
         exe.link_data_sections = true;
@@ -287,9 +309,11 @@ fn devFastGlibcVersion(b: *Build) std.SemanticVersion {
 /// it cannot drift from CI (the Makefile reads the same source of truth).
 fn findPrebuiltV8(b: *Build, target: Build.ResolvedTarget, dev_fast: bool) ?[]const u8 {
     const io = b.graph.io;
+    const action_path = ".github/actions/install/action.yml";
+    b.dependOnFileContents(b.path(action_path));
     const action = std.Io.Dir.cwd().readFileAlloc(
         io,
-        b.pathFromRoot(".github/actions/install/action.yml"),
+        rootPath(b, action_path),
         b.allocator,
         .limited(64 * 1024),
     ) catch return null;
@@ -299,7 +323,7 @@ fn findPrebuiltV8(b: *Build, target: Build.ResolvedTarget, dev_fast: bool) ?[]co
         return null;
     }
 
-    const cache_dir = b.pathFromRoot(".lp-cache");
+    const cache_dir = ".lp-cache";
     // The .so must keep the name the exe's DT_NEEDED records; the archive
     // name encodes V8 version, os and arch.
     const path = if (dev_fast)
@@ -312,12 +336,19 @@ fn findPrebuiltV8(b: *Build, target: Build.ResolvedTarget, dev_fast: bool) ?[]co
             @tagName(target.result.cpu.arch),
         }) });
     };
-    std.Io.Dir.cwd().access(io, path, .{}) catch {
+    std.Io.Dir.cwd().access(io, rootPath(b, path), .{}) catch {
+        // Zig can't track a missing file as a configure dependency; the
+        // source-build path poisons the configure cache instead.
         std.debug.print("No prebuilt V8 at {s}; using the V8 source-build path. `make download-v8` fetches the prebuilt.\n", .{path});
         return null;
     };
+    b.dependOnFileMetadata(b.path(path));
     std.debug.print("Using prebuilt V8: {s}\n", .{path});
     return path;
+}
+
+fn rootPath(b: *Build, sub_path: []const u8) []const u8 {
+    return b.root.joinString(b.allocator, sub_path) catch @panic("OOM");
 }
 
 /// Returns the quoted `default:` value of a top-level `key` in the install
@@ -351,18 +382,18 @@ fn markHotSections(b: *Build, archive: Build.LazyPath) Build.LazyPath {
         .root_module = b.createModule(.{
             .root_source_file = b.path("orderfile/mark_hot_sections.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const run = b.addRunArtifact(tool);
     run.addFileArg(archive);
     run.addFileArg(b.path("orderfile/v8.txt"));
-    return run.addOutputFileArg("libc_v8.a");
+    return run.addOutputFileArg2("libc_v8.a", .{});
 }
 
 /// Per-function/per-datum sections let the -Dorderfile linker script place
 /// individual hot functions. Only enabled for orderfile (release/LLVM) builds:
-/// the self-hosted backend used by Debug builds fails to link the C libraries
+/// the self-hosted backend used by debug builds fails to link the C libraries
 /// with them.
 fn sectionize(lib: *Build.Step.Compile, enabled: bool) *Build.Step.Compile {
     if (enabled) {
@@ -389,7 +420,7 @@ fn linkV8(
         .is_tsan = is_tsan,
         .inspector_subtype = false,
         .v8_enable_sandbox = is_tsan,
-        .cache_root = b.pathFromRoot(".lp-cache"),
+        .cache_root = rootPath(b, ".lp-cache"),
         .prebuilt_v8_path = prebuilt_v8_path,
         .shared_v8 = shared_v8,
     });
@@ -398,7 +429,7 @@ fn linkV8(
 
 fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
     // Cargo's "dev" profile writes to target/debug.
-    const profile, const out_subdir = if (deps.optimize == .Debug) .{ "dev", "debug" } else .{ "release", "release" };
+    const profile, const out_subdir = if (deps.optimize == .debug) .{ "dev", "debug" } else .{ "release", "release" };
 
     // One cargo workspace, one staticlib (src/rust/Cargo.toml explains why).
     const exec_cargo = b.addSystemCommand(&.{
@@ -417,7 +448,7 @@ fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
     _ = exec_cargo.captureStdErr(.{});
 
     // TODO: We can prefer `--artifact-dir` once it become stable.
-    const out_dir = exec_cargo.addPrefixedOutputDirectoryArg("--target-dir=", "rust");
+    const out_dir = exec_cargo.addOutputDirectoryArg2("rust", .{ .prefix = "--target-dir=" });
 
     const rust_step = b.step("rust", "Build the Rust staticlib (requires cargo)");
     rust_step.dependOn(&exec_cargo.step);
@@ -430,14 +461,18 @@ fn linkRust(b: *Build, mod: *Build.Module, deps: Deps) void {
 /// input of `run`, skipping the `skip_dir` subtree at any depth.
 fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []const u8) !void {
     const io = b.graph.io;
-    var dir = try b.build_root.handle.openDir(io, root, .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, rootPath(b, root), .{ .iterate = true });
     defer dir.close(io);
 
+    b.dependOnDirectoryContents(b.path(root));
     var walker = try dir.walk(b.allocator);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
         switch (entry.kind) {
-            .directory => if (std.mem.eql(u8, entry.basename, skip_dir)) walker.leave(io),
+            .directory => if (std.mem.eql(u8, entry.basename, skip_dir))
+                walker.leave(io)
+            else
+                b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ root, entry.path }))),
             .file => run.addFileInput(b.path(b.pathJoin(&.{ root, entry.path }))),
             else => {},
         }
@@ -445,14 +480,12 @@ fn addDirInputs(b: *Build, run: *Build.Step.Run, root: []const u8, skip_dir: []c
 }
 
 fn linkSqlite(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
-    const dep = b.dependency("sqlite3", .{
-        .target = deps.target,
-        .optimize = deps.optimize,
-    });
+    const dep = b.dependency("sqlite3", .{});
 
-    const lib = sectionize(dep.artifact("sqlite3"), section);
-    lib.root_module.sanitize_c = enable_csan;
-    lib.root_module.sanitize_thread = is_tsan;
+    const lib_mod = cLibModule(b, deps.target, deps.optimize, is_tsan);
+    lib_mod.sanitize_c = enable_csan;
+    lib_mod.addCSourceFile(.{ .file = dep.path("sqlite3.c") });
+    const lib = sectionize(b.addLibrary(.{ .name = "sqlite3", .root_module = lib_mod }), section);
 
     const macros = [_]struct { []const u8, []const u8 }{
         .{ "SQLITE_DEFAULT_FILE_PERMISSIONS", "0600" },
@@ -494,12 +527,7 @@ fn linkSqlite(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.S
 
     mod.linkLibrary(lib);
 
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = lib.getEmittedIncludeTree().path(b, "sqlite3.h"),
-        .target = mod.resolved_target.?,
-        .optimize = mod.optimize.?,
-    });
-    mod.addImport("sqlite3", translate_c.createModule());
+    mod.addImport("sqlite3", translateC(b, mod, dep.path("sqlite3.h")).mod);
 }
 
 fn linkPcre2(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.SanitizeC, is_tsan: bool, section: bool) void {
@@ -514,13 +542,9 @@ fn linkPcre2(b: *Build, mod: *Build.Module, deps: Deps, enable_csan: ?std.zig.Sa
     lib.root_module.sanitize_thread = is_tsan;
     mod.linkLibrary(lib);
 
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = lib.getEmittedIncludeTree().path(b, "pcre2.h"),
-        .target = mod.resolved_target.?,
-        .optimize = mod.optimize.?,
-    });
-    translate_c.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
-    mod.addImport("pcre2", translate_c.createModule());
+    const translator = translateC(b, mod, lib.getEmittedIncludeTree().path(b, "pcre2.h"));
+    translator.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
+    mod.addImport("pcre2", translator.mod);
 }
 
 fn linkCurl(
@@ -534,13 +558,9 @@ fn linkCurl(
 
     mod.addObjectFile(.{ .cwd_relative = curl_impersonate_archive });
 
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ curl_impersonate_include, "curl/curl.h" }) },
-        .target = target,
-        .optimize = mod.optimize.?,
-    });
-    translate_c.addIncludePath(.{ .cwd_relative = curl_impersonate_include });
-    mod.addImport("curl", translate_c.createModule());
+    const translator = translateC(b, mod, .{ .cwd_relative = b.pathJoin(&.{ curl_impersonate_include, "curl/curl.h" }) });
+    translator.addIncludePath(.{ .cwd_relative = curl_impersonate_include });
+    mod.addImport("curl", translator.mod);
 
     switch (target.result.os.tag) {
         .macos => {
@@ -575,12 +595,17 @@ fn linkIsocline(b: *Build, mod: *Build.Module) void {
         .file = dep.path("src/isocline.c"),
     });
 
-    const translate_c = b.addTranslateC(.{
-        .root_source_file = dep.path("include/isocline.h"),
+    mod.addImport("isocline", translateC(b, mod, dep.path("include/isocline.h")).mod);
+}
+
+fn translateC(b: *Build, mod: *Build.Module, header: Build.LazyPath) Translator {
+    return .init(b.dependency("translate_c", .{}), .{
+        .c_source_file = header,
         .target = mod.resolved_target.?,
         .optimize = mod.optimize.?,
+        // Zig 0.16's built-in translate-c defaulted to this.
+        .default_init = true,
     });
-    mod.addImport("isocline", translate_c.createModule());
 }
 
 /// Resolves the semantic version of the build.
@@ -590,7 +615,7 @@ fn linkIsocline(b: *Build, mod: *Build.Module) void {
 /// - If the flag contains a full semantic version (e.g., `1.2.3`), it replaces
 ///   the base version entirely.
 /// - If the flag contains a simple string (e.g., `nightly`), it replaces only
-///   the pre-release tag of the base version (e.g., `1.0.0-dev` -> `1.0.0-nightly`).
+///   the pre-release tag of the base version (e.g., `1.1.0-dev` -> `1.1.0-nightly`).
 ///
 /// Explicit full semantic versions are returned unchanged. For implicit or
 /// shorthand versions with a pre-release tag and no build metadata, append
@@ -626,10 +651,14 @@ fn resolveVersion(b: *std.Build) std.SemanticVersion {
 }
 
 fn runGit(b: *std.Build, args: []const []const u8) ![]const u8 {
-    var code: u8 = undefined;
+    // HEAD moves without touching any file the cache could track cheaply.
+    b.graph.poisonCache();
     const command = try std.mem.concat(b.allocator, []const u8, &.{
-        &.{ "git", "-C", b.pathFromRoot(".") },
+        &.{ "git", "-C", rootPath(b, ".") },
         args,
     });
-    return b.runAllowFail(command, &code, .ignore);
+    return switch (b.runFallible(command, .{ .stderr_behavior = .ignore })) {
+        .success => |stdout| stdout,
+        else => error.GitFailed,
+    };
 }

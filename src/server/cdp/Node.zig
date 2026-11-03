@@ -22,8 +22,9 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
-const Frame = @import("../../browser/Frame.zig");
+const id = @import("id.zig");
 const DOMNode = @import("../../browser/webapi/Node.zig");
+const IFrame = @import("../../browser/webapi/element/html/IFrame.zig");
 const NodeRegistry = @import("../../NodeRegistry.zig");
 
 const log = lp.log;
@@ -67,12 +68,12 @@ pub const Search = struct {
         }
 
         pub fn create(self: *List, nodes: []const *DOMNode) !Search {
-            const id = self.search_id;
-            defer self.search_id = id +% 1;
+            const search_id = self.search_id;
+            defer self.search_id = search_id +% 1;
 
             const arena = self.arena.allocator();
 
-            const name = switch (id) {
+            const name = switch (search_id) {
                 0 => "0",
                 1 => "1",
                 2 => "2",
@@ -83,7 +84,7 @@ pub const Search = struct {
                 7 => "7",
                 8 => "8",
                 9 => "9",
-                else => try std.fmt.allocPrint(arena, "{d}", .{id}),
+                else => try arena.print("{d}", .{search_id}),
             };
 
             var registry = self.registry;
@@ -217,6 +218,25 @@ pub const Writer = struct {
 
             try w.objectField("localName");
             try w.write(element.getLocalName());
+
+            // Chrome names the hosted frame on frame-owner elements and the own
+            // frame on the document element; that's how clients pair an <iframe>
+            // with its Page.frameAttached id.
+            if (element.is(IFrame)) |iframe| {
+                if (iframe.getContentDocument()) |document| {
+                    if (document._frame) |child| {
+                        try w.objectField("frameId");
+                        try w.write(&id.toFrameId(child._frame_id));
+                    }
+                }
+            } else if (dom_node._parent) |dom_parent| {
+                if (dom_parent._type == .document) {
+                    if (dom_parent.subtype(DOMNode.Document)._frame) |frame| {
+                        try w.objectField("frameId");
+                        try w.write(&id.toFrameId(frame._frame_id));
+                    }
+                }
+            }
         } else {
             try w.objectField("localName");
             try w.write("");
@@ -226,8 +246,9 @@ pub const Writer = struct {
         try w.write(dom_node.getNodeType());
 
         try w.objectField("nodeName");
-        var name_buf: [Frame.BUF_SIZE]u8 = undefined;
-        try w.write(dom_node.getNodeName(&name_buf));
+        var name_buf: [1024]u8 = undefined;
+        var name_fba = std.heap.FixedBufferAllocator.init(&name_buf);
+        try w.write(dom_node.getNodeName(name_fba.allocator()));
 
         try w.objectField("nodeValue");
         if (dom_node.getNodeValue()) |nv| {

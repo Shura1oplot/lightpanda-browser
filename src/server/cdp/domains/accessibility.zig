@@ -52,10 +52,11 @@ fn disable(cmd: *CDP.Command) !void {
 }
 
 fn getFullAXTree(cmd: *CDP.Command) !void {
-    const params = (try cmd.params(struct {
+    const Params = struct {
         depth: ?i32 = null,
         frameId: ?[]const u8 = null,
-    })) orelse return error.InvalidParams;
+    };
+    const params: Params = (try cmd.params(Params)) orelse .{};
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
     const session = bc.session;
@@ -75,7 +76,9 @@ fn getFullAXTree(cmd: *CDP.Command) !void {
     const temp_arena = try frame.getArena(.medium, "AXNode");
     defer temp_arena.release();
 
-    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(temp_arena, node, .{}) }, .{});
+    return cmd.sendResult(.{ .nodes = try bc.axnodeWriter(temp_arena, node, .{
+        .depth = params.depth orelse 0,
+    }) }, .{});
 }
 
 fn queryAXTree(cmd: *CDP.Command) !void {
@@ -86,10 +89,10 @@ fn queryAXTree(cmd: *CDP.Command) !void {
         accessibleName: ?[]const u8 = null,
         role: ?[]const u8 = null,
     };
-    const params = (try cmd.params(Params)) orelse return error.InvalidParams;
+    const params: Params = (try cmd.params(Params)) orelse .{};
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try dom.getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try dom.getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const temp_arena = try frame.getArena(.medium, "AXNode");
@@ -104,7 +107,7 @@ fn queryAXTree(cmd: *CDP.Command) !void {
 }
 
 fn getPartialAXTree(cmd: *CDP.Command) !void {
-    const params = (try cmd.params(struct {
+    const Params = struct {
         nodeId: ?u32 = null,
         backendNodeId: ?u32 = null,
         objectId: ?[]const u8 = null,
@@ -112,19 +115,20 @@ fn getPartialAXTree(cmd: *CDP.Command) !void {
         // not yet emitted; this returns the subtree rooted at the resolved
         // node, matching the scope of queryAXTree.
         fetchRelatives: ?bool = null,
-    })) orelse return error.InvalidParams;
+    };
+    const params: Params = (try cmd.params(Params)) orelse .{};
 
     if (params.fetchRelatives orelse true) {
         // orelse true, because that's what Chrome defaults too, and if people
         // aren't setting it, then they're expecting true.
-        log.warn(.not_implemented, "getPartialAXTree", .{
+        log.debug(.not_implemented, "getPartialAXTree", .{
             .cdp_cmd = "Accessibility.getPartialAXTree",
             .param = "fetchRelatives",
         });
     }
 
     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
-    const node = try dom.getNode(cmd.arena, bc, params.nodeId, params.backendNodeId, params.objectId);
+    const node = try dom.getNode(cmd.arena, bc, cmd.input.session_id, params.nodeId, params.backendNodeId, params.objectId);
 
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
     const temp_arena = try frame.getArena(.medium, "AXNode");
@@ -193,4 +197,43 @@ test "cdp.accessibility: getPartialAXTree with unknown nodeId returns error" {
         .params = .{ .nodeId = 99999, .fetchRelatives = false },
     });
     try ctx.expectSentError(-31998, "NodeNotFound", .{ .id = 1 });
+}
+
+test "cdp.accessibility: getPartialAXTree rejects a frameless node" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-A", .url = "cdp/ax_tree.html" });
+
+    try ctx.processMessage(.{ .id = 1, .method = "Runtime.evaluate", .params = .{
+        .expression = "new DOMParser().parseFromString('<button>b</button>', 'text/html').body",
+    } });
+    const object_id = try evaluatedObjectId(&ctx, 1);
+
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Accessibility.getPartialAXTree",
+        .params = .{ .objectId = object_id, .fetchRelatives = false },
+    });
+    try ctx.expectSentError(-31998, "InvalidNodeId", .{ .id = 2 });
+}
+
+// The result.result.objectId of the Runtime.evaluate response to `msg_id`.
+fn evaluatedObjectId(ctx: *testing.TestContext, msg_id: i64) ![]const u8 {
+    var i: usize = 0;
+    while (try ctx.getSentMessage(i)) |msg| : (i += 1) {
+        const obj = switch (msg) {
+            .object => |o| o,
+            else => continue,
+        };
+        const id_value = obj.get("id") orelse continue;
+        if (id_value != .integer or id_value.integer != msg_id) {
+            continue;
+        }
+        const result = obj.get("result") orelse return error.NoResult;
+        const remote = result.object.get("result") orelse return error.NoRemoteObject;
+        const object_id = remote.object.get("objectId") orelse return error.NoObjectId;
+        return object_id.string;
+    }
+    return error.MessageNotFound;
 }

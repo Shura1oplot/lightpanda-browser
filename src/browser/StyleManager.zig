@@ -20,11 +20,13 @@ const std = @import("std");
 const lp = @import("lightpanda");
 
 const Frame = @import("Frame.zig");
+const Viewport = @import("Viewport.zig");
 
 const units = @import("css/units.zig");
 const CssParser = @import("css/Parser.zig");
 const MediaQuery = @import("css/MediaQuery.zig");
 const Element = @import("webapi/Element.zig");
+const popover = @import("webapi/element/popover.zig");
 
 const Selector = @import("webapi/selector/Selector.zig");
 const SelectorParser = @import("webapi/selector/Parser.zig");
@@ -39,27 +41,26 @@ const log = lp.log;
 const String = lp.String;
 const Allocator = std.mem.Allocator;
 
-// Tracks visibility-relevant CSS rules from <style> elements.
+// Tracks the CSS properties the renderless layout acts on (display, visibility,
+// opacity, pointer-events, overflow, width, height) and text-transform, which
+// innerText applies, from author stylesheets.
 // Rules are bucketed by their rightmost selector part for fast lookup.
 const StyleManager = @This();
 
 const Tag = Element.Tag;
 const Input = Element.Html.Input;
-const RuleList = std.MultiArrayList(VisibilityRule);
 
 frame: *Frame,
 
 arena: *lp.Arena,
 
-// Bucketed rules for fast lookup - keyed by rightmost selector part
-id_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
-class_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
-tag_rules: std.AutoHashMapUnmanaged(Tag, RuleList) = .empty,
-other_rules: RuleList = .empty, // universal, attribute, pseudo-class endings
+visibility: Group(Visibility) = .{},
+geometry: Group(Geometry) = .{},
+touch_action: Group(TouchAction) = .{},
+text: Group(Text) = .{},
+flow: Group(Flow) = .{},
 
-// Own-element results, valid while Page.style_version == memo_version.
-memo: Memo = .empty,
-memo_version: usize = 0,
+widths: WidthMemo = .{},
 
 // Keyed by property name, pruning to what is (hopefully) one or few rules
 custom_rules: std.StringHashMapUnmanaged(CustomProperty) = .empty,
@@ -97,6 +98,16 @@ pub fn init(frame: *Frame) !StyleManager {
 
 pub fn deinit(self: *StyleManager) void {
     self.arena.release();
+}
+
+// StyleManager methods should always be invoked on the StyleManager of the
+// Frame associated with an Element's document.
+fn assertOwns(self: *const StyleManager, el_: ?*const Element) void {
+    if (comptime lp.IS_DEBUG == false) {
+        return;
+    }
+    const el = el_ orelse return;
+    std.debug.assert(el.ownerFrame(self.frame) == self.frame);
 }
 
 /// Hard cap on `@media` / `@layer` nesting depth. CSS allows arbitrarily-deep
@@ -187,7 +198,7 @@ fn applyLayerAtRule(self: *StyleManager, build_arena: Allocator, text: []const u
         // invalidates the whole statement. Validate everything before
         // registering anything.
         var names = text["@layer".len..];
-        if (std.mem.indexOfScalar(u8, names, ';')) |semi| {
+        if (std.mem.findScalar(u8, names, ';')) |semi| {
             names = names[0..semi];
         }
 
@@ -261,7 +272,7 @@ fn atRuleBlock(text: []const u8, keyword: []const u8) ?struct { prelude: []const
 
     // Search only past the opening brace — the matching `}` lives there, and
     // any returned position is naturally `> open` (since `rest[open] == '{'`).
-    const close = open + (std.mem.lastIndexOfScalar(u8, rest[open..], '}') orelse return null);
+    const close = open + (std.mem.findScalarLast(u8, rest[open..], '}') orelse return null);
     return .{ .prelude = rest[0..open], .body = rest[open + 1 .. close] };
 }
 
@@ -271,7 +282,7 @@ fn indexOfOpenBraceSkippingComments(s: []const u8) ?usize {
     var i: usize = 0;
     while (i < s.len) {
         if (i + 1 < s.len and s[i] == '/' and s[i + 1] == '*') {
-            const close = std.mem.indexOf(u8, s[i + 2 ..], "*/") orelse return null;
+            const close = std.mem.find(u8, s[i + 2 ..], "*/") orelse return null;
             i = i + 2 + close + 2;
             continue;
         }
@@ -308,7 +319,7 @@ fn registerLayerPath(self: *StyleManager, build_arena: Allocator, parent: u16, d
 fn internAnonymousLayer(self: *StyleManager, build_arena: Allocator, parent: u16) Allocator.Error!u16 {
     const id = self.next_anon_layer;
     // \x00{d} isn't a valid layer name, so this can't conflict
-    const name = try std.fmt.allocPrint(build_arena, "\x00{d}", .{id});
+    const name = try build_arena.print("\x00{d}", .{id});
     self.next_anon_layer = id + 1;
     return self.internLayer(build_arena, parent, name);
 }
@@ -317,7 +328,7 @@ fn internLayer(self: *StyleManager, build_arena: Allocator, parent: u16, name: [
     const path = if (parent == NO_LAYER)
         try build_arena.dupe(u8, name)
     else
-        try std.fmt.allocPrint(build_arena, "{s}.{s}", .{ self.layers.items[parent].path, name });
+        try build_arena.print("{s}.{s}", .{ self.layers.items[parent].path, name });
 
     const gop = try self.layer_ids.getOrPut(build_arena, path);
     if (gop.found_existing) {
@@ -362,14 +373,14 @@ fn isValidLayerComponent(component: []const u8) bool {
     return true;
 }
 
-/// Compute every layer's rank and apply it to every VisibilityRule we have.
+/// Compute every layer's rank and apply it to every group Rule we have.
 /// We can only do this now that we've parsed every parsed every sheet since
 /// @layer statement can change the ordering/
 fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Error!void {
     const layers = self.layers.items;
 
     if (layers.len == 0) {
-        // No layers. Every VisibilityRule already has the correct layerless
+        // No layers. Every group Rule already has the correct layerless
         // priority, and with no layers, there's nothing to adjust.
         return;
     }
@@ -430,21 +441,8 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
         }
     }
 
-    self.stampRuleList(&self.other_rules);
-
-    var id_it = self.id_rules.valueIterator();
-    while (id_it.next()) |rules| {
-        self.stampRuleList(rules);
-    }
-
-    var class_it = self.class_rules.valueIterator();
-    while (class_it.next()) |rules| {
-        self.stampRuleList(rules);
-    }
-
-    var tag_it = self.tag_rules.valueIterator();
-    while (tag_it.next()) |rules| {
-        self.stampRuleList(rules);
+    inline for (group_fields) |field| {
+        @field(self, field).stampRules(self);
     }
 
     // Custom rules parse their selectors lazily, but the layer ranks are only
@@ -457,22 +455,20 @@ fn finalizeLayerRanks(self: *StyleManager, build_arena: Allocator) Allocator.Err
     }
 }
 
-fn stampRuleList(self: *StyleManager, rules: *RuleList) void {
-    for (rules.items(.priority)) |*priority| {
-        priority.* |= self.layerRank(priority.*) << RANK_SHIFT;
-    }
-}
-
 /// The rank finalizeLayerRanks still has to stamp for a packed priority, via
-/// its doc_order: 0 for an unlayered rule, which packed UNLAYERED_RANK at
-/// creation.
+/// its doc_order: 0 for an unlayered rule, which packed its rank at creation.
 fn layerRank(self: *const StyleManager, priority: u64) u64 {
     const doc_order: u32 = @as(u22, @truncate(priority));
     const layer = self.rule_layers.items[doc_order - 1];
     if (layer == NO_LAYER) {
         return 0;
     }
-    return self.layers.items[layer].rank;
+    const rank = self.layers.items[layer].rank;
+    // Important declarations cascade their layers in reverse
+    if (priority & IMPORTANT_BIT != 0) {
+        return UNLAYERED_RANK - rank;
+    }
+    return rank;
 }
 
 fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []const u8, block_text: []const u8, layer: u16) !void {
@@ -480,22 +476,23 @@ fn addRawRule(self: *StyleManager, build_arena: Allocator, selector_text: []cons
         return;
     }
     var customs: CustomSink = .{ .allocator = build_arena };
-    const props = try foldDeclarations(block_text, &customs);
-    _ = try self.addSelectorRules(selector_text, props, customs.map.values(), layer);
+    const folded = try foldDeclarations(Declarations, CssParser.parseStyleBlock(block_text), &customs);
+    _ = try self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs.map.values(), layer);
 }
 
-// Visibility rules get one VisibilityRule per selector (not per selector list)
+// Tracked rules get one group Rule per selector (not per selector list)
 // so each has correct specificity, bucketed by their rightmost selector part.
 // Custom properties are keyed by name instead, and lazily parse the selector.
 // Returns whether the rule set any tracked property.
 fn addSelectorRules(
     self: *StyleManager,
     selector_text: []const u8,
-    props: VisibilityProperties,
+    props: Declarations,
+    important: Declarations,
     customs: []const CustomDeclaration,
     layer: u16,
 ) !bool {
-    const relevant = props.isRelevant();
+    const relevant = props.isRelevant() or important.isRelevant();
     if (relevant == false and customs.len == 0) {
         return false;
     }
@@ -523,20 +520,31 @@ fn addSelectorRules(
     if (relevant) {
         const selectors = SelectorParser.parseList(arena, selector_text) catch &.{};
         for (selectors) |selector| {
-            try self.addVisibilityRule(selector, props, layer);
+            try self.addTrackedRule(selector, props, important, layer);
         }
     }
     return self.next_doc_order != before;
 }
 
-fn addVisibilityRule(self: *StyleManager, selector: Selector.Selector, props: VisibilityProperties, layer: u16) !void {
+// One priority per selector, shared by every group it lands in: doc_order
+// indexes rule_layers. The !important declarations become a second rule in
+// the tier above every normal one, where an unlayered rule packs rank 0.
+fn addTrackedRule(self: *StyleManager, selector: Selector.Selector, props: Declarations, important: Declarations, layer: u16) !void {
     const key = getBucketKey(selector.rightmost()) orelse return;
-    const priority = try self.nextPriority(layer);
-    try self.bucket(key, .{
-        .props = props,
-        .selector = selector,
-        .priority = priority | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT),
-    });
+    const rank_and_order = try self.nextPriority(layer);
+    const priority = rank_and_order | (@as(u64, computeSpecificity(selector)) << SPEC_SHIFT);
+    const important_priority = IMPORTANT_BIT | (priority & ~RANK_MASK);
+    inline for (group_fields) |field| {
+        inline for (.{ @field(props, field), @field(important, field) }, .{ priority, important_priority }) |declared, p| {
+            if (declaresAny(declared)) {
+                try @field(self, field).bucket(self.arena.allocator(), key, .{
+                    .props = declared,
+                    .selector = selector,
+                    .priority = p,
+                });
+            }
+        }
+    }
 }
 
 /// Rank and document-order bits of the next rule. A rule outside any layer
@@ -548,17 +556,6 @@ fn nextPriority(self: *StyleManager, layer: u16) !u64 {
     const priority = (rank << RANK_SHIFT) | @min(self.next_doc_order, MAX_DOC_ORDER);
     self.next_doc_order += 1;
     return priority;
-}
-
-fn bucket(self: *StyleManager, key: BucketKey, rule: VisibilityRule) !void {
-    const allocator = self.arena.allocator();
-    const list: *RuleList = switch (key) {
-        .id => |id| (try self.id_rules.getOrPutValue(allocator, id, .empty)).value_ptr,
-        .class => |class| (try self.class_rules.getOrPutValue(allocator, class, .empty)).value_ptr,
-        .tag => |tag| (try self.tag_rules.getOrPutValue(allocator, tag, .empty)).value_ptr,
-        .other => &self.other_rules,
-    };
-    try list.append(allocator, rule);
 }
 
 fn isCustomProperty(name: []const u8) bool {
@@ -595,33 +592,22 @@ fn rebuildIfDirty(self: *StyleManager) !void {
 
     self.dirty = false;
     errdefer self.dirty = true;
-    const id_rules_count = self.id_rules.count();
-    const class_rules_count = self.class_rules.count();
-    const tag_rules_count = self.tag_rules.count();
-    const other_rules_count = self.other_rules.len;
-    const memo_count = self.memo.count();
+    var caps: [group_fields.len]Capacities = undefined;
+    inline for (group_fields, &caps) |field, *c| {
+        c.* = @field(self, field).capacities();
+    }
     const custom_rules_count = self.custom_rules.count();
 
     self.arena.resetRetain();
-
-    self.memo = .empty;
-    try self.memo.ensureTotalCapacity(self.arena.allocator(), memo_count);
+    self.widths = .{};
 
     self.next_doc_order = 1;
     self.rule_layers = .empty;
     self.last_rule_sheet = null;
 
-    self.id_rules = .empty;
-    try self.id_rules.ensureTotalCapacity(self.arena.allocator(), id_rules_count);
-
-    self.class_rules = .empty;
-    try self.class_rules.ensureTotalCapacity(self.arena.allocator(), class_rules_count);
-
-    self.tag_rules = .empty;
-    try self.tag_rules.ensureTotalCapacity(self.arena.allocator(), tag_rules_count);
-
-    self.other_rules = .{};
-    try self.other_rules.ensureTotalCapacity(self.arena.allocator(), other_rules_count);
+    inline for (group_fields, caps) |field, c| {
+        try @field(self, field).reset(self.arena.allocator(), c);
+    }
 
     self.custom_rules = .empty;
     try self.custom_rules.ensureTotalCapacity(self.arena.allocator(), custom_rules_count);
@@ -641,51 +627,36 @@ fn rebuildIfDirty(self: *StyleManager) !void {
     try self.finalizeLayerRanks(build_arena.allocator());
 }
 
-/// Own-element cascade result, resolved for every property at once so one
-/// entry serves any probe.
-const Props = packed struct(u8) {
-    // Author value (inline or sheet). Without `author_display` it's the UA
-    // fallback: .none when matchesUaDisplayNoneRule, else .other.
-    display: Display = .other,
-    author_display: bool = false,
-    visibility_hidden: bool = false,
-    opacity_zero: bool = false,
-    pointer_events_none: bool = false,
-    _unused: u2 = 0,
-
-    fn probe(self: Props, comptime what: Probe, options: CheckVisibilityOptions) bool {
-        return switch (what) {
-            .hidden => self.display == .none or
-                (options.check_visibility and self.visibility_hidden) or
-                (options.check_opacity and self.opacity_zero),
-            .visibility => self.visibility_hidden,
-            .pointer_events => self.pointer_events_none,
-        };
-    }
-};
-
-const Probe = enum { hidden, visibility, pointer_events };
-
-const Memo = std.AutoHashMapUnmanaged(*Element, Props);
-
 pub fn isHidden(self: *StyleManager, el: *Element, options: CheckVisibilityOptions) bool {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return false;
-    if (!options.ancestors) {
-        return self.ownProps(el).probe(.hidden, options);
-    }
-    return self.anyInChain(el, .hidden, options);
+    return self.visibilityProps(el).isHidden(options);
 }
 
-/// Computed display:none for a single element (own property, no ancestor walk).
+pub const Rendering = enum { visible, invisible, none };
+
+/// `.none` hides `el` and its subtree (display:none, here or above).
+/// `.invisible` hides `el` alone: visibility:hidden inherits, but a
+/// descendant can set it back to visible.
+pub fn rendering(self: *StyleManager, el: *Element) Rendering {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .visible;
+    const props = self.visibilityProps(el);
+    if (props.isHidden(.{})) return .none;
+    return if (props.visibility_hidden) .invisible else .visible;
+}
+
+/// The element's own display:none. Use `isHidden` to see if it's hidden by an ancestor
 /// Honors the UA stylesheet rules per HTML Rendering §15.3.1 "Hidden elements".
 pub fn hasDisplayNone(self: *StyleManager, el: *Element) bool {
     return self.display(el) == .none;
 }
 
-/// Own property, no ancestor walk; honors the UA hidden-element rules.
+/// Own property, not inherited; honors the UA hidden-element rules.
 pub fn display(self: *StyleManager, el: *Element) Display {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return .other;
-    return self.ownProps(el).display;
+    return self.visibilityProps(el).display;
 }
 
 /// Computed display:none coming only from inline style or an author stylesheet
@@ -693,152 +664,539 @@ pub fn display(self: *StyleManager, el: *Element) Display {
 /// are NOT counted, so document scaffolding is preserved. Used by the HTML
 /// dump's "invisible" strip mode.
 pub fn hasAuthorDisplayNone(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return false;
-    const p = self.ownProps(el);
+    const p = self.visibilityProps(el);
     return p.author_display and p.display == .none;
 }
 
-/// Computed visibility:hidden for an element, considering only the `visibility`
-/// chain (walks ancestors since `visibility` inherits by default). Ignores
+/// Computed visibility:hidden, which inherits from the ancestors. Ignores
 /// display:none: an ancestor with display:none means the element isn't
 /// rendered, but its computed `visibility` still reflects inherited visibility.
 pub fn hasVisibilityHiddenInherited(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return false;
-    return self.anyInChain(el, .visibility, .{});
+    return self.visibilityProps(el).visibility_hidden;
 }
 
 pub fn hasPointerEventsNone(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return false;
-    return self.anyInChain(el, .pointer_events, .{});
+    return self.visibilityProps(el).pointer_events_none;
 }
 
-fn anyInChain(self: *StyleManager, el: *Element, comptime what: Probe, options: CheckVisibilityOptions) bool {
+/// Blink's VisibleToHitTestRequest. Ignores display:none, which callers handle
+/// for the whole subtree.
+pub fn isHitTestable(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return true;
+    const p = self.visibilityProps(el);
+    return !p.visibility_hidden and !p.pointer_events_none;
+}
+
+/// Computed text-transform, which inherits: the nearest of `el` and its
+/// ancestors with its own value, else none.
+pub fn textTransform(self: *StyleManager, el: *Element) TextTransform {
+    self.assertOwns(el);
     var current: ?*Element = el;
     while (current) |elem| : (current = elem.parentElement()) {
-        if (self.ownProps(elem).probe(what, options)) {
-            return true;
+        const own = self.ownTextTransform(elem);
+        if (own != .inherit) {
+            return own;
         }
     }
-    return false;
+    return .none;
 }
 
-/// The memoized own-element result. Callers must have run rebuildIfDirty,
-/// which resets the memo.
-fn ownProps(self: *StyleManager, el: *Element) Props {
-    const version = self.frame.page.style_version;
-    if (self.memo_version != version) {
-        self.memo.clearRetainingCapacity();
-        self.memo_version = version;
+/// `el`'s own cascaded text-transform; `.inherit` when it takes its parent's.
+/// For tree walks that already know the parent's value.
+pub fn ownTextTransform(self: *StyleManager, el: *Element) TextTransform {
+    self.rebuildIfDirty() catch return .inherit;
+    // Most pages declare no text-transform: skip the cascade and the memo.
+    if (!self.text.hasRules() and !el._flags.has_inline_style) {
+        return .inherit;
     }
-
-    const gop = self.memo.getOrPut(self.arena.allocator(), el) catch |err| {
-        log.warn(.browser, "StyleManager memo", .{ .err = err });
-        return self.compute(el);
-    };
-    if (gop.found_existing) {
-        return gop.value_ptr.*;
-    }
-    gop.value_ptr.* = self.compute(el);
-    return gop.value_ptr.*;
+    return self.text.ownProps(self.arena.allocator(), el, self.frame).text_transform;
 }
 
-const property_fields = std.meta.fieldNames(VisibilityProperties);
+/// The axes along which `el` is a scroll container: its own computed overflow
+/// on that axis is auto, scroll or overlay. No ancestor walk.
+pub fn overflowAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
+    self.rebuildIfDirty() catch return .{};
+    const p = self.geometryProps(el);
+    return .{ .x = p.overflow_x_scrolls, .y = p.overflow_y_scrolls };
+}
 
-// INLINE_PRIORITY can't be beaten, so allInline ends the rule scan early.
-const Priorities = struct {
-    display: u64 = 0,
-    visibility_hidden: u64 = 0,
-    opacity_zero: u64 = 0,
-    pointer_events_none: u64 = 0,
+/// The axes along which `el` keeps a scroll from chaining out of it: its own
+/// computed overscroll-behavior on that axis is contain or none. No ancestor
+/// walk.
+pub fn overscrollContainAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
+    self.rebuildIfDirty() catch return .{};
+    const p = self.geometryProps(el);
+    return .{ .x = p.overscroll_x_contains, .y = p.overscroll_y_contains };
+}
 
-    fn allInline(self: Priorities) bool {
-        inline for (property_fields) |field| {
-            if (@field(self, field) != INLINE_PRIORITY) {
-                return false;
-            }
-        }
-        return true;
-    }
+/// The axes along which the effective touch-action of `el`, its own
+/// intersected with its ancestors', forbids a touch from panning.
+pub fn touchPanBlockedAxes(self: *StyleManager, el: *Element) Element.ScrollAxes {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .{};
+    const p = self.touch_action.inheritedProps(self.arena.allocator(), el, self.frame);
+    return .{ .x = p.pan_x_blocked, .y = p.pan_y_blocked };
+}
+
+/// Own computed width or height in px, from inline style or a sheet rule.
+/// Null when undeclared or when it needs layout to resolve.
+pub fn declaredSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return null;
+    const length = @field(self.geometryProps(el), @tagName(axis));
+    return length.resolve(self.frame.page.getViewport());
+}
+
+/// Like declaredSize, but only the inline style counts.
+pub fn inlineSize(self: *StyleManager, el: *Element, comptime axis: Element.Axis) ?f64 {
+    self.assertOwns(el);
+    const length = @field(inlineDeclared(Geometry.Declared, el, self.frame).props(.any), @tagName(axis)) orelse return null;
+    return length.resolve(self.frame.page.getViewport());
+}
+
+pub const WidthSizing = union(enum) {
+    fixed: f64, // A resolved length
+    percent: f64, // A fraction of the containing block
+    fill, // The containing block's width
+    grow, // A flex item that grows
+    shrink, // Shrink-to-fit its content
+    contents, // display: contents  generates no box
 };
 
-fn compute(self: *StyleManager, el: *Element) Props {
-    const frame = self.frame;
-    var p: Props = .{};
-    var priorities: Priorities = .{};
+pub fn widthSizing(self: *StyleManager, el: *Element) WidthSizing {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .shrink;
 
-    const inline_props = inlineProps(el, frame);
-    inline for (property_fields) |field| {
-        if (@field(inline_props, field)) |value| {
-            @field(p, field) = value;
-            @field(priorities, field) = INLINE_PRIORITY;
-        }
+    const vis = self.visibilityProps(el);
+    if (vis.box == .contents) {
+        return .contents;
     }
 
-    if (!priorities.allInline()) {
-        if (el.getId()) |id| {
-            if (self.id_rules.get(id)) |rules| {
-                checkRules(&rules, &p, &priorities, el, frame);
-            }
-        }
-
-        if (el.getClassName()) |class_attr| {
-            var it = std.mem.tokenizeAny(u8, class_attr, &std.ascii.whitespace);
-            while (it.next()) |class| {
-                if (self.class_rules.get(class)) |rules| {
-                    checkRules(&rules, &p, &priorities, el, frame);
-                }
-            }
-        }
-
-        if (self.tag_rules.get(el.getTag())) |rules| {
-            checkRules(&rules, &p, &priorities, el, frame);
-        }
-
-        checkRules(&self.other_rules, &p, &priorities, el, frame);
+    const width = self.geometryProps(el).width;
+    switch (width.unit) {
+        .px, .vw, .vh => return .{ .fixed = width.resolve(self.frame.page.getViewport()).? },
+        .percent => return .{ .percent = @as(f64, width.value) / 100.0 },
+        .content => return .shrink,
+        .auto => {},
     }
-
-    // UA stylesheet display:none fallback (HTML Rendering §15.3.1 "Hidden
-    // elements"). Applied only when no author rule for `display` matched the
-    // element — per CSS Cascade §6.1 any normal-origin author rule beats UA
-    // origin regardless of specificity, so `.x { display: flex }` on a
-    // `<div class="x" hidden>` must report visible.
-    p.author_display = priorities.display != 0;
-    if (!p.author_display and matchesUaDisplayNoneRule(el)) {
-        p.display = .none;
+    if (vis.box != .block_level or el.getTag().isReplacedOrControl()) {
+        return .shrink;
     }
-
-    return p;
+    const flow = self.flow.ownProps(self.arena.allocator(), el, self.frame);
+    if (flow.absolutely_positioned or flow.floated) {
+        return .shrink;
+    }
+    const parent = self.boxParent(el) orelse return .fill;
+    const parent_vis = self.visibilityProps(parent);
+    if (parent_vis.display != .flex or parent_vis.flex_column) {
+        // Block, grid and column-flex containers stretch their children
+        return .fill;
+    }
+    return if (self.geometryProps(el).flex_grow) .grow else .shrink;
 }
 
-fn checkRules(rules: *const RuleList, p: *Props, priorities: *Priorities, el: *Element, frame: *Frame) void {
-    for (rules.items(.priority), rules.items(.props), rules.items(.selector)) |priority, rule, selector| {
-        // Only rules that set a property nothing stronger has set yet are
-        // worth matching.
-        var relevant = false;
-        inline for (property_fields) |field| {
-            if (@field(rule, field) != null and priority > @field(priorities, field)) {
-                relevant = true;
+/// The nearest ancestor that generates a box
+pub fn boxParent(self: *StyleManager, el: *Element) ?*Element {
+    var parent = el.asNode().flatTreeParentElement(self.frame);
+    while (parent) |p| : (parent = p.asNode().flatTreeParentElement(self.frame)) {
+        if (self.visibilityProps(p).box != .contents) {
+            return p;
+        }
+    }
+    return null;
+}
+
+/// The children lay out side by side: a flex row or a grid. Elsewhere block
+/// children stack and only inline-level ones share a line.
+pub fn laysOutInRow(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    const vis = self.visibilityProps(el);
+    return vis.display == .grid or (vis.display == .flex and vis.flex_column == false);
+}
+
+pub fn isBlockLevel(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    switch (self.visibilityProps(el).box) {
+        .block_level, .table => {},
+        .inline_level, .contents => return false,
+    }
+    const flow = self.flow.ownProps(self.arena.allocator(), el, self.frame);
+    return flow.absolutely_positioned == false and flow.floated == false;
+}
+
+/// Overflow along x is clipped or scrolled within the box, so it doesn't
+/// widen the ancestors' scrollable area.
+pub fn clipsOverflowX(self: *StyleManager, el: *Element) bool {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return false;
+    return self.geometryProps(el).overflow_x_clips;
+}
+
+pub const WidthLimit = union(enum) {
+    px: f64,
+    percent: f64, // A fraction of the containing block
+};
+
+/// min-width and max-width. Null where they don't limit: auto, none, the
+/// intrinsic keywords, and values that need layout (em, calc).
+pub fn widthLimits(self: *StyleManager, el: *Element) struct { min: ?WidthLimit, max: ?WidthLimit } {
+    self.assertOwns(el);
+    self.rebuildIfDirty() catch return .{ .min = null, .max = null };
+    const geometry = self.geometryProps(el);
+    return .{ .min = self.widthLimit(geometry.min_width), .max = self.widthLimit(geometry.max_width) };
+}
+
+fn widthLimit(self: *StyleManager, length: Length) ?WidthLimit {
+    return switch (length.unit) {
+        .auto, .content => null,
+        .percent => .{ .percent = @as(f64, length.value) / 100.0 },
+        .px, .vw, .vh => .{ .px = length.resolve(self.frame.page.getViewport()).? },
+    };
+}
+
+pub const WidthKind = enum { box, content };
+
+/// Element's computed widths (see Element.boxWidth), valid for one style
+/// version and viewport. Each read otherwise walks up to the root and down
+/// the subtree.
+const WidthMemo = struct {
+    version: usize = 0,
+    viewport_width: u32 = 0,
+    viewport_height: u32 = 0,
+    map: std.AutoHashMapUnmanaged(*Element, Entry) = .empty,
+
+    const Entry = struct {
+        box: ?f64 = null,
+        content: ?f64 = null,
+    };
+};
+
+pub fn cachedWidth(self: *StyleManager, el: *Element, comptime kind: WidthKind) ?f64 {
+    const memo = self.freshWidthMemo() orelse return null;
+    const entry = memo.map.get(el) orelse return null;
+    return @field(entry, @tagName(kind));
+}
+
+pub fn cacheWidth(self: *StyleManager, el: *Element, comptime kind: WidthKind, width: f64) void {
+    const memo = self.freshWidthMemo() orelse return;
+    const gop = memo.map.getOrPut(self.arena.allocator(), el) catch |err| {
+        log.warn(.browser, "StyleManager width memo", .{ .err = err });
+        return;
+    };
+    if (gop.found_existing == false) {
+        gop.value_ptr.* = .{};
+    }
+    @field(gop.value_ptr, @tagName(kind)) = width;
+}
+
+// Rebuilding resets the arena the memo lives in, so it runs first.
+fn freshWidthMemo(self: *StyleManager) ?*WidthMemo {
+    self.rebuildIfDirty() catch return null;
+    const memo = &self.widths;
+    const version = self.frame.page.style_version;
+    const viewport = self.frame.page.getViewport();
+    if (memo.version != version or memo.viewport_width != viewport.width or memo.viewport_height != viewport.height) {
+        memo.map.clearRetainingCapacity();
+        memo.version = version;
+        memo.viewport_width = viewport.width;
+        memo.viewport_height = viewport.height;
+    }
+    return memo;
+}
+
+/// Callers must have run rebuildIfDirty, which resets the memo.
+fn visibilityProps(self: *StyleManager, el: *Element) Visibility.Computed {
+    return self.visibility.inheritedProps(self.arena.allocator(), el, self.frame);
+}
+
+/// Callers must have run rebuildIfDirty, which resets the memo.
+fn geometryProps(self: *StyleManager, el: *Element) Geometry.Computed {
+    return self.geometry.ownProps(self.arena.allocator(), el, self.frame);
+}
+
+/// Taken before the arena resets, to presize the new containers.
+const Capacities = struct {
+    id_rules: u32,
+    class_rules: u32,
+    tag_rules: u32,
+    other_rules: usize,
+    memo: u32,
+};
+
+/// One property group's rules and memo. A rule joins only the groups it
+/// declares something in.
+fn Group(comptime Spec: type) type {
+    return struct {
+        const Self = @This();
+        const Declared = Spec.Declared;
+        // What we store in our memo
+        const Computed = Spec.Computed;
+        // The element's own value, only used while resolving, never stored
+        const Cascaded = if (@hasDecl(Spec, "Cascaded")) Spec.Cascaded else Computed;
+        const Field = std.meta.FieldEnum(Declared);
+        const fields = @typeInfo(Declared).@"struct".field_names;
+
+        comptime {
+            // compute copies each declared value into its Cascaded namesake
+            for (fields) |field| {
+                std.debug.assert(@FieldType(Cascaded, field) == @typeInfo(@FieldType(Declared, field)).optional.child);
             }
         }
-        if (!relevant or !matchesSelector(el, selector, frame)) {
-            continue;
+
+        const Rule = struct {
+            selector: Selector.Selector, // Single selector, not a list
+            props: Declared,
+
+            // Packed priority: important:1 | layer_rank:11 | specificity:30 |
+            // doc_order:22. A layered rule's rank bits stay 0 until
+            // finalizeLayerRanks knows every layer and stamps them from
+            // rule_layers[doc_order - 1].
+            priority: u64,
+        };
+
+        const RuleList = std.MultiArrayList(Rule);
+
+        // Bucketed rules for fast lookup - keyed by rightmost selector part
+        id_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
+        class_rules: std.StringHashMapUnmanaged(RuleList) = .empty,
+        tag_rules: std.AutoHashMapUnmanaged(Tag, RuleList) = .empty,
+        other_rules: RuleList = .empty, // universal, attribute, pseudo-class endings
+
+        // Whether any bucketed rule is !important, so importantRuleWins can
+        // skip the cascade on the many pages without one.
+        has_important: bool = false,
+
+        // Valid while Page.style_version == memo_version.
+        memo: std.AutoHashMapUnmanaged(*Element, Computed) = .empty,
+        memo_version: usize = 0,
+
+        // inheritedProps' scratch, kept so each walk doesn't reallocate
+        path: std.ArrayList(struct { el: *Element, own: Cascaded }) = .empty,
+
+        fn hasRules(self: *const Self) bool {
+            return self.id_rules.count() != 0 or self.class_rules.count() != 0 or
+                self.tag_rules.count() != 0 or self.other_rules.len != 0;
         }
 
-        inline for (property_fields) |field| {
-            if (@field(rule, field)) |value| {
-                if (priority > @field(priorities, field)) {
-                    @field(p, field) = value;
-                    @field(priorities, field) = priority;
+        fn capacities(self: *const Self) Capacities {
+            return .{
+                .id_rules = self.id_rules.count(),
+                .class_rules = self.class_rules.count(),
+                .tag_rules = self.tag_rules.count(),
+                .other_rules = self.other_rules.len,
+                .memo = self.memo.count(),
+            };
+        }
+
+        fn reset(self: *Self, allocator: Allocator, caps: Capacities) !void {
+            self.memo = .empty;
+            self.path = .empty;
+            try self.memo.ensureTotalCapacity(allocator, caps.memo);
+
+            self.id_rules = .empty;
+            try self.id_rules.ensureTotalCapacity(allocator, caps.id_rules);
+
+            self.class_rules = .empty;
+            try self.class_rules.ensureTotalCapacity(allocator, caps.class_rules);
+
+            self.tag_rules = .empty;
+            try self.tag_rules.ensureTotalCapacity(allocator, caps.tag_rules);
+
+            self.other_rules = .{};
+            self.has_important = false;
+            try self.other_rules.ensureTotalCapacity(allocator, caps.other_rules);
+        }
+
+        fn bucket(self: *Self, allocator: Allocator, key: BucketKey, rule: Rule) !void {
+            const list: *RuleList = switch (key) {
+                .id => |id| (try self.id_rules.getOrPutValue(allocator, id, .empty)).value_ptr,
+                .class => |class| (try self.class_rules.getOrPutValue(allocator, class, .empty)).value_ptr,
+                .tag => |tag| (try self.tag_rules.getOrPutValue(allocator, tag, .empty)).value_ptr,
+                .other => &self.other_rules,
+            };
+            try list.append(allocator, rule);
+            if (rule.priority & IMPORTANT_BIT != 0) {
+                self.has_important = true;
+            }
+        }
+
+        fn stampRules(self: *Self, sm: *const StyleManager) void {
+            stampRuleList(sm, &self.other_rules);
+            inline for (.{ &self.id_rules, &self.class_rules, &self.tag_rules }) |map| {
+                var it = map.valueIterator();
+                while (it.next()) |rules| {
+                    stampRuleList(sm, rules);
                 }
             }
         }
-    }
+
+        fn stampRuleList(sm: *const StyleManager, rules: *RuleList) void {
+            for (rules.items(.priority)) |*priority| {
+                priority.* |= sm.layerRank(priority.*) << RANK_SHIFT;
+            }
+        }
+
+        fn ownProps(self: *Self, allocator: Allocator, el: *Element, frame: *Frame) Computed {
+            comptime std.debug.assert(Cascaded == Computed);
+            const gop = self.freshMemo(frame).getOrPut(allocator, el) catch |err| {
+                log.warn(.browser, "StyleManager memo", .{ .err = err });
+                return self.compute(el, frame);
+            };
+            if (gop.found_existing == false) {
+                gop.value_ptr.* = self.compute(el, frame);
+            }
+            return gop.value_ptr.*;
+        }
+
+        /// Resolves the path up to the first memoized ancestor, so each
+        /// element is cascaded once per memo version however deep the tree.
+        fn inheritedProps(self: *Self, allocator: Allocator, el: *Element, frame: *Frame) Computed {
+            const memo = self.freshMemo(frame);
+            self.path.clearRetainingCapacity();
+            var above: Computed = .{};
+            var current: ?*Element = el;
+            while (current) |elem| : (current = elem.asNode().flatTreeParentElement(frame)) {
+                if (memo.get(elem)) |cached| {
+                    above = cached;
+                    break;
+                }
+                self.path.append(allocator, .{ .el = elem, .own = self.compute(elem, frame) }) catch |err| {
+                    log.warn(.browser, "StyleManager path", .{ .err = err });
+                    // Degrades to the element's own values, without its ancestors
+                    return .resolve(self.compute(el, frame), .{});
+                };
+            }
+
+            var it = std.mem.reverseIterator(self.path.items);
+            while (it.next()) |step| {
+                above = .resolve(step.own, above);
+                memo.put(allocator, step.el, above) catch |err| {
+                    log.warn(.browser, "StyleManager memo", .{ .err = err });
+                };
+            }
+            return above;
+        }
+
+        fn freshMemo(self: *Self, frame: *Frame) *std.AutoHashMapUnmanaged(*Element, Computed) {
+            const version = frame.page.style_version;
+            if (self.memo_version != version) {
+                self.memo.clearRetainingCapacity();
+                self.memo_version = version;
+            }
+            return &self.memo;
+        }
+
+        fn compute(self: *const Self, el: *Element, frame: *Frame) Cascaded {
+            var p: Cascaded = .{};
+            var priorities: Priorities(Declared) = .initFill(0);
+
+            const inline_style = inlineDeclared(Declared, el, frame);
+            inline for (.{ .normal, .important }, .{ INLINE_PRIORITY, INLINE_IMPORTANT_PRIORITY }) |importance, priority| {
+                const inline_declared = inline_style.props(importance);
+                inline for (fields) |field| {
+                    if (@field(inline_declared, field)) |value| {
+                        @field(p, field) = value;
+                        priorities.set(@field(Field, field), priority);
+                    }
+                }
+            }
+
+            self.applyRules(&p, &priorities, el, frame);
+
+            if (@hasDecl(Spec, "finish")) {
+                Spec.finish(&p, el, frame, &priorities);
+            }
+            return p;
+        }
+
+        // Whether an !important rule beats a normal inline declaration of the
+        // properties `declared` sets: the cascade seeded with just that
+        // declaration, every other property out of reach.
+        fn importantRuleWins(self: *const Self, declared: Declared, el: *Element, frame: *Frame) bool {
+            if (self.has_important == false or declaresAny(declared) == false) {
+                return false;
+            }
+            var p: Cascaded = .{};
+            var priorities: Priorities(Declared) = .initFill(INLINE_IMPORTANT_PRIORITY);
+            inline for (fields) |field| {
+                if (@field(declared, field) != null) {
+                    priorities.set(@field(Field, field), INLINE_PRIORITY);
+                }
+            }
+
+            self.applyRules(&p, &priorities, el, frame);
+
+            inline for (fields) |field| {
+                if (@field(declared, field) != null and priorities.get(@field(Field, field)) != INLINE_PRIORITY) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        fn applyRules(self: *const Self, p: *Cascaded, priorities: *Priorities(Declared), el: *Element, frame: *Frame) void {
+            if (el.getId()) |id| {
+                if (self.id_rules.get(id)) |rules| {
+                    checkRules(&rules, p, priorities, el, frame);
+                }
+            }
+
+            if (el.getClassName()) |class_attr| {
+                var it = std.mem.tokenizeAny(u8, class_attr, &std.ascii.whitespace);
+                while (it.next()) |class| {
+                    if (self.class_rules.get(class)) |rules| {
+                        checkRules(&rules, p, priorities, el, frame);
+                    }
+                }
+            }
+
+            if (self.tag_rules.get(el.getTag())) |rules| {
+                checkRules(&rules, p, priorities, el, frame);
+            }
+
+            checkRules(&self.other_rules, p, priorities, el, frame);
+        }
+
+        fn checkRules(rules: *const RuleList, p: *Cascaded, priorities: *Priorities(Declared), el: *Element, frame: *Frame) void {
+            for (rules.items(.priority), rules.items(.props), rules.items(.selector)) |priority, rule, selector| {
+                // Only rules that set a property nothing stronger has set yet are
+                // worth matching.
+                var relevant = false;
+                inline for (fields) |field| {
+                    if (@field(rule, field) != null and priority > priorities.get(@field(Field, field))) {
+                        relevant = true;
+                    }
+                }
+                if (!relevant or !matchesSelector(el, selector, frame)) {
+                    continue;
+                }
+
+                inline for (fields) |field| {
+                    if (@field(rule, field)) |value| {
+                        if (priority > priorities.get(@field(Field, field))) {
+                            @field(p, field) = value;
+                            priorities.set(@field(Field, field), priority);
+                        }
+                    }
+                }
+            }
+        }
+    };
 }
 
 /// Centralizes UA-stylesheet display:none truth so `getComputedStyle().display`
 /// (via `hasDisplayNone`) and `el.checkVisibility()` (via `isHidden`) agree.
 /// Spec: HTML Rendering §15.3.1 "Hidden elements".
-fn matchesUaDisplayNoneRule(el: *Element) bool {
+fn matchesUaDisplayNoneRule(el: *Element, frame: *Frame) bool {
     // Tag check first: O(1) switch, exits for the ~95% of elements with
     // ordinary tags before we touch the attribute list.
     const tag = el.getTag();
@@ -854,8 +1212,14 @@ fn matchesUaDisplayNoneRule(el: *Element) bool {
         }
     }
 
-    // dialog:not([open]) { display: none }
-    if (tag == .dialog and !el.hasAttributeSafe(comptime .wrap("open"))) return true;
+    if (tag == .dialog) {
+        // dialog:not([open]) { display: none }
+        // dialog:popover-open { display: block }
+        if (!el.hasAttributeSafe(comptime .wrap("open")) and !popover.isOpen(el, frame)) return true;
+    } else if (el.hasAttributeInterned("popover") and !popover.isOpen(el, frame)) {
+        // [popover]:not(:popover-open):not(dialog[open]) { display: none }
+        return true;
+    }
 
     // details:not([open]) > *:not(summary) { display: none }
     if (tag != .summary) {
@@ -877,7 +1241,7 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
         return false;
     }
     const style = style_rule._style orelse return false;
-    const props = extractVisibilityProperties(style);
+    const folded = extractDeclared(Declarations, style);
     const customs = try self.extractCustomDeclarations(style);
 
     // A custom rule holds selector_text until the property is looked up, but it
@@ -885,7 +1249,7 @@ fn addRule(self: *StyleManager, style_rule: *CSSStyleRule) !bool {
     // frame arena and never frees the old one. Worst case we match a stale
     // selector, which is what the rest of this file already does when a rule is
     // mutated without going through sheetModified().
-    return self.addSelectorRules(selector_text, props, customs, NO_LAYER);
+    return self.addSelectorRules(selector_text, folded.props(.normal), folded.props(.important), customs, NO_LAYER);
 }
 
 /// A style rule appended at or after the sheet that emitted the last rule is
@@ -914,7 +1278,7 @@ pub fn ruleInserted(self: *StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) 
 
 fn appendable(self: *const StyleManager, sheet: *CSSStyleSheet, rule: *CSSRule) bool {
     const rules = sheet._css_rules orelse return false;
-    if (rules._rules.getLastOrNull() != rule) {
+    if (rules._rules.last() != rule) {
         return false;
     }
     const sheets = self.frame.document._style_sheets orelse return false;
@@ -997,6 +1361,7 @@ fn getBucketKey(compound: Selector.Compound) ?BucketKey {
                     else => {},
                 }
             },
+            .pseudo_element => return null,
             .universal, .attribute => {},
         }
     }
@@ -1004,19 +1369,16 @@ fn getBucketKey(compound: Selector.Compound) ?BucketKey {
     return best_key;
 }
 
-// The declaration names behind VisibilityProperties, in field order.
-const property_names = [_][]const u8{ "display", "visibility", "opacity", "pointer-events" };
-
-/// Extracts visibility-relevant properties from a style declaration.
-fn extractVisibilityProperties(style: *CSSStyleProperties) VisibilityProperties {
-    var props: VisibilityProperties = .{};
-    const decl = style.asCSSStyleDeclaration();
-    for (property_names) |name| {
-        if (decl.findProperty(.wrap(name))) |property| {
-            props.apply(name, property._value.str());
-        }
+/// Extracts the tracked properties from a style declaration. The object holds
+/// one entry per name in first-declared order, so folding it in order gives a
+/// shorthand and its longhands the same precedence as the source text.
+fn extractDeclared(comptime Declared: type, style: *CSSStyleProperties) Slots(Declared) {
+    var slots: Slots(Declared) = .{};
+    var it = style.asCSSStyleDeclaration().iterator();
+    while (it.next()) |property| {
+        slots.apply(property._name.str(), property._value.str(), property._important);
     }
-    return props;
+    return slots;
 }
 
 // Computes CSS specificity for a selector.
@@ -1044,7 +1406,7 @@ fn countCompoundSpecificity(compound: Selector.Compound, ids: *u32, classes: *u3
         switch (part) {
             .id => ids.* += 1,
             .class => classes.* += 1,
-            .tag, .tag_name => elements.* += 1,
+            .tag, .tag_name, .pseudo_element => elements.* += 1,
             .universal => {}, // zero specificity
             .attribute => classes.* += 1,
             .pseudo_class => |pc| {
@@ -1061,6 +1423,17 @@ fn countCompoundSpecificity(compound: Selector.Compound, ids: *u32, classes: *u3
                         // Unpack and add to our counts
                         ids.* += (max_nested >> 20) & 0x3FF;
                         classes.* += (max_nested >> 10) & 0x3FF;
+                        elements.* += max_nested & 0x3FF;
+                    },
+                    // :nth-child(An+B of S) is a pseudo-class plus its most specific argument
+                    .nth_child_of, .nth_last_child_of => |nth_of| {
+                        var max_nested: u32 = 0;
+                        for (nth_of.selectors) |nested_sel| {
+                            const spec = computeSpecificity(nested_sel);
+                            if (spec > max_nested) max_nested = spec;
+                        }
+                        ids.* += (max_nested >> 20) & 0x3FF;
+                        classes.* += 1 + ((max_nested >> 10) & 0x3FF);
                         elements.* += max_nested & 0x3FF;
                     },
                     // All other pseudo-classes count as class-level specificity
@@ -1091,27 +1464,461 @@ pub const Display = enum(u2) {
     }
 };
 
-const VisibilityProperties = struct {
-    display: ?Display = null,
-    visibility_hidden: ?bool = null,
-    opacity_zero: ?bool = null,
-    pointer_events_none: ?bool = null,
+const Box = enum(u2) {
+    block_level,
+    inline_level,
+    contents,
+    table,
 
-    fn apply(self: *VisibilityProperties, name: []const u8, value: []const u8) void {
-        if (std.ascii.eqlIgnoreCase(name, "display")) {
-            self.display = Display.parse(value);
-        } else if (std.ascii.eqlIgnoreCase(name, "visibility")) {
-            self.visibility_hidden = std.ascii.eqlIgnoreCase(value, "hidden") or std.ascii.eqlIgnoreCase(value, "collapse");
-        } else if (std.ascii.eqlIgnoreCase(name, "opacity")) {
-            self.opacity_zero = std.ascii.eqlIgnoreCase(value, "0");
-        } else if (std.ascii.eqlIgnoreCase(name, "pointer-events")) {
-            self.pointer_events_none = std.ascii.eqlIgnoreCase(value, "none");
+    fn parse(value: []const u8) ?Box {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (std.ascii.eqlIgnoreCase(trimmed, "contents")) {
+            return .contents;
+        }
+
+        if (std.ascii.eqlIgnoreCase(trimmed, "table")) {
+            return .table;
+        }
+
+        if (std.ascii.startsWithIgnoreCase(trimmed, "inline")) {
+            return .inline_level;
+        }
+
+        inline for (.{ "block", "flow-root", "list-item", "flex", "grid", "flow" }) |keyword| {
+            if (std.ascii.eqlIgnoreCase(trimmed, keyword)) {
+                return .block_level;
+            }
+        }
+
+        // Multi-keyword values start with the outer type
+        if (std.ascii.startsWithIgnoreCase(trimmed, "block ")) {
+            return .block_level;
+        }
+        return null;
+    }
+
+    fn uaDefault(tag: Tag) Box {
+        return switch (tag) {
+            .table => .table,
+            .form, .li, .dd, .dt, .details, .summary, .menu, .dir, .hgroup, .legend, .html, .body, .optgroup, .option => .block_level,
+            else => if (tag.isBlock()) .block_level else .inline_level,
+        };
+    }
+};
+
+/// The case-changing part of `text-transform`. innerText applies `uppercase`
+/// and `lowercase`; `capitalize` is a computed value only, and `full-width`,
+/// `full-size-kana` and `math-auto` are accepted but not applied. `.inherit` is both the
+/// `inherit`/`unset` keywords and "nothing declared": text-transform inherits.
+pub const TextTransform = enum(u3) {
+    inherit,
+    none,
+    capitalize,
+    uppercase,
+    lowercase,
+
+    // Null for an invalid value, which drops the declaration.
+    fn parse(value: []const u8) ?TextTransform {
+        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
+        if (std.ascii.eqlIgnoreCase(trimmed, "inherit") or std.ascii.eqlIgnoreCase(trimmed, "unset") or std.ascii.eqlIgnoreCase(trimmed, "revert") or std.ascii.eqlIgnoreCase(trimmed, "revert-layer")) {
+            return .inherit;
+        }
+        if (std.ascii.eqlIgnoreCase(trimmed, "initial") or std.ascii.eqlIgnoreCase(trimmed, "none")) {
+            return .none;
+        }
+
+        // At most one case keyword, alongside any of the non-case ones.
+        var result: ?TextTransform = null;
+        var any = false;
+        var it = std.mem.tokenizeAny(u8, trimmed, &std.ascii.whitespace);
+        while (it.next()) |token| {
+            any = true;
+            const case: TextTransform = if (std.ascii.eqlIgnoreCase(token, "uppercase"))
+                .uppercase
+            else if (std.ascii.eqlIgnoreCase(token, "lowercase"))
+                .lowercase
+            else if (std.ascii.eqlIgnoreCase(token, "capitalize"))
+                .capitalize
+            else if (std.ascii.eqlIgnoreCase(token, "full-width") or std.ascii.eqlIgnoreCase(token, "full-size-kana") or std.ascii.eqlIgnoreCase(token, "math-auto"))
+                continue
+            else
+                return null;
+            if (result != null) {
+                return null;
+            }
+            result = case;
+        }
+        if (any == false) {
+            return null;
+        }
+        return result orelse .none;
+    }
+
+    /// The computed-value keyword, as getComputedStyle reports it.
+    pub fn keyword(self: TextTransform) []const u8 {
+        return switch (self) {
+            .inherit, .none => "none",
+            else => @tagName(self),
+        };
+    }
+};
+
+/// A declared width or height. Values that need layout (auto, em, calc) are
+/// `auto`: they win the cascade but give no size. The intrinsic sizes, which
+/// follow the content, are `content`. A `percent` resolves against the
+/// containing block, which only the width axis knows.
+pub const Length = packed struct(u35) {
+    value: f32 = 0,
+    unit: Unit = .auto,
+
+    const Unit = enum(u3) { auto, content, px, vw, vh, percent };
+
+    fn parse(text: []const u8) Length {
+        if (isIntrinsic(text)) {
+            return .{ .unit = .content };
+        }
+        const parsed = units.parse(text) catch return .{};
+        if (parsed.value < 0) {
+            return .{};
+        }
+        return switch (parsed.unit) {
+            inline .vw, .vh => |unit| .{ .value = @floatCast(parsed.value), .unit = @field(Unit, @tagName(unit)) },
+            .percentage => .{ .value = @floatCast(parsed.value), .unit = .percent },
+            else => .{
+                .value = @floatCast(parsed.value * (units.absoluteLengthFactor(parsed.unit) orelse return .{})),
+                .unit = .px,
+            },
+        };
+    }
+
+    fn isIntrinsic(text: []const u8) bool {
+        inline for (.{ "min-content", "max-content", "fit-content" }) |keyword| {
+            if (std.ascii.eqlIgnoreCase(text, keyword)) {
+                return true;
+            }
+        }
+        return std.ascii.startsWithIgnoreCase(text, "fit-content(");
+    }
+
+    fn resolve(self: Length, viewport: Viewport) ?f64 {
+        const value: f64 = self.value;
+        return switch (self.unit) {
+            .auto, .content, .percent => null,
+            .px => value,
+            .vw, .vh => value * @as(f64, @floatFromInt(if (self.unit == .vw) viewport.width else viewport.height)) / 100.0,
+        };
+    }
+};
+
+/// Whether an element is rendered and takes pointer input.
+const Visibility = struct {
+    const Declared = struct {
+        const names = [_][]const u8{ "display", "visibility", "opacity", "pointer-events", "flex-direction", "flex-flow" };
+
+        display: ?Display = null,
+        box: ?Box = null,
+        flex_column: ?bool = null,
+        // Inner null: an explicit inherit, which still wins the cascade
+        visibility_hidden: ??bool = null,
+        opacity_zero: ?bool = null,
+        pointer_events_none: ??bool = null,
+
+        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(name, "display")) {
+                self.display = Display.parse(value);
+                self.box = Box.parse(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "flex-direction") or std.ascii.eqlIgnoreCase(name, "flex-flow")) {
+                // flex-flow's direction keyword comes first
+                self.flex_column = std.ascii.startsWithIgnoreCase(std.mem.trimStart(u8, value, &std.ascii.whitespace), "column");
+            } else if (std.ascii.eqlIgnoreCase(name, "visibility")) {
+                self.visibility_hidden = parseInheritedFlag(value, &.{ "hidden", "collapse" }, &.{ "visible", "initial" });
+            } else if (std.ascii.eqlIgnoreCase(name, "opacity")) {
+                self.opacity_zero = std.ascii.eqlIgnoreCase(value, "0");
+            } else if (std.ascii.eqlIgnoreCase(name, "pointer-events")) {
+                self.pointer_events_none = parseInheritedFlag(value, &.{"none"}, &.{
+                    "auto",         "initial", "visiblePainted", "visibleFill", "visibleStroke",
+                    "visible",      "painted", "fill",           "stroke",      "all",
+                    "bounding-box",
+                });
+            }
+        }
+    };
+
+    // The element's own values, from the cascade.
+    pub const Cascaded = struct {
+        // Author value (inline or sheet). Without `author_display` it's the UA
+        // fallback: .none when matchesUaDisplayNoneRule, else .other.
+        display: Display = .other,
+        // Without an author `display` it's the tag's UA default, see finish
+        box: Box = .inline_level,
+        flex_column: bool = false,
+        author_display: bool = false,
+        // Null takes the parent's value
+        visibility_hidden: ?bool = null,
+        opacity_zero: bool = false,
+        pointer_events_none: ?bool = null,
+    };
+
+    const Computed = packed struct(u10) {
+        display: Display = .other,
+        box: Box = .inline_level,
+        flex_column: bool = false,
+        author_display: bool = false,
+        visibility_hidden: bool = false, // inherited
+        pointer_events_none: bool = false, // inherited
+        in_display_none: bool = false, // This element or an ancestor
+        in_opacity_zero: bool = false, // This element or an ancestor
+
+        fn resolve(own: Cascaded, parent: Computed) Computed {
+            return .{
+                .display = own.display,
+                .box = own.box,
+                .flex_column = own.flex_column,
+                .author_display = own.author_display,
+                .visibility_hidden = own.visibility_hidden orelse parent.visibility_hidden,
+                .pointer_events_none = own.pointer_events_none orelse parent.pointer_events_none,
+                .in_display_none = own.display == .none or parent.in_display_none,
+                .in_opacity_zero = own.opacity_zero or parent.in_opacity_zero,
+            };
+        }
+
+        fn isHidden(self: Computed, options: CheckVisibilityOptions) bool {
+            return self.in_display_none or
+                (options.check_visibility and self.visibility_hidden) or
+                (options.check_opacity and self.in_opacity_zero);
+        }
+    };
+
+    // UA stylesheet display:none fallback (HTML Rendering §15.3.1 "Hidden
+    // elements"). Applied only when no author rule for `display` matched the
+    // element — per CSS Cascade §6.1 any normal-origin author rule beats UA
+    // origin regardless of specificity, so `.x { display: flex }` on a
+    // `<div class="x" hidden>` must report visible.
+    pub fn finish(p: *Cascaded, el: *Element, frame: *Frame, priorities: *const Priorities(Declared)) void {
+        p.author_display = priorities.get(.display) != 0;
+        if (priorities.get(.box) == 0) {
+            p.box = Box.uaDefault(el.getTag());
+        }
+        if (!p.author_display and matchesUaDisplayNoneRule(el, frame)) {
+            p.display = .none;
+        }
+    }
+};
+
+/// An element's box: its size and how it scrolls.
+const Geometry = struct {
+    const Declared = struct {
+        const names = [_][]const u8{ "overflow-x", "overflow-y", "overscroll-behavior-x", "overscroll-behavior-y", "width", "height", "min-width", "max-width", "flex", "flex-grow" };
+
+        overflow_x_scrolls: ?bool = null,
+        overflow_x_clips: ?bool = null,
+        flex_grow: ?bool = null,
+        overflow_y_scrolls: ?bool = null,
+        overscroll_x_contains: ?bool = null,
+        overscroll_y_contains: ?bool = null,
+        width: ?Length = null,
+        height: ?Length = null,
+        min_width: ?Length = null,
+        max_width: ?Length = null,
+
+        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(name, "overflow-x")) {
+                self.overflow_x_scrolls = overflowScrolls(value);
+                self.overflow_x_clips = overflowClips(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "flex-grow")) {
+                self.flex_grow = flexGrows(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "flex")) {
+                self.flex_grow = flexShorthandGrows(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "overflow-y")) {
+                self.overflow_y_scrolls = overflowScrolls(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "overscroll-behavior-x")) {
+                self.overscroll_x_contains = overscrollContains(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "overscroll-behavior-y")) {
+                self.overscroll_y_contains = overscrollContains(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "width")) {
+                self.width = Length.parse(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "height")) {
+                self.height = Length.parse(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "min-width")) {
+                self.min_width = Length.parse(value);
+            } else if (std.ascii.eqlIgnoreCase(name, "max-width")) {
+                self.max_width = Length.parse(value);
+            }
+        }
+
+        // `overlay` is Chrome's legacy alias of auto.
+        fn overflowScrolls(value: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(value, "auto") or
+                std.ascii.eqlIgnoreCase(value, "scroll") or
+                std.ascii.eqlIgnoreCase(value, "overlay");
+        }
+
+        // Clipped or scrolled within the box: hidden, clip and the scrolling values.
+        fn overflowClips(value: []const u8) bool {
+            return overflowScrolls(value) or
+                std.ascii.eqlIgnoreCase(value, "hidden") or
+                std.ascii.eqlIgnoreCase(value, "clip");
+        }
+
+        fn flexGrows(value: []const u8) bool {
+            const number = std.fmt.parseFloat(f64, std.mem.trim(u8, value, &std.ascii.whitespace)) catch return false;
+            return number > 0;
+        }
+
+        // `flex: <grow> [<shrink>] [<basis>]`; `auto` grows, `none` and
+        // `initial` don't, and a lone width (`flex: 200px`) is a basis.
+        fn flexShorthandGrows(value: []const u8) bool {
+            var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+            const first = it.next() orelse return false;
+            if (std.ascii.eqlIgnoreCase(first, "auto")) return true;
+            return flexGrows(first);
+        }
+
+        // `contain` keeps the scroll in the box, `none` also kills the bounce we
+        // don't render anyway; only `auto` lets a scroll chain outward.
+        fn overscrollContains(value: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(value, "contain") or
+                std.ascii.eqlIgnoreCase(value, "none");
+        }
+    };
+
+    const Computed = packed struct(u146) {
+        overflow_x_scrolls: bool = false,
+        overflow_x_clips: bool = false,
+        flex_grow: bool = false,
+        overflow_y_scrolls: bool = false,
+        overscroll_x_contains: bool = false,
+        overscroll_y_contains: bool = false,
+        width: Length = .{},
+        height: Length = .{},
+        // auto, none and the intrinsic keywords don't limit
+        min_width: Length = .{},
+        max_width: Length = .{},
+    };
+};
+
+/// The axes a touch may not pan along: touch-action, intersected with the
+/// ancestors' (an ancestor's `none` stops the pan too).
+const TouchAction = struct {
+    const Declared = struct {
+        const names = [_][]const u8{"touch-action"};
+
+        pan_x_blocked: ?bool = null,
+        pan_y_blocked: ?bool = null,
+
+        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+            if (!std.ascii.eqlIgnoreCase(name, "touch-action")) return;
+            const pans = parse(value) orelse return;
+            self.pan_x_blocked = !pans.x;
+            self.pan_y_blocked = !pans.y;
+        }
+
+        // The axes a touch may pan along; null for an invalid value. The
+        // directional keywords count for their whole axis.
+        fn parse(value: []const u8) ?Element.ScrollAxes {
+            if (std.ascii.eqlIgnoreCase(value, "auto") or std.ascii.eqlIgnoreCase(value, "manipulation")) {
+                return .{ .x = true, .y = true };
+            }
+            if (std.ascii.eqlIgnoreCase(value, "none")) {
+                return .{};
+            }
+            var pans: Element.ScrollAxes = .{};
+            var it = std.mem.tokenizeAny(u8, value, &std.ascii.whitespace);
+            while (it.next()) |token| {
+                if (std.ascii.eqlIgnoreCase(token, "pan-x") or std.ascii.eqlIgnoreCase(token, "pan-left") or std.ascii.eqlIgnoreCase(token, "pan-right")) {
+                    pans.x = true;
+                } else if (std.ascii.eqlIgnoreCase(token, "pan-y") or std.ascii.eqlIgnoreCase(token, "pan-up") or std.ascii.eqlIgnoreCase(token, "pan-down")) {
+                    pans.y = true;
+                } else if (!std.ascii.eqlIgnoreCase(token, "pinch-zoom")) {
+                    return null;
+                }
+            }
+            return pans;
+        }
+    };
+
+    pub const Cascaded = struct {
+        pan_x_blocked: bool = false,
+        pan_y_blocked: bool = false,
+    };
+
+    const Computed = packed struct(u2) {
+        pan_x_blocked: bool = false,
+        pan_y_blocked: bool = false,
+
+        fn resolve(own: Cascaded, parent: Computed) Computed {
+            return .{
+                .pan_x_blocked = own.pan_x_blocked or parent.pan_x_blocked,
+                .pan_y_blocked = own.pan_y_blocked or parent.pan_y_blocked,
+            };
+        }
+    };
+};
+
+/// Inherited text properties. Each element stores only its own cascaded
+/// value; `.inherit` means it takes its parent's.
+const Text = struct {
+    const Declared = struct {
+        const names = [_][]const u8{"text-transform"};
+
+        text_transform: ?TextTransform = null,
+
+        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(name, "text-transform")) {
+                self.text_transform = TextTransform.parse(value);
+            }
+        }
+    };
+
+    const Computed = packed struct(u3) {
+        text_transform: TextTransform = .inherit,
+    };
+};
+
+/// Whether a box is out of normal flow, which sizes it to its content.
+const Flow = struct {
+    const Declared = struct {
+        const names = [_][]const u8{ "position", "float" };
+
+        absolutely_positioned: ?bool = null,
+        floated: ?bool = null,
+
+        fn apply(self: *Declared, name: []const u8, value: []const u8) void {
+            if (std.ascii.eqlIgnoreCase(name, "position")) {
+                self.absolutely_positioned = std.ascii.eqlIgnoreCase(value, "absolute") or std.ascii.eqlIgnoreCase(value, "fixed");
+            } else if (std.ascii.eqlIgnoreCase(name, "float")) {
+                self.floated = std.ascii.eqlIgnoreCase(value, "left") or std.ascii.eqlIgnoreCase(value, "right") or
+                    std.ascii.eqlIgnoreCase(value, "inline-start") or std.ascii.eqlIgnoreCase(value, "inline-end");
+            }
+        }
+    };
+
+    const Computed = packed struct(u2) {
+        absolutely_positioned: bool = false,
+        floated: bool = false,
+    };
+};
+
+/// Every group's share of one declaration block, so a sheet's block is folded
+/// once. Field names match the StyleManager's group fields.
+const Declarations = struct {
+    const names = Visibility.Declared.names ++ Geometry.Declared.names ++ TouchAction.Declared.names ++ Text.Declared.names ++ Flow.Declared.names;
+
+    visibility: Visibility.Declared = .{},
+    geometry: Geometry.Declared = .{},
+    touch_action: TouchAction.Declared = .{},
+    text: Text.Declared = .{},
+    flow: Flow.Declared = .{},
+
+    fn apply(self: *Declarations, name: []const u8, value: []const u8) void {
+        inline for (group_fields) |field| {
+            @field(self, field).apply(name, value);
         }
     }
 
-    fn isRelevant(self: VisibilityProperties) bool {
-        inline for (property_fields) |field| {
-            if (@field(self, field) != null) {
+    fn isRelevant(self: Declarations) bool {
+        inline for (group_fields) |field| {
+            if (declaresAny(@field(self, field))) {
                 return true;
             }
         }
@@ -1119,15 +1926,22 @@ const VisibilityProperties = struct {
     }
 };
 
-const VisibilityRule = struct {
-    selector: Selector.Selector, // Single selector, not a list
-    props: VisibilityProperties,
+const group_fields = @typeInfo(Declarations).@"struct".field_names;
 
-    // Packed priority: layer_rank:12 | specificity:30 | doc_order:22. A layered
-    // rule's rank bits stay 0 until finalizeLayerRanks knows every layer and
-    // stamps them from rule_layers[doc_order - 1].
-    priority: u64,
-};
+fn declaresAny(declared: anytype) bool {
+    inline for (@typeInfo(@TypeOf(declared)).@"struct".field_names) |field| {
+        if (@field(declared, field) != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Per property, the priority of the declaration winning so far; 0 while
+/// none has.
+fn Priorities(comptime Declared: type) type {
+    return std.enums.EnumArray(std.meta.FieldEnum(Declared), u64);
+}
 
 // custom_rules map is property_name -> CustomProperty, loosely:
 //    --color => [(:root, "#ff0"), (.card, "#000")]
@@ -1149,7 +1963,7 @@ const CustomRule = struct {
 const ParsedCustomRule = struct {
     selector: Selector.Selector,
     value: []const u8,
-    priority: u64, // packed the same way as VisibilityRule.priority
+    priority: u64, // packed the same way as a group Rule.priority
 };
 
 /// A `--*` declaration on its way from a rule block into custom_rules.
@@ -1178,50 +1992,47 @@ const Layer = struct {
 // no paren (top-level layer)
 const NO_LAYER: u16 = std.math.maxInt(u16);
 
-const UNLAYERED_RANK: u32 = std.math.maxInt(u12);
+const UNLAYERED_RANK: u32 = std.math.maxInt(u11);
 
 /// Protect against hostile input. Must be < UNLAYERED_RANK so that it fits in
-// its 12 bits of VisibleRule.priority
+// its 11 bits of VisibleRule.priority
 const MAX_LAYERS: usize = 1024;
 
-// VisibilityRule.priority field offsets (layer_rank:12 | spec:30 | doc:22).
+// Group Rule.priority field offsets (important:1 | layer_rank:11 | spec:30 | doc:22).
 const SPEC_SHIFT: u6 = 22;
 const RANK_SHIFT: u6 = 52;
+const RANK_MASK: u64 = @as(u64, UNLAYERED_RANK) << RANK_SHIFT;
+const IMPORTANT_BIT: u64 = 1 << 63;
 
-// - 1 since INLINE_PRIORITY is _always_ higher
+// - 1 since the INLINE_* sentinels are _always_ higher
 const MAX_DOC_ORDER: u32 = std.math.maxInt(u22) - 1;
 
 const CheckVisibilityOptions = struct {
     check_visibility: bool = false,
     check_opacity: bool = false,
-    // false is only sound when every ancestor is already known visible.
-    ancestors: bool = true,
 };
 
-// Inline styles always win over stylesheets - use max u64 as sentinel.
-// Strictly above any packed rule priority: doc_order saturates one below
+// Inline styles win over the stylesheets of the same importance, and the
+// cascade goes: normal rules < normal inline < important rules < important
+// inline. Each sentinel is the top of its tier: doc_order saturates one below
 // its field max, so a real rule can never pack to all-ones.
-const INLINE_PRIORITY: u64 = std.math.maxInt(u64);
+const INLINE_PRIORITY: u64 = IMPORTANT_BIT - 1;
+const INLINE_IMPORTANT_PRIORITY: u64 = std.math.maxInt(u64);
 
 // `frame` must be el's owner frame (el.ownerFrame): that is the map where a
 // parsed inline style lives. Without one the attribute text is folded in
 // place; layout materializes the object itself when it needs it.
-fn inlineProps(el: *Element, frame: *Frame) VisibilityProperties {
+fn inlineDeclared(comptime Declared: type, el: *Element, frame: *Frame) Slots(Declared) {
     if (!el._flags.has_inline_style) {
         // Neither a style object nor a style attribute; skip both lookups.
         return .{};
     }
     if (el.existingStyle(frame)) |style| {
-        return extractVisibilityProperties(style);
+        return extractDeclared(Declared, style);
     }
     const attr = el.getAttributeInterned("style") orelse return .{};
     // Without a sink nothing allocates
-    return foldDeclarations(attr, null) catch unreachable;
-}
-
-fn styleValue(style: *CSSStyleProperties, property_name: String) ?[]const u8 {
-    const property = style.asCSSStyleDeclaration().findProperty(property_name) orelse return null;
-    return property._value.str();
+    return foldDeclarations(Declared, CssParser.parseDeclarationsList(attr), null) catch unreachable;
 }
 
 /// `--*` declarations of one block, keyed by name so a block declaring the same
@@ -1236,26 +2047,9 @@ const CustomSink = struct {
 // earlier !important one, and an empty value removes the property. The tracked
 // properties are matched case-insensitively; a custom property's name is
 // case-sensitive and goes to `customs` when there is one.
-fn foldDeclarations(block: []const u8, customs: ?*CustomSink) !VisibilityProperties {
-    const Slot = struct {
-        value: ?[]const u8 = null,
-        important: bool = false,
-
-        fn apply(self: *@This(), declaration: CssParser.Declaration) void {
-            if (self.important and !declaration.important) {
-                return;
-            }
-            if (declaration.value.len == 0) {
-                self.* = .{};
-                return;
-            }
-            self.value = declaration.value;
-            self.important = declaration.important;
-        }
-    };
-
-    var slots = [_]Slot{.{}} ** property_names.len;
-    var it = CssParser.parseDeclarationsList(block);
+fn foldDeclarations(comptime Declared: type, declarations: CssParser.DeclarationsIterator, customs: ?*CustomSink) !Slots(Declared) {
+    var slots: Slots(Declared) = .{};
+    var it = declarations;
     while (it.next()) |declaration| {
         if (isCustomProperty(declaration.name)) {
             const sink = customs orelse continue;
@@ -1266,35 +2060,105 @@ fn foldDeclarations(block: []const u8, customs: ?*CustomSink) !VisibilityPropert
             gop.value_ptr.* = .{ .name = declaration.name, .value = declaration.value, .important = declaration.important };
             continue;
         }
-        for (property_names, &slots) |name, *slot| {
-            if (std.ascii.eqlIgnoreCase(declaration.name, name)) {
-                slot.apply(declaration);
-                break;
+        slots.apply(declaration.name, declaration.value, declaration.important);
+    }
+    return slots;
+}
+
+/// One block's winning value per property in `Declared.names`, folded in
+/// declaration order.
+fn Slots(comptime Declared: type) type {
+    return struct {
+        const Self = @This();
+
+        slots: [Declared.names.len]Slot = @splat(.{}),
+
+        fn apply(self: *Self, name: []const u8, value: []const u8, important: bool) void {
+            if (CssParser.axisShorthand(name)) |shorthand| {
+                const values = CssParser.splitAxisPair(value) orelse return;
+                self.apply(shorthand.x, values.x, important);
+                self.apply(shorthand.y, values.y, important);
+                return;
+            }
+            for (Declared.names, &self.slots) |tracked, *slot| {
+                if (std.ascii.eqlIgnoreCase(name, tracked)) {
+                    slot.apply(value, important);
+                    return;
+                }
             }
         }
-    }
 
-    var props: VisibilityProperties = .{};
-    for (property_names, slots) |name, slot| {
-        if (slot.value) |value| {
-            props.apply(name, value);
+        fn props(self: Self, comptime importance: Importance) Declared {
+            var p: Declared = .{};
+            for (Declared.names, self.slots) |name, s| {
+                const value = s.value orelse continue;
+                switch (importance) {
+                    .any => {},
+                    .normal => if (s.important) continue,
+                    .important => if (s.important == false) continue,
+                }
+                p.apply(name, value);
+            }
+            return p;
         }
-    }
-    return props;
+    };
 }
+
+const Importance = enum { any, normal, important };
+
+const Slot = struct {
+    value: ?[]const u8 = null,
+    important: bool = false,
+
+    fn apply(self: *Slot, value: []const u8, important: bool) void {
+        if (self.important and !important) {
+            return;
+        }
+        if (value.len == 0) {
+            self.* = .{};
+            return;
+        }
+        self.value = value;
+        self.important = important;
+    }
+};
 
 /// Resolved value of an element's inline `style=` declaration for `property_name`,
 /// or null when the element has no such declaration. Reads the element's parsed
 /// inline style (the same source `el.style` exposes), so `getComputedStyle` and
 /// `el.style` agree on inline values instead of resolving them independently.
+/// Null too when a tracked property's normal declaration loses to an
+/// !important stylesheet rule.
 pub fn inlineStyleValue(self: *StyleManager, el: *Element, property_name: String) ?[]const u8 {
+    self.assertOwns(el);
     const style = el.inlineStyle(self.frame) orelse return null;
-    return styleValue(style, property_name);
+    const declaration = style.asCSSStyleDeclaration();
+    const value = declaration.declaredValue(property_name, self.frame) orelse return null;
+    if (declaration.declaredImportant(property_name) == false and self.importantRuleWins(el, property_name.str(), value)) {
+        return null;
+    }
+    return value;
+}
+
+// Folds the one declaration the way the inline style is folded for layout, so
+// a shorthand checks its longhands and a value we don't parse checks nothing.
+fn importantRuleWins(self: *StyleManager, el: *Element, name: []const u8, value: []const u8) bool {
+    self.rebuildIfDirty() catch return false;
+    var slots: Slots(Declarations) = .{};
+    slots.apply(name, value, false);
+    const declared = slots.props(.any);
+    inline for (group_fields) |field| {
+        if (@field(self, field).importantRuleWins(@field(declared, field), el, self.frame)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Computed value of a custom property (`--x`) on `el`, or null when nothing
 /// declares it. The value is returned as-is, no var substitution
 pub fn customPropertyValue(self: *StyleManager, el: *Element, property_name: String) ?[]const u8 {
+    self.assertOwns(el);
     self.rebuildIfDirty() catch return null;
 
     // Only the rules declaring this name; usually a handful, often none. An
@@ -1306,7 +2170,7 @@ pub fn customPropertyValue(self: *StyleManager, el: *Element, property_name: Str
     };
 
     var current: ?*Element = el;
-    while (current) |elem| : (current = elem.parentElement()) {
+    while (current) |elem| : (current = elem.asNode().flatTreeParentElement(self.frame)) {
         if (self.inlineStyleValue(elem, property_name)) |value| {
             return value;
         }
@@ -1369,18 +2233,23 @@ fn parsedCustomRules(self: *StyleManager, name: []const u8) ![]const ParsedCusto
 /// `inherit`/relative-unit chains share it).
 const MAX_FONT_ANCESTOR_DEPTH = 32;
 
+/// The font-size an element inherits when nothing declares one and when an
+/// element is part of a frameless document.
+pub const DEFAULT_FONT_SIZE = 16;
+
 /// Computed font-size in CSS pixels. We do what we can, namely inline styles
 /// font-related attributes, up the parent chain.
 pub fn computedFontSize(self: *StyleManager, element: ?*Element) f64 {
+    self.assertOwns(element);
     return self.computedFontSizeAt(element, 0);
 }
 
 fn computedFontSizeAt(self: *StyleManager, element: ?*Element, depth: u8) f64 {
     if (depth >= MAX_FONT_ANCESTOR_DEPTH) {
-        return 16;
+        return DEFAULT_FONT_SIZE;
     }
-    const current = element orelse return 16;
-    const parent = current.parentElement();
+    const current = element orelse return DEFAULT_FONT_SIZE;
+    const parent = current.asNode().flatTreeParentElement(self.frame);
 
     if (self.inlineStyleValue(current, comptime .wrap("font-size"))) |raw| {
         if (self.parseFontSize(raw, parent, depth + 1)) |size| {
@@ -1395,13 +2264,55 @@ fn computedFontSizeAt(self: *StyleManager, element: ?*Element, depth: u8) f64 {
     return self.computedFontSizeAt(parent, depth + 1);
 }
 
+/// `inherit`, or `unset` on an inherited property.
+fn inheritsKeyword(value: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset");
+}
+
+/// An inherited boolean property's declared value: inner null for an explicit
+/// inherit, outer null for an invalid value, which the cascade drops. No UA
+/// style sets these properties, so revert also rolls back to inheriting.
+fn parseInheritedFlag(value: []const u8, comptime on: []const []const u8, comptime off: []const []const u8) ??bool {
+    if (inheritsKeyword(value) or std.ascii.eqlIgnoreCase(value, "revert") or std.ascii.eqlIgnoreCase(value, "revert-layer")) {
+        return @as(?bool, null);
+    }
+    inline for (on) |keyword| {
+        if (std.ascii.eqlIgnoreCase(value, keyword)) return true;
+    }
+    inline for (off) |keyword| {
+        if (std.ascii.eqlIgnoreCase(value, keyword)) return false;
+    }
+    return null;
+}
+
+// Absolute-size keywords, in pixels as Chrome maps them.
+const font_size_keywords = std.StaticStringMapWithEql(f64, std.static_string_map.eqlAsciiIgnoreCase).initComptime(.{
+    .{ "xx-small", 9 },
+    .{ "x-small", 10 },
+    .{ "small", 13 },
+    .{ "medium", 16 },
+    .{ "large", 18 },
+    .{ "x-large", 24 },
+    .{ "xx-large", 32 },
+    .{ "xxx-large", 48 },
+});
+
 fn parseFontSize(self: *StyleManager, raw: []const u8, parent: ?*Element, depth: u8) ?f64 {
     const value = std.mem.trim(u8, raw, " \t\r\n\x0c");
-    if (std.ascii.eqlIgnoreCase(value, "inherit") or std.ascii.eqlIgnoreCase(value, "unset")) {
+    if (inheritsKeyword(value)) {
         return self.computedFontSizeAt(parent, depth);
     }
-    if (std.ascii.eqlIgnoreCase(value, "initial") or std.ascii.eqlIgnoreCase(value, "medium")) {
-        return 16;
+    if (std.ascii.eqlIgnoreCase(value, "initial")) {
+        return DEFAULT_FONT_SIZE;
+    }
+    if (font_size_keywords.get(value)) |size| {
+        return size;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "smaller")) {
+        return self.computedFontSizeAt(parent, depth) / 1.2;
+    }
+    if (std.ascii.eqlIgnoreCase(value, "larger")) {
+        return self.computedFontSizeAt(parent, depth) * 1.2;
     }
 
     const parsed = units.parse(value) catch return null;
@@ -1409,6 +2320,8 @@ fn parseFontSize(self: *StyleManager, raw: []const u8, parent: ?*Element, depth:
         .percentage => self.computedFontSizeAt(parent, depth) / 100.0,
         .em => self.computedFontSizeAt(parent, depth),
         .ex => self.computedFontSizeAt(parent, depth) / 2.0,
+        // The root's own `rem` resolves against the initial size.
+        .rem => if (parent == null) DEFAULT_FONT_SIZE else self.computedFontSizeAt(self.frame.document.getDocumentElement(), depth),
         else => return null,
     };
     const size = parsed.value * factor;
@@ -1416,8 +2329,35 @@ fn parseFontSize(self: *StyleManager, raw: []const u8, parent: ?*Element, depth:
 }
 
 const testing = @import("../testing.zig");
+test "StyleManager: important cascade across external sheets, inline styles and layers" {
+    try testing.htmlRunner("css/important_cascade.html", .{ .load_resources = .{ .stylesheet = true } });
+}
+
 test "StyleManager: custom properties" {
     try testing.htmlRunner("css/custom_properties.html", .{});
+}
+
+test "StyleManager: text-transform" {
+    try testing.htmlRunner("css/text_transform.html", .{});
+}
+
+test "StyleManager: text-transform without rules skips the memo" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const div = try frame.window._document.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(),
+        \\<p style="text-transform: uppercase"><b><i></i></b></p>
+    );
+    const p = div.asNode().firstChild().?.as(Element);
+    const b = p.asNode().firstChild().?.as(Element);
+    const i = b.asNode().firstChild().?.as(Element);
+
+    // Inherited from the inline declaration; only <p> needs the cascade.
+    try testing.expectEqual(TextTransform.uppercase, sm.textTransform(i));
+    try testing.expectEqual(1, sm.text.memo.count());
+    try testing.expectEqual(TextTransform.none, sm.textTransform(div));
 }
 
 test "StyleManager: computeSpecificity: element selector" {
@@ -1574,22 +2514,25 @@ test "StyleManager: document order tie-breaking" {
 }
 
 test "StyleManager: packed priority bounds" {
-    // The three fields fill the u64 exactly, without overlap.
-    try testing.expectEqual(64, @as(u32, RANK_SHIFT) + 12);
+    // The four fields fill the u64 exactly, without overlap.
+    try testing.expectEqual(IMPORTANT_BIT, @as(u64, 1) << (RANK_SHIFT + 11));
     try testing.expectEqual(RANK_SHIFT, @as(u32, SPEC_SHIFT) + 30);
 
     // The maximum packable rule priority (unlayered rank, fully-clamped
-    // specificity, saturated doc_order) stays below INLINE_PRIORITY.
+    // specificity, saturated doc_order) stays below its tier's inline sentinel,
+    // and every important rule above INLINE_PRIORITY.
     const max_packed = (@as(u64, UNLAYERED_RANK) << RANK_SHIFT) |
         (@as(u64, std.math.maxInt(u30)) << SPEC_SHIFT) |
         MAX_DOC_ORDER;
     try testing.expect(max_packed < INLINE_PRIORITY);
+    try testing.expect(IMPORTANT_BIT > INLINE_PRIORITY);
+    try testing.expect((IMPORTANT_BIT | max_packed) < INLINE_IMPORTANT_PRIORITY);
 
-    // Real layer ranks fit the 12 rank bits below the unlayered sentinel.
+    // Real layer ranks fit the 11 rank bits below the unlayered sentinel.
     try testing.expect(MAX_LAYERS < UNLAYERED_RANK);
 }
 
-test "StyleManager: inlineProps: scan matches the parsed style object" {
+test "StyleManager: inlineDeclared: scan matches the parsed style object" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
@@ -1605,32 +2548,64 @@ test "StyleManager: inlineProps: scan matches the parsed style object" {
         \\<i style="visibility:hidden"></i>
         \\<i style="display:"></i>
         \\<i></i>
+        \\<i style="overflow: auto"></i>
+        \\<i style="overflow: hidden scroll"></i>
+        \\<i style="overflow: hidden; overflow-y: auto"></i>
+        \\<i style="overflow-y: auto; overflow: hidden"></i>
+        \\<i style="overflow-y: auto !important; overflow: hidden"></i>
+        \\<i style="overflow-x: overlay"></i>
+        \\<i style="overflow:"></i>
+        \\<i style="width: 100px; height: 1in"></i>
+        \\<i style="height: 10vh; height: auto"></i>
+        \\<i style="width: 50%; height: -5px"></i>
+        \\<i style="width: 2em !important; width: 10vw"></i>
+        \\<i style="display: flex"></i>
+        \\<i style="display: inline-grid"></i>
+        \\<i style="width: max-content; position: absolute; float: left"></i>
+        \\<i style="width: fit-content(10px); position: relative; float: none"></i>
     );
-    const expected = [_]VisibilityProperties{
-        .{ .display = .none },
-        .{ .display = .none },
-        .{ .display = .none },
-        .{ .display = .other },
-        .{ .display = .none, .visibility_hidden = true },
-        .{ .opacity_zero = true, .pointer_events_none = true },
-        .{ .opacity_zero = false, .pointer_events_none = true },
-        .{ .visibility_hidden = true },
+    const expected = [_]Declarations{
+        .{ .visibility = .{ .display = .none } },
+        .{ .visibility = .{ .display = .none } },
+        .{ .visibility = .{ .display = .none } },
+        .{ .visibility = .{ .display = .other, .box = .block_level } },
+        .{ .visibility = .{ .display = .none, .visibility_hidden = true } },
+        .{ .visibility = .{ .opacity_zero = true, .pointer_events_none = true } },
+        .{ .visibility = .{ .opacity_zero = false, .pointer_events_none = true } },
+        .{ .visibility = .{ .visibility_hidden = true } },
         .{},
         .{},
+        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true, .overflow_y_scrolls = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = false } },
+        .{ .geometry = .{ .overflow_x_scrolls = false, .overflow_x_clips = true, .overflow_y_scrolls = true } },
+        .{ .geometry = .{ .overflow_x_scrolls = true, .overflow_x_clips = true } },
+        .{},
+        .{ .geometry = .{ .width = .{ .value = 100, .unit = .px }, .height = .{ .value = 96, .unit = .px } } },
+        .{ .geometry = .{ .height = .{} } },
+        .{ .geometry = .{ .width = .{ .value = 50, .unit = .percent }, .height = .{} } },
+        .{ .geometry = .{ .width = .{} } },
+        .{ .visibility = .{ .display = .flex, .box = .block_level } },
+        .{ .visibility = .{ .display = .grid, .box = .inline_level } },
+        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .absolutely_positioned = true, .floated = true } },
+        .{ .geometry = .{ .width = .{ .unit = .content } }, .flow = .{ .absolutely_positioned = false, .floated = false } },
     };
 
     var i: usize = 0;
     var child = div.asNode().firstChild();
     while (child) |node| : (child = node.nextSibling()) {
         const el = node.is(Element) orelse continue;
-        const scanned = inlineProps(el, frame);
+        // std's expectEqual: testing's can't compare an optional struct
+        const scanned = inlineDeclared(Declarations, el, frame).props(.any);
+        try std.testing.expectEqual(expected[i], scanned);
+        try std.testing.expectEqual(expected[i].visibility, inlineDeclared(Visibility.Declared, el, frame).props(.any));
+        try std.testing.expectEqual(expected[i].geometry, inlineDeclared(Geometry.Declared, el, frame).props(.any));
+        try std.testing.expectEqual(expected[i].flow, inlineDeclared(Flow.Declared, el, frame).props(.any));
         // scanning never creates the style object
         try testing.expectEqual(null, el.existingStyle(frame));
-        const materialized = extractVisibilityProperties(try el.getOrCreateStyle(frame));
-        inline for (property_fields) |field| {
-            try testing.expectEqual(@field(expected[i], field), @field(scanned, field));
-            try testing.expectEqual(@field(expected[i], field), @field(materialized, field));
-        }
+        const materialized = extractDeclared(Declarations, try el.getOrCreateStyle(frame)).props(.any);
+        try std.testing.expectEqual(expected[i], materialized);
         i += 1;
     }
     try testing.expectEqual(expected.len, i);
@@ -1650,9 +2625,10 @@ test "StyleManager: memo: reuse and invalidation" {
 
     // The walk memoizes the element and every ancestor
     try testing.expectEqual(false, sm.isHidden(b, .{}));
-    try testing.expectEqual(3, sm.memo.count());
+    try testing.expectEqual(3, sm.visibility.memo.count());
+    try testing.expectEqual(0, sm.geometry.memo.count());
     try testing.expectEqual(false, sm.isHidden(b, .{}));
-    try testing.expectEqual(3, sm.memo.count());
+    try testing.expectEqual(3, sm.visibility.memo.count());
 
     // Probes never create the style object
     try testing.expectEqual(null, b.existingStyle(frame));
@@ -1679,10 +2655,211 @@ test "StyleManager: memo: reuse and invalidation" {
     try testing.expectEqual(true, sm.hasVisibilityHiddenInherited(b));
     try testing.expectEqual(false, sm.hasPointerEventsNone(b));
 
+    try b.setStyle("overflow: hidden auto", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = false, .y = true }, sm.overflowAxes(b));
+    try testing.expectEqual(Element.ScrollAxes{}, sm.overflowAxes(p));
+
+    // Setting the shorthand resets both longhands, whatever declared them.
+    try b.setStyle("overflow: hidden; overflow-y: scroll", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = false, .y = true }, sm.overflowAxes(b));
+    try (try b.getOrCreateStyle(frame)).asCSSStyleDeclaration().setProperty("overflow", "hidden", null, frame);
+    try testing.expectEqual(Element.ScrollAxes{}, sm.overflowAxes(b));
+
+    // overscroll-behavior expands the same way; only `auto` chains outward.
+    try b.setStyle("overscroll-behavior: contain auto", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = true, .y = false }, sm.overscrollContainAxes(b));
+    try testing.expectEqual(Element.ScrollAxes{}, sm.overscrollContainAxes(p));
+    try b.setStyle("overscroll-behavior-y: none", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = false, .y = true }, sm.overscrollContainAxes(b));
+    try b.setStyle("overscroll-behavior: contain; overscroll-behavior-x: auto", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = false, .y = true }, sm.overscrollContainAxes(b));
+
+    try b.setStyle("touch-action: pan-y pinch-zoom", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = true, .y = false }, sm.touchPanBlockedAxes(b));
+    try b.setStyle("touch-action: none", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = true, .y = true }, sm.touchPanBlockedAxes(b));
+    try b.setStyle("touch-action: manipulation", frame);
+    try testing.expectEqual(Element.ScrollAxes{}, sm.touchPanBlockedAxes(b));
+    try testing.expectEqual(Element.ScrollAxes{}, sm.touchPanBlockedAxes(p));
+    // An ancestor's touch-action narrows its descendants'.
+    try p.setStyle("touch-action: pan-x", frame);
+    try testing.expectEqual(Element.ScrollAxes{ .x = false, .y = true }, sm.touchPanBlockedAxes(b));
+
     // A stylesheet change resets the memo
     sm.sheetModified();
     try testing.expectEqual(false, sm.isHidden(p, .{}));
-    try testing.expectEqual(2, sm.memo.count());
+    try testing.expectEqual(2, sm.visibility.memo.count());
+}
+
+test "StyleManager: memo: inherited values, any query order" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const div = try frame.window._document.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(),
+        \\<p><b style="pointer-events: none"><i style="visibility: hidden"><s style="opacity: 0"><u></u></s></i></b></p>
+    );
+    const p = div.asNode().firstChild().?.as(Element);
+    const b = p.asNode().firstChild().?.as(Element);
+    const i = b.asNode().firstChild().?.as(Element);
+    const s = i.asNode().firstChild().?.as(Element);
+    const u = s.asNode().firstChild().?.as(Element);
+
+    // The deepest first stores every ancestor, each resolved against its parent
+    try testing.expectEqual(true, sm.hasPointerEventsNone(u));
+    try testing.expectEqual(6, sm.visibility.memo.count());
+    try testing.expectEqual(Visibility.Computed{ .visibility_hidden = true, .pointer_events_none = true, .in_opacity_zero = true }, sm.visibility.memo.get(u).?);
+    try testing.expectEqual(Visibility.Computed{ .visibility_hidden = true, .pointer_events_none = true }, sm.visibility.memo.get(i).?);
+    try testing.expectEqual(Visibility.Computed{ .box = .block_level }, sm.visibility.memo.get(p).?);
+
+    try testing.expectEqual(false, sm.isHidden(u, .{}));
+    try testing.expectEqual(true, sm.isHidden(u, .{ .check_visibility = true }));
+    try testing.expectEqual(true, sm.isHidden(u, .{ .check_opacity = true }));
+    try testing.expectEqual(true, sm.isHidden(s, .{ .check_opacity = true }));
+    try testing.expectEqual(false, sm.isHidden(i, .{ .check_opacity = true }));
+    try testing.expectEqual(true, sm.hasVisibilityHiddenInherited(i));
+    try testing.expectEqual(false, sm.hasVisibilityHiddenInherited(b));
+    try testing.expectEqual(true, sm.hasPointerEventsNone(b));
+    try testing.expectEqual(false, sm.hasPointerEventsNone(p));
+
+    // A DOM change drops the memo; a middle element first, then below and above it
+    try p.setStyle("display: none", frame);
+    try testing.expectEqual(true, sm.isHidden(i, .{}));
+    try testing.expectEqual(true, sm.isHidden(u, .{}));
+    // display itself isn't inherited
+    try testing.expectEqual(false, sm.hasDisplayNone(u));
+    try testing.expectEqual(true, sm.hasDisplayNone(p));
+    try testing.expectEqual(true, sm.hasPointerEventsNone(u));
+    try testing.expectEqual(false, sm.hasPointerEventsNone(p));
+    try testing.expectEqual(true, sm.isHidden(p, .{}));
+    try testing.expectEqual(false, sm.isHidden(div, .{}));
+
+    try p.setStyle("", frame);
+    try testing.expectEqual(false, sm.isHidden(u, .{}));
+    try testing.expectEqual(true, sm.hasPointerEventsNone(s));
+}
+
+test "StyleManager: memo: a descendant overrides inherited visibility and pointer-events" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const div = try frame.window._document.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(),
+        \\<b style="visibility: hidden; pointer-events: none"><i style="visibility: visible; pointer-events: auto"><s><u style="visibility: inherit; pointer-events: unset"></u></s></i></b>
+    );
+    const b = div.asNode().firstChild().?.as(Element);
+    const i = b.asNode().firstChild().?.as(Element);
+    const s = i.asNode().firstChild().?.as(Element);
+    const u = s.asNode().firstChild().?.as(Element);
+
+    // Deepest first resolves the whole path in one walk; top-down hits the
+    // memo one level up each time
+    for ([_][4]*Element{ .{ u, s, i, b }, .{ b, i, s, u } }) |order| {
+        frame.styleChanged();
+        for (order) |el| {
+            try testing.expectEqual(el == b, sm.isHidden(el, .{ .check_visibility = true }));
+            try testing.expectEqual(el == b, sm.hasPointerEventsNone(el));
+        }
+    }
+
+    try i.setStyle("", frame);
+    try testing.expectEqual(true, sm.hasVisibilityHiddenInherited(u));
+    try testing.expectEqual(true, sm.hasPointerEventsNone(u));
+
+    // inherit wins the cascade like any value, over a weaker declaration
+    try b.setStyle("visibility: inherit !important; visibility: hidden; pointer-events: inherit !important; pointer-events: none", frame);
+    try testing.expectEqual(false, sm.hasVisibilityHiddenInherited(u));
+    try testing.expectEqual(false, sm.hasPointerEventsNone(b));
+
+    // An invalid value is dropped, so the parent's value still inherits
+    try b.setStyle("visibility: hidden; pointer-events: none", frame);
+    try u.setStyle("visibility: bogus; pointer-events: bogus", frame);
+    try testing.expectEqual(true, sm.hasVisibilityHiddenInherited(u));
+    try testing.expectEqual(true, sm.hasPointerEventsNone(u));
+}
+
+test "StyleManager: revert on visibility and pointer-events inherits" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const sm = &frame._style_manager;
+
+    const doc = frame.document;
+    const html = (try doc.createElement("html", null, frame)).asNode();
+    _ = try doc.asNode().appendChild(html, frame);
+    const body = (try doc.createElement("body", null, frame)).asNode();
+    _ = try html.appendChild(body, frame);
+    try Frame.parse.htmlAsChildren(frame, body, "<div class=\"x\"></div><div class=\"x\"></div>");
+    const a = body.firstChild().?.as(Element);
+    const b = a.asNode().nextSibling().?.as(Element);
+
+    const style_el = (try doc.createElement("style", null, frame)).as(Element.Html.Style);
+    try style_el.asNode().setTextContent(".x { visibility: hidden; pointer-events: none }", frame);
+    _ = try body.insertBefore(style_el.asNode(), a.asNode(), frame);
+
+    // No UA style sets either property, so the inline revert beats the class
+    // and inherits the body's values, instead of being dropped as invalid.
+    try a.setStyle("visibility: revert; pointer-events: revert", frame);
+    try b.setStyle("visibility: REVERT-LAYER; pointer-events: revert-layer", frame);
+    for ([_]*Element{ a, b }) |el| {
+        try testing.expectEqual(false, sm.hasVisibilityHiddenInherited(el));
+        try testing.expectEqual(false, sm.hasPointerEventsNone(el));
+    }
+}
+
+// Every element of a deep chain probed in document order, the shape of an
+// interactivity pass. Walking all ancestors per probe is quadratic, which only
+// the growth between two depths a factor of TIMES apart tells apart. The
+// fastest of ROUNDS so a scheduler stall on the small chain can't skew it.
+test "StyleManager: memo: probing a deep tree stays linear" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const SMALL = 1000;
+    const TIMES = 10;
+    // well above TIMES, well below TIMES squared
+    const LIMIT = TIMES * 3;
+    const ROUNDS = 3;
+
+    const small = try buildDivChain(frame, SMALL);
+    const large = try buildDivChain(frame, SMALL * TIMES);
+
+    var small_us: u64 = std.math.maxInt(u64);
+    var large_us: u64 = std.math.maxInt(u64);
+    for (0..ROUNDS) |_| {
+        small_us = @min(small_us, probeChain(frame, small));
+        large_us = @min(large_us, probeChain(frame, large));
+    }
+    const ratio = @as(f64, @floatFromInt(large_us)) / @as(f64, @floatFromInt(@max(small_us, 1)));
+    try testing.expect(ratio < LIMIT);
+}
+
+fn buildDivChain(frame: *Frame, depth: usize) !*Element {
+    const doc = frame.window._document;
+    // Bottom-up: appending under a deep parent walks its ancestors
+    var top = try doc.createElement("div", null, frame);
+    try top.setStyle("pointer-events: none", frame);
+    for (1..depth) |_| {
+        const div = try doc.createElement("div", null, frame);
+        _ = try div.asNode().appendChild(top.asNode(), frame);
+        top = div;
+    }
+    return top;
+}
+
+fn probeChain(frame: *Frame, top: *Element) u64 {
+    const sm = &frame._style_manager;
+    frame.styleChanged();
+    const start = lp.datetime.microTimestamp(.awake);
+    var current: ?*Element = top;
+    while (current) |el| {
+        const child = if (el.asNode().firstChild()) |c| c.as(Element) else null;
+        // only the deepest one declares it
+        std.debug.assert(sm.hasPointerEventsNone(el) == (child == null));
+        current = child;
+    }
+    return @intCast(lp.datetime.microTimestamp(.awake) - start);
 }
 
 test "StyleManager: ruleInserted: append joins the buckets without a rebuild" {

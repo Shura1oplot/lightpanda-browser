@@ -80,16 +80,39 @@ pub const Type = enum {
     pub fn toString(self: Type) []const u8 {
         return @tagName(self);
     }
+
+    // https://html.spec.whatwg.org/multipage/input.html#dom-input-value
+    pub fn valueMode(self: Type) ValueMode {
+        return switch (self) {
+            .hidden, .submit, .image, .reset, .button => .default,
+            .checkbox, .radio => .default_on,
+            .file => .filename,
+            else => .value,
+        };
+    }
+};
+
+pub const ValueMode = enum {
+    // The IDL value is the current value (_value).
+    value,
+    // The IDL value is the value content attribute, or "".
+    default,
+    // The IDL value is the value content attribute, or "on".
+    default_on,
+    filename,
 };
 
 _proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 _default_value: ?[]const u8 = null,
 _default_checked: bool = false,
 _value: ?[]const u8 = null,
+_value_dirty: bool = false, // Once set _value no longer follows the value attribute
 _checked: bool = false,
 _checked_dirty: bool = false,
 // Only user edits count for tooLong/tooShort; script and attribute values don't.
 _user_edited: bool = false,
+// The value before the user's first edit since the last change event.
+_value_before_edit: ?[]const u8 = null,
 _input_type: Type = .text,
 _indeterminate: bool = false,
 _custom_validity: ?[]const u8 = null,
@@ -100,20 +123,6 @@ _files: ?*FileList = null,
 _selection_start: u32 = 0,
 _selection_end: u32 = 0,
 _selection_direction: Selection.SelectionDirection = .none,
-
-_on_selectionchange: ?js.Function.Global = null,
-
-fn getOnSelectionChange(self: *Input) ?js.Function.Global {
-    return self._on_selectionchange;
-}
-
-fn setOnSelectionChange(self: *Input, listener: ?js.Function) !void {
-    if (listener) |listen| {
-        self._on_selectionchange = try listen.persistWithThis(self);
-    } else {
-        self._on_selectionchange = null;
-    }
-}
 
 pub fn asElement(self: *Input) *Element {
     return Factory.protoOf(self).asElement();
@@ -135,10 +144,11 @@ fn setType(self: *Input, typ: []const u8, frame: *Frame) !void {
 }
 
 pub fn getValue(self: *const Input) []const u8 {
-    if (self._input_type == .file) return "";
-    return self._value orelse self._default_value orelse switch (self._input_type) {
-        .checkbox, .radio => "on",
-        else => "",
+    return switch (self._input_type.valueMode()) {
+        .value => self._value orelse "",
+        .default => self._default_value orelse "",
+        .default_on => self._default_value orelse "on",
+        .filename => "",
     };
 }
 
@@ -151,14 +161,24 @@ pub fn getRedactedValue(self: *const Input) []const u8 {
 }
 
 pub fn setValue(self: *Input, value: []const u8, frame: *Frame) !void {
-    // File inputs: setting to empty string is a no-op, anything else throws
-    if (self._input_type == .file) {
-        if (value.len == 0) return;
-        return error.InvalidStateError;
+    switch (self._input_type.valueMode()) {
+        .value => {},
+        // The value _is_ the content attribute (no sanitization for these types)
+        .default, .default_on => {
+            self._value = null;
+            self._user_edited = false;
+            return self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(value), frame);
+        },
+        // File inputs: setting to empty string is a no-op, anything else throws
+        .filename => {
+            if (value.len == 0) return;
+            return error.InvalidStateError;
+        },
     }
-    // This should _not_ call setAttribute. It updates the current state only
+    // In value mode, this should _not_ call setAttribute. It updates the current state only
     const sanitized = try self.sanitizeValue(false, value, frame);
     const changed = std.mem.eql(u8, self.getValue(), sanitized) == false;
+    self._value_dirty = true;
     if (changed == false and self._value != null) {
         // _value itself isn't changing (not to be mixed up with setValue
         // being called with the same as the default value, which would need
@@ -173,7 +193,7 @@ pub fn setValue(self: *Input, value: []const u8, frame: *Frame) !void {
     }
 
     // move the text entry cursor position to the end of the text control
-    if (changed and self.selectionAvailable()) {
+    if (changed and self.tracksSelection()) {
         self._selection_start = @intCast(sanitized.len);
         self._selection_end = @intCast(sanitized.len);
         self._selection_direction = .none;
@@ -200,7 +220,7 @@ pub fn getChecked(self: *const Input) bool {
 pub fn setChecked(self: *Input, checked: bool, frame: *Frame) !void {
     // If checking a radio button, uncheck others in the group first
     if (checked and self._input_type == .radio) {
-        self.uncheckRadioGroup(frame);
+        self.uncheckRadioGroup();
     }
     // This should _not_ call setAttribute. It updates the current state only
     self._checked = checked;
@@ -303,7 +323,7 @@ fn replaceFiles(self: *Input, files: []const *File, frame: *Frame) !void {
     }
 
     const fl = try self.ensureFileList(frame);
-    const dupe = try frame.arena.dupe(*File, files);
+    const dupe = try frame.page_arena.dupe(*File, files);
 
     for (dupe) |file| {
         file._proto.acquireRef();
@@ -340,13 +360,13 @@ fn getValueForJS(self: *const Input, frame: *Frame) ![]const u8 {
     if (fl._files.len == 0) {
         return "";
     }
-    return try std.fmt.allocPrint(frame.local_arena, "C:\\fakepath\\{s}", .{fl._files[0]._name});
+    return try frame.local_arena.print("C:\\fakepath\\{s}", .{fl._files[0]._name});
 }
 
 fn getValidationMessage(self: *Input, frame: *Frame) []const u8 {
     if (!self.getWillValidate()) return "";
     if (self._custom_validity) |msg| return msg;
-    if (self.suffersValueMissing(frame)) return "Please fill out this field.";
+    if (self.suffersValueMissing()) return "Please fill out this field.";
     if (self.suffersTypeMismatch()) return switch (self._input_type) {
         .email => "Please enter an email address.",
         .url => "Please enter a URL.",
@@ -360,14 +380,8 @@ fn getValidationMessage(self: *Input, frame: *Frame) []const u8 {
     return "";
 }
 
-pub fn checkValidity(self: *Input, frame: *Frame) !bool {
-    if (!self.getWillValidate()) return true;
-    const v = ValidityState{ ._owner = self.asElement() };
-    if (v.getValid(frame)) return true;
-
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame.page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-    return false;
+fn checkValidity(self: *Input, frame: *Frame) !bool {
+    return ValidityState.checkValidity(self.asElement(), frame);
 }
 
 fn reportValidity(self: *Input, frame: *Frame) !bool {
@@ -387,12 +401,12 @@ pub fn hasCustomValidity(self: *const Input) bool {
     return self._custom_validity != null;
 }
 
-pub fn suffersValueMissing(self: *Input, frame: *Frame) bool {
+pub fn suffersValueMissing(self: *Input) bool {
     if (!self.getWillValidate()) return false;
     if (!self.getRequired()) return false;
     return switch (self._input_type) {
         .checkbox => !self._checked,
-        .radio => !self.radioGroupHasChecked(frame),
+        .radio => !self.radioGroupHasChecked(),
         .file => if (self._files) |fl| fl._files.len == 0 else true,
         .text, .password, .email, .url, .tel, .search, .number, .date, .time, .@"datetime-local", .month, .week, .color => blk: {
             const v = self._value orelse self._default_value orelse "";
@@ -437,8 +451,8 @@ pub fn suffersPatternMismatch(self: *const Input, frame: *Frame) bool {
     try_catch.init(&ls.local);
     defer try_catch.deinit();
 
-    const wrapped = std.fmt.allocPrint(frame.call_arena, "^(?:{s})$", .{pattern}) catch return false;
-    const re = js.RegExp.init(&ls.local, wrapped, js.RegExp.Flag.unicode_sets) catch return false;
+    const wrapped = frame.call_arena.print("^(?:{s})$", .{pattern}) catch return false;
+    const re = js.RegExp.init(&ls.local, wrapped, .{ .flags = js.RegExp.Flag.unicode_sets }) catch return false;
     const matched = re.match(value) catch return false;
 
     return !matched;
@@ -483,14 +497,14 @@ fn numericRangeBreach(self: *const Input, comptime kind: enum { underflow, overf
     };
 }
 
-fn radioGroupHasChecked(self: *Input, frame: *Frame) bool {
+fn radioGroupHasChecked(self: *Input) bool {
     if (self._checked) return true;
     var iter = self.radioGroupIterator() orelse return false;
-    const my_form = self.getForm(frame);
+    const my_form = self.getForm();
     while (iter.next()) |other| {
         if (other == self) continue;
         if (!other._checked) continue;
-        if (sameFormOwner(my_form, other, frame)) return true;
+        if (sameFormOwner(my_form, other)) return true;
     }
     return false;
 }
@@ -529,8 +543,8 @@ fn radioGroupIterator(self: *const Input) ?RadioGroupIterator {
     };
 }
 
-fn sameFormOwner(self_form: ?*Form, other: *Input, frame: *Frame) bool {
-    const other_form = other.getForm(frame);
+fn sameFormOwner(self_form: ?*Form, other: *Input) bool {
+    const other_form = other.getForm();
 
     // Check if same form context
     if (self_form == null and other_form == null) {
@@ -552,12 +566,12 @@ fn sameFormOwner(self_form: ?*Form, other: *Input, frame: *Frame) bool {
 /// the WHATWG "valid e-mail address" production loosely — sufficient for most
 /// constraint-validation tests; HTML browsers themselves are permissive here.
 fn isValidEmail(value: []const u8) bool {
-    const at = std.mem.indexOfScalar(u8, value, '@') orelse return false;
+    const at = std.mem.findScalar(u8, value, '@') orelse return false;
     if (at == 0 or at == value.len - 1) return false;
     const local = value[0..at];
     const host = value[at + 1 ..];
     for (local) |c| if (!isEmailLocalChar(c)) return false;
-    if (std.mem.indexOfScalar(u8, host, '.') == null) return false;
+    if (std.mem.findScalar(u8, host, '.') == null) return false;
     for (host) |c| if (!isEmailHostChar(c)) return false;
     if (host[0] == '.' or host[host.len - 1] == '.') return false;
     return true;
@@ -578,7 +592,7 @@ fn isEmailHostChar(c: u8) bool {
 /// Absolute URL check per the WHATWG URL parser: must include a scheme followed
 /// by "://" and a non-empty authority. Relative URLs are typeMismatches per spec.
 fn isValidAbsoluteURL(value: []const u8) bool {
-    const scheme_end = std.mem.indexOfScalar(u8, value, ':') orelse return false;
+    const scheme_end = std.mem.findScalar(u8, value, ':') orelse return false;
     if (scheme_end == 0) return false;
     if (!std.ascii.isAlphabetic(value[0])) return false;
     for (value[1..scheme_end]) |c| {
@@ -627,13 +641,28 @@ const entry = text_entry.TextEntry(Input);
 
 pub const select = entry.select;
 pub const innerInsert = entry.innerInsert;
+pub const acceptsTextEntry = entry.acceptsTextEntry;
+pub const tracksSelection = entry.tracksSelection;
 pub const innerDelete = entry.innerDelete;
 pub const moveCaret = entry.moveCaret;
+pub const caretToEnd = entry.caretToEnd;
+pub const rememberValueBeforeEdit = entry.rememberValueBeforeEdit;
+pub const dispatchChangeIfEdited = entry.dispatchChangeIfEdited;
 pub const CaretMove = entry.CaretMove;
 pub const getSelectionDirection = entry.getSelectionDirection;
 pub const setSelectionStart = entry.setSelectionStart;
 pub const setSelectionEnd = entry.setSelectionEnd;
 pub const setSelectionRange = entry.setSelectionRange;
+pub const setRangeText = entry.setRangeText;
+
+/// https://html.spec.whatwg.org/multipage/input.html#attr-input-readonly
+pub fn readonlyApplies(self: *const Input) bool {
+    return switch (self._input_type) {
+        .text, .password, .email, .url, .tel, .search, .number => true,
+        .date, .time, .@"datetime-local", .month, .week => true,
+        else => false,
+    };
+}
 
 pub fn selectionAvailable(self: *const Input) bool {
     switch (self._input_type) {
@@ -645,12 +674,12 @@ pub fn selectionAvailable(self: *const Input) bool {
 // Nullable here, unlike <textarea>'s, which is why these two aren't shared.
 fn getSelectionStart(self: *const Input) !?u32 {
     if (!self.selectionAvailable()) return null;
-    return self._selection_start;
+    return entry.selectionOffsetToJs(self, self._selection_start);
 }
 
 fn getSelectionEnd(self: *const Input) !?u32 {
     if (!self.selectionAvailable()) return null;
-    return self._selection_end;
+    return entry.selectionOffsetToJs(self, self._selection_end);
 }
 
 fn getLabels(self: *Input, frame: *Frame) !js.Array {
@@ -660,7 +689,7 @@ fn getLabels(self: *Input, frame: *Frame) !js.Array {
     return @import("Label.zig").getControlLabels(self.asElement(), frame);
 }
 
-fn getList(self: *Input, frame: *Frame) ?*HtmlElement.DataList {
+fn getList(self: *Input) ?*HtmlElement.DataList {
     switch (self._input_type) {
         .hidden, .password, .checkbox, .radio, .file, .submit, .image, .reset, .button => return null,
         else => {},
@@ -670,36 +699,12 @@ fn getList(self: *Input, frame: *Frame) ?*HtmlElement.DataList {
     const list_id = element.getAttributeSafe(comptime .wrap("list")) orelse return null;
 
     // list= resolves in the input's own tree (shadow root or document).
-    const target = frame.getElementByIdFromNode(element.asNode(), list_id) orelse return null;
+    const target = Frame.getElementByIdFromNode(element.asNode(), list_id) orelse return null;
     return target.is(HtmlElement.DataList);
 }
 
-pub fn getForm(self: *Input, frame: *Frame) ?*Form {
-    const element = self.asElement();
-
-    // If form attribute exists, ONLY use that (even if it references nothing)
-    if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
-        // form= resolves in the control's own tree (shadow root or document),
-        // not the calling realm's. @constCast: getElementByIdFromNode wants a
-        // mutable *Node but doesn't mutate it (same idiom as radioGroupIterator);
-        // keeping getForm const avoids a wide validity-path const cascade.
-        if (frame.getElementByIdFromNode(element.asNode(), form_id)) |form_element| {
-            return form_element.is(Form);
-        }
-        // form attribute present but invalid - no form owner
-        return null;
-    }
-
-    // No form attribute - traverse ancestors looking for a <form>
-    var node = element.asConstNode()._parent;
-    while (node) |n| {
-        if (n.is(Element.Html.Form)) |form| {
-            return form;
-        }
-        node = n._parent;
-    }
-
-    return null;
+pub fn getForm(self: *Input) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 // Form submission attribute overrides
@@ -748,16 +753,82 @@ fn setFormNoValidate(self: *Input, value: bool, frame: *Frame) !void {
     }
 }
 
+// https://html.spec.whatwg.org/multipage/input.html#input-type-change
+fn changeType(self: *Input, new_type: Type, frame: *Frame) !void {
+    const old_mode = self._input_type.valueMode();
+    const new_mode = new_type.valueMode();
+    // The current value, read with the old type
+    const old_value = self.getValue();
+    self._input_type = new_type;
+
+    switch (new_mode) {
+        .value => if (old_mode == .value) {
+            // Sanitize the current value according to the new type
+            if (self._value) |current_value| {
+                self._value = try self.sanitizeValue(false, current_value, frame);
+            } else {
+                try self.syncValueFromAttribute(frame);
+            }
+        } else {
+            self._value_dirty = false;
+            try self.syncValueFromAttribute(frame);
+        },
+        .default, .default_on => {
+            self._value = null;
+            if (old_mode == .value and old_value.len > 0) {
+                try self.asElement().setAttributeSafe(comptime .wrap("value"), .wrap(old_value), frame);
+            }
+        },
+        .filename => self._value = null,
+    }
+}
+
+pub fn reset(self: *Input, frame: *Frame) !void {
+    self._value_dirty = false;
+    self._checked_dirty = false;
+    self._user_edited = false;
+    self._checked = self._default_checked;
+    if (self._input_type.valueMode() == .value) {
+        try self.syncValueFromAttribute(frame);
+    }
+    if (self._files != null) {
+        try self.replaceFiles(&.{}, frame);
+    }
+    frame.styleChanged();
+}
+
+// The value of a non-dirty control in value mode is its sanitized value attribute
+fn syncValueFromAttribute(self: *Input, frame: *Frame) !void {
+    const default_value = self._default_value orelse switch (self._input_type) {
+        // These sanitize the empty string to a default (midpoint, #000000)
+        .range, .color => "",
+        else => {
+            self._value = null;
+            return;
+        },
+    };
+    self._value = try self.sanitizeValue(false, default_value, frame);
+}
+
+// A range value depends on min, max and step, so it is sanitized again when they change
+fn resanitizeRange(self: *Input, frame: *Frame) !void {
+    if (self._input_type != .range) {
+        return;
+    }
+    const current = self._value orelse return;
+    self._value = try self.sanitizeValue(false, current, frame);
+}
+
 /// Sanitize the value according to the current input type
 fn sanitizeValue(self: *Input, comptime dupe: bool, value: []const u8, frame: *Frame) ![]const u8 {
     switch (self._input_type) {
         .text, .search, .tel, .password, .url, .email => {
             const sanitized = blk: {
-                const first = std.mem.indexOfAny(u8, value, "\r\n") orelse {
+                const first = std.mem.findAny(u8, value, "\r\n") orelse {
                     break :blk if (comptime dupe) try frame.dupeString(value) else value;
                 };
 
-                var result = try frame.arena.alloc(u8, value.len);
+                var result = try frame.page_arena.alloc(u8, value.len);
                 @memcpy(result[0..first], value[0..first]);
 
                 var i: usize = first;
@@ -779,7 +850,7 @@ fn sanitizeValue(self: *Input, comptime dupe: bool, value: []const u8, frame: *F
         .month => return if (isValidMonth(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
         .week => return if (isValidWeek(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
         .time => return if (isValidTime(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
-        .@"datetime-local" => return try sanitizeDatetimeLocal(dupe, value, frame.arena),
+        .@"datetime-local" => return try sanitizeDatetimeLocal(dupe, value, frame.page_arena),
         .number => return if (isValidFloatingPoint(value)) if (comptime dupe) try frame.dupeString(value) else value else "",
         .range => {
             const value_attr = self.asConstElement().getAttributeInterned("value") orelse "";
@@ -801,7 +872,7 @@ fn sanitizeValue(self: *Input, comptime dupe: bool, value: []const u8, frame: *F
                 }
 
                 // Normalize to lowercase per spec
-                const result = try frame.arena.alloc(u8, 7);
+                const result = try frame.page_arena.alloc(u8, 7);
                 result[0] = '#';
                 for (value[1..], 1..) |c, j| {
                     result[j] = std.ascii.toLower(c);
@@ -950,7 +1021,7 @@ fn valueToNumber(typ: Type, value: []const u8) ?f64 {
             return timeToMs(value);
         },
         .@"datetime-local" => {
-            const sep = std.mem.indexOfAny(u8, value, "T ") orelse return null;
+            const sep = std.mem.findAny(u8, value, "T ") orelse return null;
             const date = value[0..sep];
             const time = value[sep + 1 ..];
             if (!isValidDate(date) or !isValidTime(time)) return null;
@@ -963,7 +1034,7 @@ fn valueToNumber(typ: Type, value: []const u8) ?f64 {
 fn numberToValue(typ: Type, number: f64, buf: []u8) ?[]const u8 {
     if (std.math.isNan(number) or @abs(number) > max_time_value) return null;
     switch (typ) {
-        .number, .range => return std.fmt.bufPrint(buf, "{d}", .{number}) catch null,
+        .number, .range => return std.mem.print(buf, "{d}", .{number}) catch null,
         .date => {
             const days: i64 = @floor(number / ms_per_day);
             return formatDate(civilFromDays(days), buf);
@@ -972,7 +1043,7 @@ fn numberToValue(typ: Type, number: f64, buf: []u8) ?[]const u8 {
             const months: i64 = @floor(number);
             const year = 1970 + @divFloor(months, 12);
             if (year < 1) return null;
-            return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}", .{ @as(u64, @intCast(year)), @as(u64, @intCast(@mod(months, 12) + 1)) }) catch null;
+            return std.mem.print(buf, "{d:0>4}-{d:0>2}", .{ @as(u64, @intCast(year)), @as(u64, @intCast(@mod(months, 12) + 1)) }) catch null;
         },
         .week => {
             const days: i64 = @floor(number / ms_per_day);
@@ -981,7 +1052,7 @@ fn numberToValue(typ: Type, number: f64, buf: []u8) ?[]const u8 {
             const year = civilFromDays(thursday).year;
             if (year < 1) return null;
             const week = @divFloor(thursday - isoWeekMonday(year, 1), 7) + 1;
-            return std.fmt.bufPrint(buf, "{d:0>4}-W{d:0>2}", .{ @as(u64, @intCast(year)), @as(u64, @intCast(week)) }) catch null;
+            return std.mem.print(buf, "{d:0>4}-W{d:0>2}", .{ @as(u64, @intCast(year)), @as(u64, @intCast(week)) }) catch null;
         },
         .time => return formatTime(@mod(number, ms_per_day), buf),
         .@"datetime-local" => {
@@ -1031,7 +1102,7 @@ const Civil = struct { year: i64, month: i64, day: i64 };
 
 fn formatDate(civil: Civil, buf: []u8) ?[]const u8 {
     if (civil.year < 1) return null;
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(civil.year)), @as(u64, @intCast(civil.month)), @as(u64, @intCast(civil.day)) }) catch null;
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ @as(u64, @intCast(civil.year)), @as(u64, @intCast(civil.month)), @as(u64, @intCast(civil.day)) }) catch null;
 }
 
 /// Normalized time string: seconds only when needed, fraction always 3 digits.
@@ -1042,12 +1113,12 @@ fn formatTime(ms_in_day: f64, buf: []u8) ?[]const u8 {
     const second = (total / 1000) % 60;
     const millis = total % 1000;
     if (second == 0 and millis == 0) {
-        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hour, minute }) catch null;
+        return std.mem.print(buf, "{d:0>2}:{d:0>2}", .{ hour, minute }) catch null;
     }
     if (millis == 0) {
-        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch null;
+        return std.mem.print(buf, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch null;
     }
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ hour, minute, second, millis }) catch null;
+    return std.mem.print(buf, "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{ hour, minute, second, millis }) catch null;
 }
 
 // Howard Hinnant's civil-from-days and days-from-civil.
@@ -1310,7 +1381,7 @@ fn sanitizeRange(
         0;
 
     if (!isValidFloatingPoint(value)) {
-        return try formatFloat(frame.arena, snapToStep(min + (max - min) / 2, min, max, step_base, step_attr));
+        return try formatFloat(frame.page_arena, snapToStep(min + (max - min) / 2, min, max, step_base, step_attr));
     }
 
     const v0 = std.fmt.parseFloat(f64, value) catch unreachable; // grammar already validated
@@ -1323,7 +1394,7 @@ fn sanitizeRange(
         // assignments like `el.value = "1.0"` round-trip without canonicalizing.
         return if (comptime dupe) try frame.dupeString(value) else value;
     }
-    return try formatFloat(frame.arena, snapped);
+    return try formatFloat(frame.page_arena, snapped);
 }
 
 /// Snap `value` (already clamped to `[min, max]`) to the nearest value on the
@@ -1361,7 +1432,7 @@ fn snapToStep(value: f64, min: f64, max: f64, step_base: f64, step_attr: []const
 
 /// Format an f64 to its shortest decimal representation, arena-allocated.
 fn formatFloat(arena: std.mem.Allocator, value: f64) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{d}", .{value});
+    return arena.print("{d}", .{value});
 }
 
 /// Parse a slice that must be ALL ASCII digits into a u32. Returns null if any non-digit or empty.
@@ -1399,18 +1470,18 @@ fn maxWeeksInYear(year: u32) u32 {
     return 52;
 }
 
-fn uncheckRadioGroup(self: *Input, frame: *Frame) void {
+fn uncheckRadioGroup(self: *Input) void {
     var iter = self.radioGroupIterator() orelse return;
-    const my_form = self.getForm(frame);
+    const my_form = self.getForm();
     while (iter.next()) |other| {
         if (other == self) continue;
-        if (!sameFormOwner(my_form, other, frame)) continue;
+        if (!sameFormOwner(my_form, other)) continue;
         other._checked = false;
     }
 }
 
-fn getPopoverTargetElement(self: *Input, frame: *Frame) ?*Element {
-    return popover.invokerTarget(self.asNode(), self._popover_target, frame);
+fn getPopoverTargetElement(self: *Input) ?*Element {
+    return popover.invokerTarget(self.asNode(), self._popover_target);
 }
 
 fn setPopoverTargetElement(self: *Input, value: ?*Element, frame: *Frame) !void {
@@ -1451,7 +1522,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLInputElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1468,7 +1538,6 @@ pub const JsApi = struct {
         return self.setValue(try js_value.toZig([]const u8), frame);
     }
 
-    pub const onselectionchange = bridge.accessor(Input.getOnSelectionChange, Input.setOnSelectionChange, .{});
     pub const @"type" = bridge.accessor(Input.getType, Input.setType, .{ .ce_reactions = true });
     pub const value = bridge.accessor(Input.getValueForJS, setValueFromJS, .{ .ce_reactions = true });
     pub const valueAsNumber = bridge.accessor(Input.getValueAsNumber, Input.setValueAsNumber, .{});
@@ -1519,6 +1588,7 @@ pub const JsApi = struct {
     pub const selectionEnd = bridge.accessor(Input.getSelectionEnd, Input.setSelectionEnd, .{});
     pub const selectionDirection = bridge.accessor(Input.getSelectionDirection, null, .{});
     pub const setSelectionRange = bridge.function(Input.setSelectionRange, .{});
+    pub const setRangeText = bridge.function(Input.setRangeText, .{});
 };
 
 pub const Build = struct {
@@ -1538,34 +1608,31 @@ pub const Build = struct {
             .text;
 
         // Sanitize initial value per input type (e.g. date rejects "invalid-date").
-        if (self._default_value) |dv| {
-            self._value = try self.sanitizeValue(false, dv, frame);
+        // Outside the value mode, the value is read from the attribute.
+        if (self._input_type.valueMode() == .value) {
+            try self.syncValueFromAttribute(frame);
         } else {
             self._value = null;
         }
 
         // If this is a checked radio button, uncheck others in its group
         if (self._checked and self._input_type == .radio) {
-            self.uncheckRadioGroup(frame);
+            self.uncheckRadioGroup();
         }
     }
 
     pub fn attributeChange(element: *Element, name: String, value: String, frame: *Frame) !void {
-        const attribute = std.meta.stringToEnum(enum { type, value, checked }, name.str()) orelse return;
+        const attribute = std.meta.stringToEnum(enum { type, value, checked, min, max, step }, name.str()) orelse return;
         const self = element.as(Input);
         switch (attribute) {
-            .type => {
-                self._input_type = Type.fromString(value.str());
-                // Sanitize the current value according to the new type
-                if (self._value) |current_value| {
-                    self._value = try self.sanitizeValue(false, current_value, frame);
-                    // Apply default value for checkbox/radio if value is now empty
-                    if (self._value.?.len == 0 and (self._input_type == .checkbox or self._input_type == .radio)) {
-                        self._value = "on";
-                    }
+            .type => try self.changeType(Type.fromString(value.str()), frame),
+            .min, .max, .step => try self.resanitizeRange(frame),
+            .value => {
+                self._default_value = try frame.page_arena.dupe(u8, value.str());
+                if (self._value_dirty == false and self._input_type.valueMode() == .value) {
+                    try self.syncValueFromAttribute(frame);
                 }
             },
-            .value => self._default_value = try frame.arena.dupe(u8, value.str()),
             .checked => {
                 self._default_checked = true;
                 // Only update checked state if it hasn't been manually modified
@@ -1573,19 +1640,25 @@ pub const Build = struct {
                     self._checked = true;
                     // If setting a radio button to checked, uncheck others in the group
                     if (self._input_type == .radio) {
-                        self.uncheckRadioGroup(frame);
+                        self.uncheckRadioGroup();
                     }
                 }
             },
         }
     }
 
-    pub fn attributeRemove(element: *Element, name: String, _: *Frame) !void {
-        const attribute = std.meta.stringToEnum(enum { type, value, checked }, name.str()) orelse return;
+    pub fn attributeRemove(element: *Element, name: String, frame: *Frame) !void {
+        const attribute = std.meta.stringToEnum(enum { type, value, checked, min, max, step }, name.str()) orelse return;
         const self = element.as(Input);
         switch (attribute) {
-            .type => self._input_type = .text,
-            .value => self._default_value = null,
+            .type => try self.changeType(.text, frame),
+            .min, .max, .step => try self.resanitizeRange(frame),
+            .value => {
+                self._default_value = null;
+                if (self._value_dirty == false and self._input_type.valueMode() == .value) {
+                    try self.syncValueFromAttribute(frame);
+                }
+            },
             .checked => {
                 self._default_checked = false;
                 // Only update checked state if it hasn't been manually modified
@@ -1603,6 +1676,7 @@ pub const Build = struct {
 
         // Copy runtime state from source to clone
         clone._value = source._value;
+        clone._value_dirty = source._value_dirty;
         clone._checked = source._checked;
         clone._checked_dirty = source._checked_dirty;
         clone._user_edited = source._user_edited;
@@ -1623,6 +1697,7 @@ test "WebApi: HTML.Input" {
     try testing.htmlRunner("element/html/input-validity.html", .{});
     try testing.htmlRunner("element/html/input_file.html", .{});
     try testing.htmlRunner("element/html/input-value-as.html", .{});
+    try testing.htmlRunner("element/html/input-value-mode.html", .{});
 }
 
 test "isValidFloatingPoint" {

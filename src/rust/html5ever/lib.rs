@@ -38,7 +38,6 @@ pub extern "C" fn html5ever_parse_document(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -67,7 +66,6 @@ pub extern "C" fn html5ever_parse_document(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -101,7 +99,6 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -141,7 +138,6 @@ pub extern "C" fn html5ever_parse_document_with_encoding(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -281,14 +277,15 @@ pub extern "C" fn encoding_decode(
 
 use encoding_rs::Decoder;
 
-/// Create a streaming decoder that maintains state across calls
+/// Create a streaming decoder that maintains state across calls.
+/// It does no BOM sniffing: a BOM decodes to U+FEFF, as TextDecoder needs.
 #[no_mangle]
 pub extern "C" fn encoding_decoder_new(handle: *const c_void) -> *mut c_void {
     if handle.is_null() {
         return std::ptr::null_mut();
     }
     let encoding: &'static Encoding = unsafe { &*(handle as *const Encoding) };
-    let decoder = Box::new(encoding.new_decoder());
+    let decoder = Box::new(encoding.new_decoder_without_bom_handling());
     Box::into_raw(decoder) as *mut c_void
 }
 
@@ -455,17 +452,41 @@ pub extern "C" fn encoding_max_encode_buffer_length(
         .unwrap_or(input_len * 10)
 }
 
+/// Looks `name` (an HTML named character reference without its leading '&')
+/// up in html5ever's table. Returns 0 when no reference starts with `name`, 1
+/// when `name` is only a prefix of one, and 2 for a full reference, whose
+/// codepoints are written to `out` (the second is 0 for single-codepoint ones).
+#[no_mangle]
+pub extern "C" fn html5ever_named_character_reference(
+    name: *const c_uchar,
+    len: usize,
+    out: *mut [u32; 2],
+) -> u8 {
+    let bytes = unsafe { std::slice::from_raw_parts(name, len) };
+    let Ok(name) = std::str::from_utf8(bytes) else {
+        return 0;
+    };
+    match html5ever::data::NAMED_ENTITIES.get(name) {
+        None => 0,
+        Some(&(0, _)) => 1,
+        Some(&(c1, c2)) => {
+            unsafe { *out = [c1, c2] };
+            2
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn html5ever_parse_fragment(
     html: *mut c_uchar,
     len: usize,
     context_name: *const c_uchar,
     context_name_len: usize,
+    context_ns: u8,
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
     create_context_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -494,7 +515,6 @@ pub extern "C" fn html5ever_parse_fragment(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -536,7 +556,14 @@ pub extern "C" fn html5ever_parse_fragment(
         ..Default::default()
     };
 
-    let context_qname = QualName::new(None, ns!(html), context_local);
+    // An svg or math context makes the fragment foreign content, so e.g.
+    // <symbol> lands in the SVG namespace (0: html, 1: svg, 2: mathml).
+    let context_namespace = match context_ns {
+        1 => ns!(svg),
+        2 => ns!(mathml),
+        _ => ns!(html),
+    };
+    let context_qname = QualName::new(None, context_namespace, context_local);
     let context_data = arena.alloc(sink::ElementData {
         qname: context_qname.clone(),
         mathml_annotation_xml_integration_point: false,
@@ -606,7 +633,6 @@ pub extern "C" fn html5ever_streaming_parser_create(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -637,7 +663,6 @@ pub extern "C" fn html5ever_streaming_parser_create(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -739,7 +764,6 @@ pub extern "C" fn xml5ever_parse_document(
     document: Ref,
     ctx: Ref,
     create_element_callback: CreateElementCallback,
-    get_data_callback: GetDataCallback,
     append_callback: AppendCallback,
     parse_error_callback: ParseErrorCallback,
     pop_callback: PopCallback,
@@ -768,7 +792,6 @@ pub extern "C" fn xml5ever_parse_document(
         quirks_mode: Cell::new(QuirksMode::NoQuirks),
         pop_callback: pop_callback,
         append_callback: append_callback,
-        get_data_callback: get_data_callback,
         parse_error_callback: parse_error_callback,
         create_element_callback: create_element_callback,
         create_comment_callback: create_comment_callback,
@@ -799,6 +822,140 @@ pub extern "C" fn xml5ever_parse_document(
         input_buffer: Default::default(),
     })
     .one(&*bytes);
+}
+
+// Runs xml5ever over `xml` without building a tree, reporting every error
+// through `parse_error_callback`, so the caller can decide between the XML
+// and HTML parsers before any node is created (or script run).
+#[no_mangle]
+pub extern "C" fn xml5ever_validate_document(
+    xml: *mut c_uchar,
+    len: usize,
+    ctx: Ref,
+    parse_error_callback: ParseErrorCallback,
+) -> () {
+    if xml.is_null() || len == 0 {
+        return ();
+    }
+
+    let sink = ValidateSink {
+        ctx: ctx,
+        parse_error_callback: parse_error_callback,
+        names: std::cell::RefCell::new(Vec::new()),
+    };
+
+    let bytes = unsafe { std::slice::from_raw_parts(xml, len) };
+    let bytes = strip_doctype_internal_subset(bytes);
+    let tb = xml5ever::tree_builder::XmlTreeBuilder::new(sink, Default::default());
+    let tokenizer = xml5ever::tokenizer::XmlTokenizer::new(
+        UnclosedTagSink {
+            tb,
+            depth: Cell::new(0),
+        },
+        Default::default(),
+    );
+    html5ever::tendril::stream::Utf8LossyDecoder::new(XmlDocumentParser {
+        tokenizer,
+        input_buffer: Default::default(),
+    })
+    .one(&*bytes);
+}
+
+// A TreeSink that only keeps what the tree builder queries back: element
+// names, so end tags can be matched. A handle is an index into `names`; the
+// document and non-element nodes share index 0.
+struct ValidateSink {
+    ctx: Ref,
+    parse_error_callback: ParseErrorCallback,
+    names: std::cell::RefCell<Vec<QualName>>,
+}
+
+impl xml5ever::tree_builder::TreeSink for ValidateSink {
+    type Handle = usize;
+    type Output = ();
+    type ElemName<'a> = std::cell::Ref<'a, QualName>;
+
+    fn finish(self) -> () {}
+
+    fn parse_error(&self, err: std::borrow::Cow<'static, str>) {
+        unsafe {
+            (self.parse_error_callback)(
+                self.ctx,
+                StringSlice {
+                    ptr: err.as_ptr(),
+                    len: err.len(),
+                },
+            );
+        }
+    }
+
+    fn get_document(&self) -> usize {
+        0
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a usize) -> Self::ElemName<'a> {
+        std::cell::Ref::map(self.names.borrow(), |names| &names[*target - 1])
+    }
+
+    fn create_element(
+        &self,
+        name: QualName,
+        _attrs: Vec<html5ever::Attribute>,
+        _flags: html5ever::interface::ElementFlags,
+    ) -> usize {
+        let mut names = self.names.borrow_mut();
+        names.push(name);
+        names.len()
+    }
+
+    fn create_comment(&self, _text: StrTendril) -> usize {
+        0
+    }
+
+    fn create_pi(&self, _target: StrTendril, _data: StrTendril) -> usize {
+        0
+    }
+
+    fn append(&self, _parent: &usize, _child: html5ever::interface::NodeOrText<usize>) {}
+
+    fn append_based_on_parent_node(
+        &self,
+        _element: &usize,
+        _prev_element: &usize,
+        _child: html5ever::interface::NodeOrText<usize>,
+    ) {
+    }
+
+    fn append_doctype_to_document(
+        &self,
+        _name: StrTendril,
+        _public_id: StrTendril,
+        _system_id: StrTendril,
+    ) {
+    }
+
+    fn get_template_contents(&self, target: &usize) -> usize {
+        *target
+    }
+
+    fn same_node(&self, x: &usize, y: &usize) -> bool {
+        x == y
+    }
+
+    fn set_quirks_mode(&self, _mode: QuirksMode) {}
+
+    fn append_before_sibling(
+        &self,
+        _sibling: &usize,
+        _new_node: html5ever::interface::NodeOrText<usize>,
+    ) {
+    }
+
+    fn add_attrs_if_missing(&self, _target: &usize, _attrs: Vec<html5ever::Attribute>) {}
+
+    fn remove_from_parent(&self, _target: &usize) {}
+
+    fn reparent_children(&self, _node: &usize, _new_parent: &usize) {}
 }
 
 // xml5ever's tokenizer has no notion of a DOCTYPE internal subset
@@ -845,18 +1002,20 @@ fn strip_doctype_internal_subset(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 // (`<root><a>text`) parses "cleanly". Browsers reject it. This sits between
 // the tokenizer and the tree builder, tracks tag nesting from the raw token
 // stream, and reports an error when EOF arrives with tags still open.
-struct UnclosedTagSink<'arena> {
-    tb: xml5ever::tree_builder::XmlTreeBuilder<Ref, sink::Sink<'arena>>,
+struct UnclosedTagSink<H: Clone, S: xml5ever::tree_builder::TreeSink<Handle = H>> {
+    tb: xml5ever::tree_builder::XmlTreeBuilder<H, S>,
     depth: Cell<u32>,
 }
 
-impl<'arena> xml5ever::tokenizer::TokenSink for UnclosedTagSink<'arena> {
-    type Handle = Ref;
+impl<H: Clone, S: xml5ever::tree_builder::TreeSink<Handle = H>> xml5ever::tokenizer::TokenSink
+    for UnclosedTagSink<H, S>
+{
+    type Handle = H;
 
     fn process_token(
         &self,
         token: xml5ever::tokenizer::Token,
-    ) -> xml5ever::tokenizer::ProcessResult<Ref> {
+    ) -> xml5ever::tokenizer::ProcessResult<H> {
         use xml5ever::tokenizer::{TagKind, Token};
         match &token {
             Token::Tag(tag) => match tag.kind {
@@ -868,11 +1027,20 @@ impl<'arena> xml5ever::tokenizer::TokenSink for UnclosedTagSink<'arena> {
             },
             Token::EndOfFile => {
                 if self.depth.get() > 0 {
-                    use xml5ever::tree_builder::TreeSink;
                     self.tb
                         .sink
                         .parse_error(std::borrow::Cow::Borrowed("Unclosed element at EOF"));
                 }
+            }
+            // The XML declaration isn't a processing instruction, so no node
+            // is created for it. xml5ever doesn't validate it.
+            Token::ProcessingInstruction(pi) if &*pi.target == "xml" => {
+                if !is_valid_xml_declaration(&pi.data) {
+                    self.tb
+                        .sink
+                        .parse_error(std::borrow::Cow::Borrowed("Invalid XML declaration"));
+                }
+                return xml5ever::tokenizer::ProcessResult::Continue;
             }
             _ => {}
         }
@@ -884,14 +1052,40 @@ impl<'arena> xml5ever::tokenizer::TokenSink for UnclosedTagSink<'arena> {
     }
 }
 
+// The declaration must start with `version="1.x"`: browsers accept any 1.x
+// (XML 1.0 5th edition's VersionNum is `1.[0-9]+`) and reject everything else.
+fn is_valid_xml_declaration(data: &str) -> bool {
+    fn trim(s: &str) -> &str {
+        s.trim_start_matches([' ', '\t', '\r', '\n'])
+    }
+    let Some(rest) = trim(data).strip_prefix("version").map(trim) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('=').map(trim) else {
+        return false;
+    };
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    let Some((version, _)) = rest[1..].split_once(quote) else {
+        return false;
+    };
+    match version.strip_prefix("1.") {
+        Some(minor) => !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 // xml5ever::driver::XmlParser, minus the tree-builder-typed tokenizer so the
 // UnclosedTagSink can sit in between.
-struct XmlDocumentParser<'arena> {
-    tokenizer: xml5ever::tokenizer::XmlTokenizer<UnclosedTagSink<'arena>>,
+struct XmlDocumentParser<H: Clone, S: xml5ever::tree_builder::TreeSink<Handle = H>> {
+    tokenizer: xml5ever::tokenizer::XmlTokenizer<UnclosedTagSink<H, S>>,
     input_buffer: xml5ever::buffer_queue::BufferQueue,
 }
 
-impl<'arena> TendrilSink<html5ever::tendril::fmt::UTF8> for XmlDocumentParser<'arena> {
+impl<H: Clone, S: xml5ever::tree_builder::TreeSink<Handle = H>>
+    TendrilSink<html5ever::tendril::fmt::UTF8> for XmlDocumentParser<H, S>
+{
     type Output = ();
 
     fn process(&mut self, t: StrTendril) {
@@ -900,7 +1094,6 @@ impl<'arena> TendrilSink<html5ever::tendril::fmt::UTF8> for XmlDocumentParser<'a
     }
 
     fn error(&mut self, desc: std::borrow::Cow<'static, str>) {
-        use xml5ever::tree_builder::TreeSink;
         self.tokenizer.sink.tb.sink.parse_error(desc)
     }
 

@@ -61,6 +61,11 @@ pub const Algorithm = struct {
     name: []const u8,
     hash: ?[]const u8 = null,
     named_curve: ?[]const u8 = null,
+    modulus_length: ?u32 = null,
+    /// HMAC: the key's length in bits, which needn't fill its last byte.
+    length: ?u32 = null,
+    /// RSA: big-endian, duped into the key's arena by init.
+    public_exponent: ?[]const u8 = null,
 };
 
 /// https://developer.mozilla.org/en-US/docs/Web/API/CryptoKeyPair
@@ -72,7 +77,7 @@ pub const Pair = struct {
 /// Key-creating functions expect this format.
 pub const KeyOrPair = union(enum) { key: *CryptoKey, pair: Pair };
 
-pub const Type = enum(u8) { hmac, rsa, x25519, aes, derive, ec };
+pub const Type = enum(u8) { hmac, rsa, x25519, aes, derive, ec, ed25519 };
 
 pub const Kind = enum {
     secret,
@@ -99,7 +104,7 @@ pub const Usages = struct {
 };
 
 /// Copies `key` into an owned pooled arena, duping the caller-provided
-/// slices (`_key`, `_algorithm.hash`). `_algorithm.name` and `_named_curve`
+/// slices (`_key`, `_algorithm.hash`, `_algorithm.public_exponent`). `_algorithm.name` and `_named_curve`
 /// are expected to be static strings. Takes ownership of `_vary.pkey`.
 pub fn init(exec: *const Execution, key: CryptoKey) !*CryptoKey {
     const arena = try exec.getArena(.tiny, "CryptoKey");
@@ -111,6 +116,9 @@ pub fn init(exec: *const Execution, key: CryptoKey) !*CryptoKey {
     self._key = try arena.dupe(u8, key._key);
     if (key._algorithm.hash) |hash| {
         self._algorithm.hash = try arena.dupe(u8, hash);
+    }
+    if (key._algorithm.public_exponent) |exponent| {
+        self._algorithm.public_exponent = try arena.dupe(u8, exponent);
     }
     return self;
 }
@@ -129,22 +137,6 @@ pub fn releaseRef(self: *CryptoKey, page: *Page) void {
 
 pub fn acquireRef(self: *CryptoKey) void {
     self._rc.acquire();
-}
-
-pub fn canEncrypt(self: *const CryptoKey) bool {
-    return self._usages & Usages.encrypt != 0;
-}
-
-pub fn canDecrypt(self: *const CryptoKey) bool {
-    return self._usages & Usages.decrypt != 0;
-}
-
-pub fn canSign(self: *const CryptoKey) bool {
-    return self._usages & Usages.sign != 0;
-}
-
-pub fn canVerify(self: *const CryptoKey) bool {
-    return self._usages & Usages.verify != 0;
 }
 
 pub fn canDeriveBits(self: *const CryptoKey) bool {
@@ -178,27 +170,40 @@ pub fn getExtractable(self: *const CryptoKey) bool {
 }
 
 /// The shape of the `.algorithm` dictionary depends on the algorithm. AES and
-/// HMAC expose a `length` (in bits, derived from the key material); HMAC also
-/// exposes a nested `hash`.
+/// HMAC expose a `length` in bits (AES's from the key material, HMAC's as
+/// stored, since it needn't fill the last byte); HMAC also exposes a nested
+/// `hash`.
 const AlgorithmReport = union(enum) {
     keyed: struct { name: []const u8, length: u32 },
     hmac: struct { name: []const u8, length: u32, hash: struct { name: []const u8 } },
     ec: struct { name: []const u8, namedCurve: []const u8 },
+    rsa: struct {
+        name: []const u8,
+        hash: struct { name: []const u8 },
+        modulusLength: u32,
+        publicExponent: js.TypedArray(u8),
+    },
     named: struct { name: []const u8 },
 };
 
 pub fn getAlgorithm(self: *const CryptoKey) AlgorithmReport {
-    const length: u32 = @intCast(self._key.len * 8);
     return switch (self._type) {
-        .aes => .{ .keyed = .{ .name = self._algorithm.name, .length = length } },
+        // AES keys are 16, 24 or 32 bytes.
+        .aes => .{ .keyed = .{ .name = self._algorithm.name, .length = @intCast(self._key.len * 8) } },
         .hmac => .{ .hmac = .{
             .name = self._algorithm.name,
-            .length = length,
+            .length = self._algorithm.length orelse 0,
             .hash = .{ .name = self._algorithm.hash orelse "" },
         } },
         .ec => .{ .ec = .{
             .name = self._algorithm.name,
             .namedCurve = self._algorithm.named_curve orelse "",
+        } },
+        .rsa => .{ .rsa = .{
+            .name = self._algorithm.name,
+            .hash = .{ .name = self._algorithm.hash orelse "" },
+            .modulusLength = self._algorithm.modulus_length orelse 0,
+            .publicExponent = .{ .values = self._algorithm.public_exponent orelse "" },
         } },
         else => .{ .named = .{ .name = self._algorithm.name } },
     };
@@ -237,11 +242,12 @@ pub const JsApi = struct {
         pub const name = "CryptoKey";
 
         pub var class_id: bridge.ClassId = undefined;
-        pub const prototype_chain = bridge.prototypeChain();
     };
 
     pub const @"type" = bridge.accessor(CryptoKey.getType, null, .{});
     pub const extractable = bridge.accessor(CryptoKey.getExtractable, null, .{});
-    pub const algorithm = bridge.accessor(CryptoKey.getAlgorithm, null, .{});
-    pub const usages = bridge.accessor(CryptoKey.getUsages, null, .{});
+    // Each returns its cached object: the same one on every read, as the
+    // spec's [[algorithm_cached]] and [[usages_cached]] slots are.
+    pub const algorithm = bridge.accessor(CryptoKey.getAlgorithm, null, .{ .cache = .{ .private = "crypto_key_algorithm" } });
+    pub const usages = bridge.accessor(CryptoKey.getUsages, null, .{ .cache = .{ .private = "crypto_key_usages" } });
 };

@@ -68,7 +68,7 @@ pub fn getType(self: *const CSSRule) u16 {
         // `@layer` rules postdate the legacy numeric type constants, so
         // their `type` is 0 (CSSOM §6.4.1) — same as unknown at-rules.
         .layer, .unknown => 0,
-        else => @as(u16, @intFromEnum(std.meta.activeTag(self._type))) + 1,
+        else => @as(u16, @backingInt(std.meta.activeTag(self._type))) + 1,
     };
 }
 
@@ -90,7 +90,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "CSSRule";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

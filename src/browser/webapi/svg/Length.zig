@@ -23,6 +23,7 @@ const js = @import("../../js/js.zig");
 const Frame = @import("../../Frame.zig");
 const Page = @import("../../Page.zig");
 const units = @import("../../css/units.zig");
+const StyleManager = @import("../../StyleManager.zig");
 const Element = @import("../Element.zig");
 
 const String = lp.String;
@@ -105,7 +106,7 @@ pub fn reflectedConfigured(
 
 fn getUnitType(self: *Length) u16 {
     self.syncFromAttribute();
-    return @intFromEnum(self._unit);
+    return @backingInt(self._unit);
 }
 
 // An attribute SVG could not parse reports the unknown unit type. Callers that
@@ -217,7 +218,7 @@ fn writeBack(self: *Length, frame: *Frame) !void {
 }
 
 fn serialize(self: *const Length, frame: *Frame) ![]const u8 {
-    return std.fmt.allocPrint(frame.local_arena, "{d}{s}", .{ self._value, units.suffix(toShared(self._unit)) });
+    return frame.local_arena.print("{d}{s}", .{ self._value, units.suffix(toShared(self._unit)) });
 }
 
 fn unitToUserUnits(self: *const Length, unit: Unit, frame: *Frame) f64 {
@@ -298,12 +299,12 @@ fn resolveParsedLength(parsed: Parsed, element: *Element, direction: Direction, 
 }
 
 fn fontSize(self: *const Length, frame: *Frame) f64 {
-    const element = self._element orelse return frame._style_manager.computedFontSize(null);
+    const element = self._element orelse return StyleManager.DEFAULT_FONT_SIZE;
     return elementFontSize(element, frame);
 }
 
 fn elementFontSize(element: *Element, frame: *Frame) f64 {
-    const owner = element.ownerFrame(frame) orelse return frame._style_manager.computedFontSize(null);
+    const owner = element.ownerFrame(frame) orelse return StyleManager.DEFAULT_FONT_SIZE;
     return owner._style_manager.computedFontSize(element);
 }
 
@@ -330,7 +331,7 @@ fn fromShared(unit: units.Unit) ?Unit {
         .in => .in,
         .pt => .pt,
         .pc => .pc,
-        .vh, .vw, .deg, .rad, .grad, .turn => null,
+        .rem, .vh, .vw, .deg, .rad, .grad, .turn => null,
     };
 }
 
@@ -370,7 +371,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "SVGLength";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

@@ -28,6 +28,7 @@ const DOMTokenList = @import("../../collections.zig").DOMTokenList;
 
 const HtmlElement = @import("../Html.zig");
 
+const String = lp.String;
 const Link = @This();
 
 pub const Proto = HtmlElement;
@@ -38,6 +39,10 @@ _proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 // old rules are dropped instead of accumulating in `document.styleSheets`.
 // Mirrors `Style._sheet`.
 _sheet: ?*@import("../../css/CSSStyleSheet.zig") = null,
+// Bumped each time the link is (re)processed or disconnected. A queued
+// load/error from an earlier pass no longer matches and is dropped.
+_generation: u32 = 0,
+_processed_rel: []const u8 = "",
 
 pub fn asElement(self: *Link) *Element {
     return Factory.protoOf(self).asElement();
@@ -61,10 +66,6 @@ pub fn getHref(self: *Link, frame: *Frame) ![]const u8 {
 pub fn setHref(self: *Link, value: []const u8, frame: *Frame) !void {
     const element = self.asElement();
     try element.setAttributeSafe(comptime .wrap("href"), .wrap(value), frame);
-
-    if (element.asNode().isConnected()) {
-        try self.linkAddedCallback(frame);
-    }
 }
 
 fn getRel(self: *Link) []const u8 {
@@ -91,6 +92,11 @@ fn getSizes(self: *Link, frame: *Frame) !?*DOMTokenList {
     return element.getTokenList(.sizes, frame);
 }
 
+fn setSizes(self: *Link, value: String, frame: *Frame) !void {
+    const list = try self.getSizes(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 pub fn getRelList(self: *Link, frame: *Frame) !?*DOMTokenList {
     const element = self.asElement();
     // relList is only valid for HTML <link> elements, not SVG or MathML
@@ -100,13 +106,20 @@ pub fn getRelList(self: *Link, frame: *Frame) !?*DOMTokenList {
     return element.getRelList(frame);
 }
 
+fn setRelList(self: *Link, value: String, frame: *Frame) !void {
+    const list = try self.getRelList(frame) orelse return;
+    try list.setValue(value, frame);
+}
+
 pub fn linkAddedCallback(self: *Link, frame: *Frame) !void {
+    self._generation +%= 1;
     // if we're planning on navigating to another frame, don't trigger load event.
     if (frame.isGoingAway()) {
         return;
     }
 
     const element = self.asElement();
+    self._processed_rel = element.getAttributeInterned("rel") orelse "";
 
     // A document without a browsing context (DOMParser et al.) loads nothing.
     if (element.getDocument(frame)._frame == null) {
@@ -157,7 +170,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLLinkElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -176,8 +188,8 @@ pub const JsApi = struct {
     pub const @"type" = reflect.string("type");
     pub const rev = reflect.string("rev");
     pub const target = reflect.string("target");
-    pub const relList = bridge.accessor(Link.getRelList, null, .{ .null_as_undefined = true });
-    pub const sizes = bridge.accessor(Link.getSizes, null, .{ .null_as_undefined = true });
+    pub const relList = bridge.accessor(Link.getRelList, Link.setRelList, .{ .null_as_undefined = true, .ce_reactions = true });
+    pub const sizes = bridge.accessor(Link.getSizes, Link.setSizes, .{ .null_as_undefined = true, .ce_reactions = true });
 };
 
 // Parser-created <link> elements are void (no closing tag) so they never
@@ -185,6 +197,24 @@ pub const JsApi = struct {
 // links in HTML go through `linkAddedCallback` at element-create time,
 // with attributes already populated by `populateElementAttributes`.
 pub const Build = struct {
+    pub fn attributeChange(element: *Element, name: String, value: String, frame: *Frame) !void {
+        const link = element.as(Link);
+        const is_rel = name.eql(comptime .wrap("rel"));
+        if (!is_rel and !name.eql(comptime .wrap("href"))) return;
+        if (is_rel and std.mem.eql(u8, value.str(), link._processed_rel)) return;
+        if (element.asNode().isConnected()) {
+            try link.linkAddedCallback(element.ownerFrame(frame) orelse return);
+        }
+    }
+
+    pub fn attributeRemove(element: *Element, name: String, frame: *Frame) !void {
+        try attributeChange(element, name, .wrap(""), frame);
+    }
+
+    pub fn disconnected(element: *Element, _: *Frame) !void {
+        element.as(Link)._generation +%= 1;
+    }
+
     pub fn created(node: *Node, frame: *Frame) !void {
         const self = node.as(Link);
         return self.linkAddedCallback(frame);
@@ -199,6 +229,15 @@ test "WebApi: HTML.Link" {
 test "WebApi: HTML.Link external stylesheet" {
     testing.silenceLog(&.{.http});
     try testing.htmlRunner("css/external_stylesheet.html", .{ .load_resources = .{ .stylesheet = true } });
+}
+
+test "WebApi: HTML.Link external stylesheet charset" {
+    try testing.htmlRunner("css/stylesheet_charset.html", .{ .load_resources = .{ .stylesheet = true } });
+}
+
+test "WebApi: HTML.Link external stylesheet event ordering" {
+    testing.silenceLog(&.{.http});
+    try testing.htmlRunner("css/stylesheet_event_order.html", .{ .load_resources = .{ .stylesheet = true } });
 }
 
 // Regression: a synchronous external-stylesheet fetch must not strand the

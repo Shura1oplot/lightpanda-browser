@@ -42,7 +42,7 @@ pub const Key = struct {
 pub fn getOrCreate(element: *Element, kind: Kind, frame: *Frame) !*AnimatedString {
     const key: Key = .{ .element = element, .kind = kind };
     const page = frame.page;
-    const gop = try page.svg_animated_strings.getOrPut(page.frame_arena, key);
+    const gop = try page.svg_animated_strings.getOrPut(page.arena, key);
     if (!gop.found_existing) {
         errdefer _ = page.svg_animated_strings.remove(key);
         gop.value_ptr.* = try frame._factory.create(AnimatedString{
@@ -90,7 +90,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "SVGAnimatedString";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

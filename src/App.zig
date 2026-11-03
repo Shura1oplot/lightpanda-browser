@@ -19,14 +19,18 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const Regex = @import("Regex.zig");
 const Config = @import("Config.zig");
-const Snapshot = @import("browser/js/Snapshot.zig");
-const Platform = @import("browser/js/Platform.zig");
-const Telemetry = @import("telemetry/telemetry.zig").Telemetry;
-
-const Network = @import("network/Network.zig");
 const Watchdog = @import("Watchdog.zig");
 pub const ArenaPool = @import("ArenaPool.zig");
+
+const Snapshot = @import("browser/js/Snapshot.zig");
+const Platform = @import("browser/js/Platform.zig");
+const screenshot = @import("browser/screenshot.zig");
+const Sanitizer = @import("browser/webapi/Sanitizer.zig");
+
+const Network = @import("network/Network.zig");
+const Telemetry = @import("telemetry/telemetry.zig").Telemetry;
 
 const log = lp.log;
 const Allocator = std.mem.Allocator;
@@ -43,6 +47,10 @@ allocator: Allocator,
 arena_pool: ArenaPool,
 app_dir_path: ?[]const u8,
 
+regex_context: *Regex.Context,
+default_sanitizer: *Sanitizer,
+render_fonts: screenshot.Fonts,
+
 pub fn init(allocator: Allocator, config: *const Config) !*App {
     const platform = try Platform.init(.{
         .v8_flags = config.v8Flags(),
@@ -54,6 +62,12 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
     const snapshot = try Snapshot.load();
     errdefer snapshot.deinit();
 
+    const regex_context: *Regex.Context = try .init(allocator);
+    errdefer regex_context.deinit();
+
+    var render_fonts: screenshot.Fonts = try .load(allocator, config.renderFonts());
+    errdefer render_fonts.deinit(allocator);
+
     const app = try allocator.create(App);
     errdefer allocator.destroy(app);
 
@@ -62,10 +76,13 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
         .allocator = allocator,
         .platform = platform,
         .snapshot = snapshot,
+        .regex_context = regex_context,
+        .render_fonts = render_fonts,
         .network = undefined,
         .app_dir_path = undefined,
         .telemetry = undefined,
         .arena_pool = undefined,
+        .default_sanitizer = undefined,
         .watchdog = .init(config.watchdogMs()),
     };
     try app.watchdog.start();
@@ -82,6 +99,8 @@ pub fn init(allocator: Allocator, config: *const Config) !*App {
     app.arena_pool = ArenaPool.init(allocator, .{});
     errdefer app.arena_pool.deinit();
 
+    app.default_sanitizer = try .initDefault(&app.arena_pool);
+
     return app;
 }
 
@@ -96,8 +115,12 @@ pub fn deinit(self: *App) void {
     }
     self.telemetry.deinit(allocator);
     self.network.deinit();
+    // After `network`: its adblock regexes free through this context.
+    self.regex_context.deinit();
     self.snapshot.deinit();
     self.platform.deinit();
+    self.default_sanitizer.deinitDefault();
+    self.render_fonts.deinit(allocator);
     self.arena_pool.deinit();
 
     allocator.destroy(self);

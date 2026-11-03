@@ -24,6 +24,7 @@ const Env = @import("Env.zig");
 const Origin = @import("Origin.zig");
 const Scheduler = @import("Scheduler.zig");
 const Execution = @import("Execution.zig");
+const WasmStreaming = @import("WasmStreaming.zig");
 
 const Frame = @import("../Frame.zig");
 const Page = @import("../Page.zig");
@@ -97,12 +98,15 @@ origin: *Origin,
 identity: *js.Identity,
 
 // Allocator to use for identity map operations. For main world contexts this is
-// page.frame_arena, for isolated worlds it's the isolated world's arena.
+// page.arena, for isolated worlds it's the isolated world's arena.
 identity_arena: Allocator,
 
 // Unlike other v8 types, like functions or objects, modules are not shared
 // across origins.
 global_modules: std.ArrayList(v8.Global) = .empty,
+
+// WebAssembly streaming compilations still waiting on their Response.
+wasm_streams: std.ArrayList(*WasmStreaming) = .empty,
 
 // Our module cache: normalized module specifier => module.
 module_cache: std.StringHashMapUnmanaged(ModuleEntry) = .empty,
@@ -120,6 +124,11 @@ script_manager: *ScriptManagerBase,
 
 // Our macrotasks
 scheduler: Scheduler,
+
+// Promises rejected without a handler since the last microtask checkpoint. A
+// handler attached before the checkpoint ends withdraws the promise: it was
+// never unhandled. What is left is reported by Env.runMicrotasks.
+rejected_promises: std.ArrayList(js.Promise.Global) = .empty,
 
 // Execution context for worker-compatible APIs. This provides a common
 // interface that works in both Page and Worker contexts.
@@ -154,13 +163,14 @@ fn fromC(c_context: *const v8.Context) ?*Context {
 /// falls back to the incumbent context (the calling context).
 /// Returns null if neither context has a valid Context struct (both were destroyed).
 pub fn fromIsolate(isolate: js.Isolate) ?struct { *Context, *const v8.Context } {
-    const v8_context = v8.v8__Isolate__GetCurrentContext(isolate.handle).?;
+    const v8_context = v8.v8__Isolate__GetCurrentContext(isolate.handle) orelse return null;
     if (fromC(v8_context)) |ctx| {
         return .{ ctx, v8_context };
     }
+
     // The current context's Context struct has been freed (e.g., iframe navigated away).
     // Fall back to the incumbent context (the calling context).
-    const v8_incumbent = v8.v8__Isolate__GetIncumbentContext(isolate.handle).?;
+    const v8_incumbent = v8.v8__Isolate__GetIncumbentContext(isolate.handle) orelse return null;
     const ctx = fromC(v8_incumbent) orelse return null;
     return .{ ctx, v8_incumbent };
 }
@@ -197,8 +207,17 @@ pub fn deinit(self: *Context) void {
     // this can release objects
     self.scheduler.deinit();
 
+    for (self.rejected_promises.items) |promise| {
+        promise.release();
+    }
+    self.rejected_promises.deinit(env.allocator);
+
     for (self.global_modules.items) |*global| {
         v8.v8__Global__Reset(global);
+    }
+
+    while (self.wasm_streams.pop()) |stream| {
+        stream.abort(null);
     }
 
     self.page.releaseOrigin(self.origin);
@@ -208,30 +227,20 @@ pub fn deinit(self: *Context) void {
     // have a dangling pointer to our freed Context struct.
     v8.v8__Context__SetAlignedPointerInEmbedderData(entered.handle, 1, null);
 
+    // Detach the global so that a navigation can attach the reused Window to
+    // the frame's next context. This also nulls v8's pointer to our
+    // microtask_queue, which we free below. The v8 context can outlive us when
+    // another realm holds one of our functions, e.g. as a promise handler, and
+    // resolving that promise would enqueue onto the freed queue. With the
+    // pointer null, v8 drops the job instead.
+    v8.v8__Context__DetachGlobal(entered.handle);
+
     v8.v8__Global__Reset(&self.handle);
     env.isolate.notifyContextDisposed();
     // There can be other tasks associated with this context that we need to
     // purge while the context is still alive.
-    _ = env.pumpMessageLoop();
+    env.pumpMessageLoop();
     v8.v8__MicrotaskQueue__DELETE(self.microtask_queue);
-}
-
-// The global (e.g. Window) can be reused across contexts. If you do:
-//
-// var w = iframe.contentWindow;
-// iframe.src = 'two.html';
-// w === iframe.contentWindow  (must be true)
-//
-// so when we navigate, the Window/Global is re-used. That's fine with v8, but
-// we need to explicitly detach it from the original before we can safely attach
-// it to the new
-pub fn detachGlobal(self: *Context) void {
-    var hs: js.HandleScope = undefined;
-    hs.init(self.isolate);
-    defer hs.deinit();
-
-    const local_v8_context: *const v8.Context = @ptrCast(v8.v8__Global__Get(&self.handle, self.isolate.handle));
-    v8.v8__Context__DetachGlobal(local_v8_context);
 }
 
 // setOrigin is called at navigation (opaque -> real origin) and again when a
@@ -253,6 +262,12 @@ pub fn setOrigin(self: *Context, key: ?[]const u8) !void {
         // one context to access another.
         const token_local = v8.v8__Global__Get(&origin.security_token, isolate.handle);
         v8.v8__Context__SetSecurityToken(ls.local.handle, token_local);
+
+        // navigator.serviceWorker is [SecureContext]. With the feature
+        // disabled, Env.createContext has already removed it.
+        if (self.global == .frame and self.page.session.experimental_features.serviceworker and self.execution.isSecureContext() == false) {
+            env.hideServiceWorker(true, ls.local.handle, v8.v8__Context__Global(ls.local.handle).?);
+        }
     }
 }
 
@@ -284,6 +299,7 @@ pub fn localScope(self: *Context, ls: *js.Local.Scope) void {
         .handle = local_v8_context,
         .call_arena = self.call_arena,
     };
+    ls.page_scope = self.page.logScope();
 }
 
 pub fn toLocal(self: *Context, global: anytype) js.Local.ToLocalReturnType(@TypeOf(global)) {
@@ -361,7 +377,7 @@ pub fn module(self: *Context, comptime want_result: bool, local: *const js.Local
             }
         }
 
-        const owned_url = try arena.dupeZ(u8, url);
+        const owned_url = try arena.dupeSentinel(u8, url, 0);
         if (cacheable and !gop.found_existing) {
             gop.key_ptr.* = owned_url;
         }
@@ -402,6 +418,17 @@ fn evaluateModule(self: *Context, comptime want_result: bool, mod: js.Module, ur
         // Some module-loading errors aren't handled by TryCatch. We need to
         // get the error from the module itself.
         const exception = mod.getException();
+
+        // Like a classic script's, the exception is reported as uncaught.
+        // (Module.evaluate marked the rejected evaluation promise handled.)
+        if (comptime want_result == false) {
+            if (self.env.terminatePending() == false) {
+                self.global.reportError(exception) catch |report_err| {
+                    log.debug(.js, "report module error", .{ .specifier = url, .err = report_err });
+                };
+            }
+        }
+
         const message = blk: {
             const e = exception.toString() catch break :blk "???";
             break :blk e.toSlice() catch "???";
@@ -418,7 +445,7 @@ fn evaluateModule(self: *Context, comptime want_result: bool, mod: js.Module, ur
             break :blk buf.written();
         };
 
-        log.warn(.js, "evaluate module", .{
+        log.debug(.js, "evaluate module", .{
             .stack = stack,
             .specifier = url,
             .message = message,
@@ -523,7 +550,7 @@ fn postCompileModule(self: *Context, mod: js.Module, url: [:0]const u8, local: *
         };
         const nested_gop = try self.module_cache.getOrPut(self.arena.allocator(), normalized_specifier);
         if (!nested_gop.found_existing) {
-            const owned_specifier = try self.arena.dupeZ(u8, normalized_specifier);
+            const owned_specifier = try self.arena.dupeSentinel(u8, normalized_specifier, 0);
             nested_gop.key_ptr.* = owned_specifier;
             nested_gop.value_ptr.* = .{};
             try script_manager.preloadImport(owned_specifier, url, .{});
@@ -531,7 +558,7 @@ fn postCompileModule(self: *Context, mod: js.Module, url: [:0]const u8, local: *
             // Entry exists but module failed to compile previously.
             // The imported_modules entry may have been consumed, so
             // re-preload to ensure waitForImport can find it.
-            // Key was stored via dupeZ so it has a sentinel in memory.
+            // Key was stored via dupeSentinel so it has a sentinel in memory.
             const key = nested_gop.key_ptr.*;
             const key_z: [:0]const u8 = key.ptr[0..key.len :0];
             try script_manager.preloadImport(key_z, url, .{});
@@ -577,7 +604,7 @@ fn resolveModuleCallback(
         if (err == error.SpecifierResolutionFailed) {
             _ = self.isolate.throwException(self.isolate.createTypeError("Failed to resolve module specifier"));
         }
-        log.err(.js, "resolve module", .{
+        log.debug(.js, "resolve module", .{
             .err = err,
             .specifier = specifier,
         });
@@ -596,6 +623,12 @@ pub fn dynamicModuleCallback(
     _ = import_attrs;
 
     const self = fromC(c_context.?).?;
+
+    // prevent running a microtask checkpoint mid-script: import() is called
+    // from running JS, and every reject below would otherwise drain the queue
+    self.call_depth += 1;
+    defer self.call_depth -= 1;
+
     const local = js.Local{
         .ctx = self,
         .handle = c_context.?,
@@ -633,7 +666,7 @@ pub fn dynamicModuleCallback(
     };
 
     const promise = self._dynamicModuleCallback(normalized_specifier, resource, &local) catch |err| blk: {
-        log.err(.js, "dynamic module callback", .{
+        log.debug(.js, "dynamic module callback", .{
             .err = err,
         });
         break :blk local.rejectPromise(.{ .generic_error = "Out of memory" });
@@ -936,7 +969,7 @@ fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptM
 
         break :blk self.module(true, local, ms.src(), state.specifier, true) catch |err| {
             const caught = try_catch.caughtOrError(self.local_arena, err);
-            log.err(.js, "module compilation failed", .{
+            log.debug(.js, "module compilation failed", .{
                 .caught = caught,
                 .specifier = state.specifier,
             });
@@ -1071,7 +1104,13 @@ pub fn enter(self: *Context, hs: *js.HandleScope) Entered {
 
     const handle: *const v8.Context = @ptrCast(v8.v8__Global__Get(&self.handle, isolate.handle));
     v8.v8__Context__Enter(handle);
-    return .{ .original = original, .handle = handle, .handle_scope = hs, .global = self.global };
+    return .{
+        .original = original,
+        .handle = handle,
+        .handle_scope = hs,
+        .global = self.global,
+        .page_scope = self.page.logScope(),
+    };
 }
 
 const Entered = struct {
@@ -1085,7 +1124,10 @@ const Entered = struct {
 
     global: lp.GlobalScope,
 
+    page_scope: log.PageScope,
+
     pub fn exit(self: Entered) void {
+        self.page_scope.exit();
         self.global.setJs(self.original);
         v8.v8__Context__Exit(self.handle);
         self.handle_scope.deinit();
@@ -1173,6 +1215,27 @@ fn enqueueMicrotask(self: *Context, callback: anytype) void {
             callback(ctx);
         }
     }.run, self);
+}
+
+// A promise rejected with no handler. It is reported at the end of the
+// microtask checkpoint if it still has none.
+pub fn addRejectedPromise(self: *Context, promise: js.Promise) !void {
+    const global = try promise.persist();
+    errdefer global.release();
+    try self.rejected_promises.append(self.env.allocator, global);
+}
+
+// A handler was attached to `promise`. False when it wasn't waiting to be
+// reported (it was already reported, or rejected in another context).
+pub fn withdrawRejectedPromise(self: *Context, promise: js.Promise) bool {
+    for (self.rejected_promises.items, 0..) |rejected, i| {
+        if (rejected.isEqual(promise)) {
+            rejected.release();
+            _ = self.rejected_promises.orderedRemove(i);
+            return true;
+        }
+    }
+    return false;
 }
 
 // There's an assumption here: the js.Function will be alive when microtasks are

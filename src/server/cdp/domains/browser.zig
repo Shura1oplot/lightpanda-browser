@@ -74,7 +74,7 @@ fn getVersion(cmd: *CDP.Command) !void {
         .revision = REVISION,
         .userAgent = CDP_USER_AGENT,
         .jsVersion = JS_VERSION,
-    }, .{ .include_session_id = false });
+    }, .{});
 }
 
 // https://chromedevtools.github.io/devtools-protocol/tot/Browser/#method-setDownloadBehavior
@@ -184,10 +184,10 @@ fn grantPermissions(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     if (params.origin) |v| {
-        log.warn(.not_implemented, "Browser.grantPermissions", .{ .param = "origin", .value = v });
+        log.debug(.not_implemented, "Browser.grantPermissions", .{ .param = "origin", .value = v });
     }
     if (params.browserContextId) |v| {
-        log.warn(.not_implemented, "Browser.grantPermissions", .{ .param = "browserContextId", .value = v });
+        log.debug(.not_implemented, "Browser.grantPermissions", .{ .param = "browserContextId", .value = v });
     }
 
     const browser = &cmd.cdp.browser;
@@ -195,7 +195,7 @@ fn grantPermissions(cmd: *CDP.Command) !void {
         try browser.setPermission(name, .granted);
     }
 
-    return cmd.sendResult(null, .{ .include_session_id = false });
+    return cmd.sendResult(null, .{});
 }
 
 // Set a single permission to an explicit state ("granted", "denied" or
@@ -209,24 +209,24 @@ fn setPermission(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     if (params.origin) |v| {
-        log.warn(.not_implemented, "Browser.setPermission", .{ .param = "origin", .value = v });
+        log.debug(.not_implemented, "Browser.setPermission", .{ .param = "origin", .value = v });
     }
     if (params.browserContextId) |v| {
-        log.warn(.not_implemented, "Browser.setPermission", .{ .param = "browserContextId", .value = v });
+        log.debug(.not_implemented, "Browser.setPermission", .{ .param = "browserContextId", .value = v });
     }
 
     const state = std.meta.stringToEnum(PermissionState, params.setting) orelse {
         return error.InvalidPermissionSetting;
     };
     try cmd.cdp.browser.setPermission(params.permission.name, state);
-    return cmd.sendResult(null, .{ .include_session_id = false });
+    return cmd.sendResult(null, .{});
 }
 
 // Clear all granted permissions; navigator.permissions.query() falls back to
 // the default "prompt".
 fn resetPermissions(cmd: *CDP.Command) !void {
     cmd.cdp.browser.clearPermissions();
-    return cmd.sendResult(null, .{ .include_session_id = false });
+    return cmd.sendResult(null, .{});
 }
 
 const testing = @import("../testing.zig");
@@ -247,6 +247,16 @@ test "cdp.browser: getVersion" {
         .userAgent = lp.Config.HttpHeaders.user_agent_base,
         .jsVersion = JS_VERSION,
     }, .{ .id = 32, .index = 0, .session_id = null });
+}
+
+// Clients route replies by (sessionId, id): a reply must echo the sessionId of its command.
+test "cdp.browser: replies echo the sessionId" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    _ = try ctx.loadBrowserContext(.{ .session_id = "SID-X" });
+    try ctx.processMessage(.{ .id = 1, .method = "Browser.getVersion", .sessionId = "SID-X" });
+    try ctx.expectSentResult(.{ .product = PRODUCT }, .{ .id = 1, .session_id = "SID-X" });
 }
 
 test "cdp.browser: getWindowForTarget" {
@@ -301,6 +311,35 @@ test "cdp.browser: grant/set/reset permissions reach navigator.permissions" {
         .method = "Browser.resetPermissions",
     });
     try ctx.expectSentResult(null, .{ .id = 42, .session_id = null });
+    try testing.expectEqual(@as(usize, 0), browser.permissions.count());
+}
+
+test "cdp.browser: disposing a context clears its permission overrides" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-PERM-OLD" });
+    const browser = &ctx.cdp().browser;
+
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "Browser.grantPermissions",
+        .params = .{ .permissions = &[_][]const u8{"geolocation"}, .browserContextId = "BID-PERM-OLD" },
+    });
+    try ctx.processMessage(.{
+        .id = 2,
+        .method = "Browser.setPermission",
+        .params = .{ .permission = .{ .name = "notifications" }, .setting = "denied", .browserContextId = "BID-PERM-OLD" },
+    });
+    try testing.expectEqual(@as(usize, 2), browser.permissions.count());
+
+    try ctx.processMessage(.{ .id = 3, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = "BID-UNKNOWN" } });
+    try ctx.expectSentError(-32602, "No browser context with the given id found", .{ .id = 3 });
+    try testing.expectEqual(@as(usize, 2), browser.permissions.count());
+
+    try ctx.processMessage(.{ .id = 4, .method = "Target.disposeBrowserContext", .params = .{ .browserContextId = "BID-PERM-OLD" } });
+    try ctx.expectSentResult(null, .{ .id = 4 });
+    try testing.expectEqual(@as(usize, 0), browser.permissions.count());
+    _ = try ctx.loadBrowserContext(.{ .id = "BID-PERM-NEW" });
     try testing.expectEqual(@as(usize, 0), browser.permissions.count());
 }
 

@@ -23,6 +23,7 @@ const Frame = @import("../Frame.zig");
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
 const ShadowRoot = @import("ShadowRoot.zig");
+const Template = @import("element/html/Template.zig");
 const collections = @import("collections.zig");
 const Selector = @import("selector/Selector.zig");
 
@@ -32,6 +33,7 @@ pub const Proto = Node;
 
 _type: Type,
 _proto: *Node,
+_template: ?*Template = null,
 
 pub const Type = union(enum) {
     generic,
@@ -59,6 +61,13 @@ pub fn init(document: *const Node.Document, frame: *Frame) !*DocumentFragment {
         ._type = .generic,
         ._proto = undefined,
     });
+}
+
+pub fn getHost(self: *const DocumentFragment) ?*Element {
+    return switch (self._type) {
+        .shadow_root => |shadow_root| shadow_root._host,
+        .generic => if (self._template) |template| template.asElement() else null,
+    };
 }
 
 pub fn asNode(self: *DocumentFragment) *Node {
@@ -126,26 +135,26 @@ fn getChildElementCount(self: *DocumentFragment) usize {
     return count;
 }
 
-pub fn append(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn append(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const parent = self.asNode();
-    for (nodes) |node_or_text| {
+    for (nodes.values) |node_or_text| {
         const child = try node_or_text.toNode(parent.getDocument(frame));
         _ = try parent.appendChild(child, frame);
     }
 }
 
-pub fn prepend(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
+pub fn prepend(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
     const parent = self.asNode();
-    var i = nodes.len;
+    var i = nodes.values.len;
     while (i > 0) {
         i -= 1;
-        const child = try nodes[i].toNode(parent.getDocument(frame));
+        const child = try nodes.values[i].toNode(parent.getDocument(frame));
         _ = try parent.insertBefore(child, parent.firstChild(), frame);
     }
 }
 
-pub fn replaceChildren(self: *DocumentFragment, nodes: []const Node.NodeOrText, frame: *Frame) !void {
-    return self.asNode().replaceChildren(nodes, frame);
+pub fn replaceChildren(self: *DocumentFragment, nodes: js.Variadic(Node.NodeOrText), frame: *Frame) !void {
+    return self.asNode().replaceChildren(nodes.values, frame);
 }
 
 pub fn moveBefore(self: *DocumentFragment, node: js.Value, child: js.Value, frame: *Frame) !void {
@@ -165,12 +174,6 @@ pub fn setInnerHTML(self: *DocumentFragment, html: []const u8, frame: *Frame) !v
     return parent.setHTML(html, .{}, frame);
 }
 
-/// allows declarative shadow dom
-pub fn setHTMLUnsafe(self: *DocumentFragment, html: []const u8, frame: *Frame) !void {
-    const parent = self.asNode();
-    return parent.setHTML(html, .{ .allow_declarative_shadow = true }, frame);
-}
-
 pub fn cloneFragment(self: *DocumentFragment, deep: bool, document: *const Node.Document, frame: *Frame) !*Node {
     const fragment = try DocumentFragment.init(document, frame);
     const fragment_node = fragment.asNode();
@@ -187,7 +190,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DocumentFragment";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

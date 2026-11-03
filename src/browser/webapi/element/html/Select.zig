@@ -23,7 +23,6 @@ const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
 
 const Node = @import("../../Node.zig");
-const Event = @import("../../Event.zig");
 const Element = @import("../../Element.zig");
 const collections = @import("../../collections.zig");
 
@@ -222,6 +221,24 @@ fn deselectOthers(self: *const Select, keep: *const Option) void {
     }
 }
 
+pub fn reset(self: *Select, frame: *Frame) void {
+    var last_selected: ?*Option = null;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| {
+        option._selected = option.asElement().hasAttributeInterned("selected");
+        if (option._selected) {
+            last_selected = option;
+        }
+    }
+    if (self.asElement().hasAttributeInterned("multiple") == false) {
+        if (last_selected) |keep| {
+            self.deselectOthers(keep);
+        }
+    }
+    self.resetToDefaultSelection();
+    frame.domChanged();
+}
+
 // HTML's "ask for a reset". Every path that selects an option in a
 // non-multiple select deselects the others, so this only has to handle a
 // menu list left with nothing selected.
@@ -288,6 +305,17 @@ pub fn setValue(self: *Select, value: []const u8, frame: *Frame) !void {
     frame.domChanged();
 }
 
+/// The position of `option` in the list of options, or null when the option
+/// is not in it.
+pub fn optionIndex(self: *const Select, option: *const Option) ?u32 {
+    var index: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |o| : (index += 1) {
+        if (o == option) return index;
+    }
+    return null;
+}
+
 pub fn getSelectedIndex(self: *Select) i32 {
     var index: i32 = 0;
     var it = OptionIterator.init(self);
@@ -341,6 +369,56 @@ pub fn getLength(self: *Select) u32 {
     return i;
 }
 
+pub const max_list_items = 100_000;
+pub fn setLength(self: *Select, value: u32, frame: *Frame) !void {
+    // value > options.len means add blank options
+    // value < options.len means remove extra options
+
+    // we'll collect the length AND trim at the same time
+
+    var len: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| : (len += 1) {
+        if (len >= value) {
+            // we have to be in trim mode
+            option.asElement().remove(frame);
+        }
+    }
+    if (len >= value) {
+        return;
+    }
+
+    // growing, we append blank options
+    if (value > max_list_items) {
+        lp.log.debug(.js, "select overflow", .{ .max_list_items = max_list_items, .request = value });
+        return;
+    }
+    const self_node = self.asNode();
+    const doc = self_node.ownerDocument(frame).?;
+    for (len..value) |_| {
+        // yes, one at time, for the correct mutation records
+        const blank = try Frame.node_factory.createElementNS(doc, .html, "option", null);
+        _ = try self_node.appendChild(blank, frame);
+    }
+}
+
+// remove() is ChildNode's; remove(index) removes the option at index.
+fn remove(self: *Select, index_: ?js.Value, frame: *Frame) !void {
+    const value = index_ orelse return self.asElement().remove(frame);
+    const index = try value.toI32();
+
+    if (index < 0) {
+        return;
+    }
+    var i: u32 = 0;
+    var it = OptionIterator.init(self);
+    while (it.next()) |option| : (i += 1) {
+        if (i == index) {
+            return option.asElement().remove(frame);
+        }
+    }
+}
+
 const AddBeforeOption = union(enum) {
     option: *Option,
     index: u32,
@@ -376,28 +454,8 @@ pub fn getSelectedOptions(self: *Select, frame: *Frame) !collections.NodeLive(.s
     return collections.NodeLive(.selected_options).init(self.asNode(), {}, frame);
 }
 
-pub fn getForm(self: *Select, frame: *Frame) ?*Form {
-    const element = self.asElement();
-
-    // If form attribute exists, ONLY use that (even if it references nothing)
-    if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
-        if (frame.getElementByIdFromNode(element.asNode(), form_id)) |form_element| {
-            return form_element.is(Form);
-        }
-        // form attribute present but invalid - no form owner
-        return null;
-    }
-
-    // No form attribute - traverse ancestors looking for a <form>
-    var node = element.asNode()._parent;
-    while (node) |n| {
-        if (n.is(Element.Html.Form)) |form| {
-            return form;
-        }
-        node = n._parent;
-    }
-
-    return null;
+pub fn getForm(self: *Select) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *Select, frame: *Frame) !js.Array {
@@ -425,14 +483,8 @@ fn getValidationMessage(self: *const Select) []const u8 {
     return "";
 }
 
-pub fn checkValidity(self: *Select, frame: *Frame) !bool {
-    if (!self.getWillValidate()) return true;
-    const v = ValidityState{ ._owner = self.asElement() };
-    if (v.getValid(frame)) return true;
-
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame.page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-    return false;
+fn checkValidity(self: *Select, frame: *Frame) !bool {
+    return ValidityState.checkValidity(self.asElement(), frame);
 }
 
 fn reportValidity(self: *Select, frame: *Frame) !bool {
@@ -478,7 +530,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLSelectElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -495,12 +546,13 @@ pub const JsApi = struct {
     pub const selectedOptions = bridge.accessor(Select.getSelectedOptions, null, .{});
     pub const form = bridge.accessor(Select.getForm, null, .{});
     pub const size = reflect.unsignedLong("size", .{});
-    pub const length = bridge.accessor(Select.getLength, null, .{});
+    pub const length = bridge.accessor(Select.getLength, Select.setLength, .{ .ce_reactions = true });
     pub const labels = bridge.accessor(Select.getLabels, null, .{});
     pub const willValidate = bridge.accessor(Select.getWillValidate, null, .{});
     pub const validity = bridge.accessor(Select.getValidity, null, .{});
     pub const validationMessage = bridge.accessor(Select.getValidationMessage, null, .{});
     pub const add = bridge.function(Select.add, .{ .ce_reactions = true });
+    pub const remove = bridge.function(Select.remove, .{ .ce_reactions = true });
     pub const checkValidity = bridge.function(Select.checkValidity, .{});
     pub const reportValidity = bridge.function(Select.reportValidity, .{});
     pub const setCustomValidity = bridge.function(Select.setCustomValidity, .{});

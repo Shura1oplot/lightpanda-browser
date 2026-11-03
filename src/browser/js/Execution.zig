@@ -28,12 +28,15 @@
 const std = @import("std");
 const lp = @import("lightpanda");
 
+const Value = @import("Value.zig");
+const Function = @import("Function.zig");
 const Context = @import("Context.zig");
 const Scheduler = @import("Scheduler.zig");
 const Page = @import("../Page.zig");
 const Session = @import("../Session.zig");
 const Factory = @import("../Factory.zig");
 const HttpClient = @import("../../network/HttpClient.zig");
+const referrer = @import("../referrer.zig");
 const EventManagerBase = @import("../EventManagerBase.zig");
 
 const Console = @import("../webapi/Console.zig");
@@ -50,8 +53,9 @@ const Execution = @This();
 js: *Context,
 
 // Fields named to match Page for generic code (executor._factory works for both)
-buf: []u8,
-arena: Allocator,
+// For a Frame, the Page's arena. For a worker, the worker's own arena (a worker
+// has its own identity map, so nothing it allocates is shared with another realm).
+page_arena: Allocator,
 call_arena: Allocator,
 local_arena: Allocator,
 
@@ -70,7 +74,7 @@ pub fn dupeString(self: *const Execution, value: []const u8) ![]const u8 {
     if (String.intern(value)) |v| {
         return v;
     }
-    return self.arena.dupe(u8, value);
+    return self.page_arena.dupe(u8, value);
 }
 
 pub fn getArena(self: *const Execution, size_or_bucket: anytype, debug: []const u8) !*lp.Arena {
@@ -88,8 +92,22 @@ pub fn base(self: *const Execution) [:0]const u8 {
     return self.js.global.base();
 }
 
-pub fn headersForRequest(self: *const Execution, transfer: *HttpClient.Transfer) !void {
-    return self.js.global.headersForRequest(transfer);
+pub const HeadersForRequestOptions = struct {
+    // Callers that compute their own Referer (e.g. fetch()'s referrer/referrerPolicy
+    // options) set this to false so we don't set a header here just to override it.
+    referer: bool = true,
+};
+
+pub fn headersForRequest(self: *const Execution, transfer: *HttpClient.Transfer, opts: HeadersForRequestOptions) !void {
+    return self.js.global.headersForRequest(transfer, opts);
+}
+
+pub fn referrerSource(self: *const Execution) [:0]const u8 {
+    return self.js.global.referrerSource();
+}
+
+pub fn referrerPolicy(self: *const Execution) referrer.Policy {
+    return self.js.global.referrerPolicy();
 }
 
 pub fn isSameOrigin(self: *const Execution, url: [:0]const u8) bool {
@@ -114,6 +132,10 @@ pub fn messagePorts(self: *const Execution) *std.DoublyLinkedList {
 
 pub fn origin(self: *const Execution) ?[]const u8 {
     return self.js.global.origin();
+}
+
+pub fn isSecureContext(self: *const Execution) bool {
+    return self.js.global.isSecureContext();
 }
 
 pub fn frameId(self: *const Execution) u32 {
@@ -152,14 +174,26 @@ pub fn dispatch(
     self: *const Execution,
     target: *EventTarget,
     event: *Event,
-    handler: anytype,
     comptime opts: EventManagerBase.DispatchDirectOptions,
 ) !void {
-    return self.js.global.dispatch(target, event, handler, opts);
+    return self.js.global.dispatch(target, event, opts);
 }
 
-pub fn hasDirectListeners(self: *const Execution, target: *EventTarget, typ: []const u8, handler: anytype) bool {
-    return self.js.global.hasDirectListeners(target, typ, handler);
+pub fn reportError(self: *const Execution, err: Value) !void {
+    return self.js.global.reportError(err);
+}
+
+pub fn hasDirectListeners(self: *const Execution, target: *EventTarget, typ: []const u8) bool {
+    return self.js.global.hasDirectListeners(target, typ);
+}
+
+/// Sets (or, with null, clears) the target's `on<typ>` event handler.
+pub fn setHandler(self: *const Execution, target: *EventTarget, typ: []const u8, handler: ?Function.Global) !void {
+    return self.js.global.setHandler(target, typ, handler);
+}
+
+pub fn getHandler(self: *const Execution, target: *EventTarget, typ: []const u8) ?Function.Global {
+    return self.js.global.getHandler(target, typ);
 }
 
 pub fn performance(self: *const Execution) *Performance {

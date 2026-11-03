@@ -277,7 +277,7 @@ fn writePartWithEndings(part: []const u8, use_native_endings: bool, writer: *Wri
             const match = chunk == cr;
 
             // Create a bitset out of match vector.
-            const bitset = std.bit_set.IntegerBitSet(vector_len){
+            const bitset = std.bit_set.Integer(vector_len){
                 .mask = @bitCast(@intFromBool(match)),
             };
 
@@ -423,7 +423,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Blob";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -453,7 +452,7 @@ test "Blob: a pinned arena reaches the browser's account and is given back" {
     browser.flushArenaMemory();
     try testing.expectEqual(0, browser.arena_account.pending);
 
-    const data = [_]u8{'x'} ** (64 * 1024);
+    const data: [64 * 1024]u8 = @splat('x');
     const blob = try Blob.initFromBytes(&data, "text/plain", &frame.js.execution);
     try testing.expect(browser.arena_account.pending >= data.len);
 

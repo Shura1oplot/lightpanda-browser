@@ -40,6 +40,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         getNodeDetails,
         getStructuredData,
         getContentSignal,
+        getPageStatus,
         detectForms,
         clickNode,
         fillNode,
@@ -59,6 +60,7 @@ pub fn processMessage(cmd: *CDP.Command) !void {
         .getNodeDetails => return getNodeDetails(cmd),
         .getStructuredData => return getStructuredData(cmd),
         .getContentSignal => return getContentSignal(cmd),
+        .getPageStatus => return getPageStatus(cmd),
         .detectForms => return detectForms(cmd),
         .clickNode => return clickNode(cmd),
         .fillNode => return fillNode(cmd),
@@ -127,22 +129,18 @@ fn getSemanticTree(cmd: anytype) !void {
     const params = (try cmd.params(Params)) orelse Params{};
 
     const bc = cmd.browser_context orelse return error.NoBrowserContext;
-    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const root = bc.mainFrame() orelse return error.FrameNotLoaded;
 
     const dom_node = if (params.backendNodeId) |nodeId|
         (bc.node_registry.lookup_by_id.get(nodeId) orelse return error.InvalidNodeId).dom
     else
-        frame.document.asNode();
+        root.document.asNode();
 
-    var st = SemanticTree{
-        .dom_node = dom_node,
-        .registry = &bc.node_registry,
-        .frame = frame,
-        .arena = cmd.arena,
+    const st = SemanticTree.init(cmd.arena, dom_node, &bc.node_registry, root, .{
         .prune = params.prune orelse true,
         .interactive_only = params.interactiveOnly orelse false,
         .max_depth = params.maxDepth orelse std.math.maxInt(u32) - 1,
-    };
+    }) catch return error.InvalidNodeId;
 
     if (params.format) |format| {
         if (format == .text) {
@@ -247,12 +245,13 @@ fn getInteractiveElements(cmd: anytype) !void {
     const params = (try cmd.params(Params)) orelse Params{};
 
     const bc = cmd.browser_context orelse return error.NoBrowserContext;
-    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const main_frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
     const root = if (params.nodeId) |nodeId|
         (bc.node_registry.lookup_by_id.get(nodeId) orelse return error.InvalidNodeId).dom
     else
-        frame.document.asNode();
+        main_frame.document.asNode();
+    const frame = root.ownerFrame(main_frame) orelse return error.InvalidNodeId;
 
     const elements = try interactive.collectInteractiveElements(root, cmd.arena, frame);
     try interactive.registerNodes(elements, &bc.node_registry);
@@ -269,11 +268,11 @@ fn getNodeDetails(cmd: anytype) !void {
     const params = (try cmd.params(Params)) orelse return error.InvalidParam;
 
     const bc = cmd.browser_context orelse return error.NoBrowserContext;
-    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const root = bc.mainFrame() orelse return error.FrameNotLoaded;
 
     const node = (bc.node_registry.lookup_by_id.get(params.backendNodeId) orelse return error.InvalidNodeId).dom;
-
-    const details = SemanticTree.getNodeDetails(cmd.arena, node, &bc.node_registry, frame) catch return error.InternalError;
+    const st = SemanticTree.init(cmd.arena, node, &bc.node_registry, root, .{}) catch return error.InvalidNodeId;
+    const details = st.nodeDetails() catch return error.InternalError;
 
     return cmd.sendResult(.{
         .nodeDetails = details,
@@ -309,10 +308,30 @@ fn getContentSignal(cmd: anytype) !void {
         return cmd.sendResult(.{ .available = false, .contentSignals = empty }, .{});
     };
 
-    const signals = network.robot_store.getContentSignals(robots_url);
+    const signals = try network.robot_store.getContentSignals(cmd.arena, robots_url);
     return cmd.sendResult(.{
         .available = signals != null,
         .contentSignals = signals orelse empty,
+    }, .{});
+}
+
+fn getPageStatus(cmd: anytype) !void {
+    const bc = cmd.browser_context orelse return error.NoBrowserContext;
+    const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
+    const status = &frame.page.status;
+
+    return cmd.sendResult(.{
+        .url = frame.url,
+        .httpStatus = frame._http_status,
+        .botChallenge = frame._bot_challenge,
+        .navigateError = if (frame._last_navigate_error) |err| @errorName(err) else null,
+        .jsErrors = status.js_errors,
+        .unsupported = status.unsupported,
+        .skipped = status.skipped,
+        .missingGlobals = status.missing_globals,
+        .failed = status.failed,
+        .blocked = status.blocked,
+        .resourceChallenge = status.resource_challenge,
     }, .{});
 }
 
@@ -399,10 +418,10 @@ fn scrollNode(cmd: anytype) !void {
         return error.InternalError;
     };
 
-    const target_id: ?NodeRegistry.Id = if (result.scrolled) |scrolled|
-        (try bc.node_registry.register(scrolled)).id
-    else
-        null;
+    const target_id: ?NodeRegistry.Id = switch (result.target) {
+        .window => null,
+        .node, .container => |scrolled| (try bc.node_registry.register(scrolled)).id,
+    };
     return cmd.sendResult(.{ .backendNodeId = target_id, .x = result.x, .y = result.y }, .{});
 }
 
@@ -417,7 +436,7 @@ fn waitForSelector(cmd: anytype) !void {
     const frame = bc.mainFrame() orelse return error.FrameNotLoaded;
 
     const timeout_ms = params.timeout orelse lp.tools.defaultWaitTimeout(frame);
-    const selector_z = try cmd.arena.dupeZ(u8, params.selector);
+    const selector_z = try cmd.arena.dupeSentinel(u8, params.selector, 0);
 
     const node = lp.actions.waitForSelector(selector_z, timeout_ms, frame._frame_id, bc.session) catch |err| {
         if (err == error.InvalidSelector) return error.InvalidParam;
@@ -578,8 +597,8 @@ test "cdp.lp: dump formats, strip and scoping" {
     // markdown, no strip: chrome and content both present.
     try ctx.processMessage(.{ .id = 1, .method = "LP.dump", .params = .{ .format = "markdown" } });
     var content = try dumpContent(&ctx, 1, "markdown");
-    try testing.expect(std.mem.indexOf(u8, content, "Site menu") != null);
-    try testing.expect(std.mem.indexOf(u8, content, "Article body") != null);
+    try testing.expect(std.mem.find(u8, content, "Site menu") != null);
+    try testing.expect(std.mem.find(u8, content, "Article body") != null);
 
     // markdown + shell: chrome gone, the article's own header kept.
     try ctx.processMessage(.{ .id = 2, .method = "LP.dump", .params = .{ .format = "markdown", .strip = .{ .shell = true } } });
@@ -616,6 +635,50 @@ test "cdp.lp: dump formats, strip and scoping" {
     try testing.expect((try dumpReply(&ctx, 9)).get("error") != null);
 }
 
+// A backendNodeId can name a node in a child frame while the handler only
+// knows the root. Labels, datalists and styles must come from the node's own
+// document: the parent reuses every id and hides `.probe`.
+test "cdp.lp: semantic tree and node details read the node's own frame" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-T", .url = "cdp/semantic_tree_iframe.html", .target_id = "FID-000000000T".* });
+    const root = bc.mainFrame() orelse unreachable;
+    const child = root.child_frames.items[0];
+
+    const html = (child.document.getDocumentElement() orelse unreachable).asNode();
+    const input = (try child.document.querySelector(.wrap("input"), child)).?.asNode();
+    const html_id = (try bc.node_registry.register(html)).id;
+    const input_id = (try bc.node_registry.register(input)).id;
+
+    try ctx.processMessage(.{ .id = 1, .method = "LP.getSemanticTree", .params = .{ .backendNodeId = html_id, .format = "text", .prune = false } });
+    const tree = (try dumpReply(&ctx, 1)).get("result").?.object.get("semanticTree").?.string;
+    try testing.expect(std.mem.find(u8, tree, "child-label") != null);
+    try testing.expect(std.mem.find(u8, tree, "child-option") != null);
+    try testing.expect(std.mem.find(u8, tree, "child-probe") != null);
+    try testing.expect(std.mem.find(u8, tree, "parent-") == null);
+
+    try ctx.processMessage(.{ .id = 2, .method = "LP.getNodeDetails", .params = .{ .backendNodeId = input_id } });
+    const details = (try dumpReply(&ctx, 2)).get("result").?.object.get("nodeDetails").?.object;
+    try testing.expectEqual("child-label", details.get("name").?.string);
+    try testing.expectEqual("child-option", details.get("options").?.array.items[0].object.get("value").?.string);
+
+    // JSON format and interactiveOnly walk the same frame as the text format.
+    try ctx.processMessage(.{ .id = 5, .method = "LP.getSemanticTree", .params = .{ .backendNodeId = html_id, .interactiveOnly = true } });
+    const json = try std.json.Stringify.valueAlloc(testing.allocator, (try dumpReply(&ctx, 5)).get("result").?.object.get("semanticTree").?, .{});
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.find(u8, json, "child-label") != null);
+    try testing.expect(std.mem.find(u8, json, "parent-") == null);
+
+    // A document with no frame has no styles or layout to describe.
+    const frameless = try root._factory.genericDocument(.{});
+    const frameless_id = (try bc.node_registry.register(frameless.asNode())).id;
+    try ctx.processMessage(.{ .id = 3, .method = "LP.getSemanticTree", .params = .{ .backendNodeId = frameless_id } });
+    try ctx.expectSentError(-31998, "InvalidNodeId", .{ .id = 3 });
+    try ctx.processMessage(.{ .id = 4, .method = "LP.getNodeDetails", .params = .{ .backendNodeId = frameless_id } });
+    try ctx.expectSentError(-31998, "InvalidNodeId", .{ .id = 4 });
+}
+
 test "cdp.lp: getInteractiveElements" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -630,6 +693,36 @@ test "cdp.lp: getInteractiveElements" {
 
     const result = (try ctx.getSentMessage(0)).?.object.get("result").?.object;
     try testing.expect(result.get("elements") != null);
+}
+
+test "cdp.lp: getInteractiveElements reads the node's own frame" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{ .id = "BID-T", .url = "cdp/interactive_iframe.html", .target_id = "FID-000000000T".* });
+    const root = bc.mainFrame() orelse unreachable;
+    const child = root.child_frames.items[0];
+
+    const html = (child.document.getDocumentElement() orelse unreachable).asNode();
+    const html_id = (try bc.node_registry.register(html)).id;
+
+    try ctx.processMessage(.{ .id = 1, .method = "LP.getInteractiveElements", .params = .{ .nodeId = html_id } });
+    const elements = (try dumpReply(&ctx, 1)).get("result").?.object.get("elements").?.array.items;
+
+    var found_hook = false;
+    var found_link = false;
+    for (elements) |el| {
+        const id = el.object.get("id") orelse continue;
+        if (std.mem.eql(u8, id.string, "child-hook")) {
+            found_hook = true;
+            try testing.expectEqual("listener", el.object.get("type").?.string);
+        } else if (std.mem.eql(u8, id.string, "child-link")) {
+            found_link = true;
+            try testing.expectEqual("http://127.0.0.1:9582/src/browser/tests/cdp/iframe/target.html", el.object.get("href").?.string);
+        }
+    }
+    try testing.expect(found_link);
+    try testing.expect(found_hook);
 }
 
 test "cdp.lp: getStructuredData" {
@@ -667,6 +760,62 @@ test "cdp.lp: getContentSignal" {
     try testing.expect(result.get("contentSignals") != null);
 }
 
+test "cdp.lp: getPageStatus" {
+    testing.expectLog(&.{.page_error});
+
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    const bc = try ctx.loadBrowserContext(.{});
+    const page = try bc.session.createPage();
+    bc.session.load_resources = .{};
+    // The iframe and worker skips warn; image and stylesheet are debug.
+    testing.expectLog(&.{ .disabled, .disabled });
+
+    const url = "http://localhost:9582/src/browser/tests/cdp/page_status.html";
+    try page.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    try ctx.processMessage(.{ .id = 1, .method = "LP.getPageStatus" });
+    var result = (try dumpReply(&ctx, 1)).get("result").?.object;
+    try testing.expectEqual(url, result.get("url").?.string);
+    try testing.expectEqual(200, result.get("httpStatus").?.integer);
+    try testing.expectEqual(null, result.get("botChallenge"));
+    try testing.expectEqual(null, result.get("navigateError"));
+    try testing.expectEqual(1, result.get("jsErrors").?.integer);
+
+    // Two webgl probes, three paint calls; the 2d context itself and its
+    // path setup don't count.
+    var unsupported = result.get("unsupported").?.object;
+    try testing.expectEqual(2, unsupported.get("webgl").?.integer);
+    try testing.expectEqual(3, unsupported.get("canvas2d").?.integer);
+
+    try testing.expectEqual(0, result.get("missingGlobals").?.array.items.len);
+
+    var skipped = result.get("skipped").?.object;
+    try testing.expectEqual(1, skipped.get("iframe").?.integer);
+    try testing.expectEqual(1, skipped.get("worker").?.integer);
+    try testing.expectEqual(1, skipped.get("image").?.integer);
+    try testing.expectEqual(1, skipped.get("stylesheet").?.integer);
+
+    try testing.expectEqual(0, result.get("failed").?.object.get("fetch").?.integer);
+    try testing.expectEqual(0, result.get("blocked").?.object.get("fetch").?.integer);
+    try testing.expectEqual(null, result.get("resourceChallenge"));
+
+    // A new top-level navigation starts over.
+    try bc.session.initiateRootNavigation(page.frame_id, "http://localhost:9582/src/browser/tests/cdp/dialog.html", .{ .reason = .address_bar, .kind = .{ .push = null } });
+    try testing.waitForPage(bc);
+
+    try ctx.processMessage(.{ .id = 2, .method = "LP.getPageStatus" });
+    result = (try dumpReply(&ctx, 2)).get("result").?.object;
+    try testing.expectEqual(0, result.get("jsErrors").?.integer);
+    unsupported = result.get("unsupported").?.object;
+    try testing.expectEqual(0, unsupported.get("webgl").?.integer);
+    try testing.expectEqual(0, unsupported.get("canvas2d").?.integer);
+    skipped = result.get("skipped").?.object;
+    try testing.expectEqual(0, skipped.get("iframe").?.integer);
+}
+
 test "cdp.lp: action tools" {
     var ctx = try testing.context();
     defer ctx.deinit();
@@ -680,7 +829,7 @@ test "cdp.lp: action tools" {
     try testing.waitForPage(bc);
 
     // Test Click
-    const btn = frame.document.getElementById("btn", frame).?.asNode();
+    const btn = frame.document.getElementById("btn").?.asNode();
     const btn_id = (try bc.node_registry.register(btn)).id;
     try ctx.processMessage(.{
         .id = 1,
@@ -689,7 +838,7 @@ test "cdp.lp: action tools" {
     });
 
     // Test Fill Input
-    const inp = frame.document.getElementById("inp", frame).?.asNode();
+    const inp = frame.document.getElementById("inp").?.asNode();
     const inp_id = (try bc.node_registry.register(inp)).id;
     try ctx.processMessage(.{
         .id = 2,
@@ -698,7 +847,7 @@ test "cdp.lp: action tools" {
     });
 
     // Test Fill Select
-    const sel = frame.document.getElementById("sel", frame).?.asNode();
+    const sel = frame.document.getElementById("sel").?.asNode();
     const sel_id = (try bc.node_registry.register(sel)).id;
     try ctx.processMessage(.{
         .id = 3,
@@ -707,7 +856,7 @@ test "cdp.lp: action tools" {
     });
 
     // Test Scroll
-    const scrollbox = frame.document.getElementById("scrollbox", frame).?.asNode();
+    const scrollbox = frame.document.getElementById("scrollbox").?.asNode();
     const scrollbox_id = (try bc.node_registry.register(scrollbox)).id;
     try ctx.processMessage(.{
         .id = 4,
@@ -717,9 +866,9 @@ test "cdp.lp: action tools" {
     try ctx.expectSentResult(.{ .backendNodeId = scrollbox_id, .x = 0, .y = 50 }, .{ .id = 4 });
 
     // A leaf inside a scroll container scrolls the container, not the leaf.
-    const leaf = frame.document.getElementById("innerleaf", frame).?.asNode();
+    const leaf = frame.document.getElementById("innerleaf").?.asNode();
     const leaf_id = (try bc.node_registry.register(leaf)).id;
-    const outer = frame.document.getElementById("outerscroll", frame).?.asNode();
+    const outer = frame.document.getElementById("outerscroll").?.asNode();
     const outer_id = (try bc.node_registry.register(outer)).id;
     try ctx.processMessage(.{
         .id = 5,
@@ -780,7 +929,7 @@ test "cdp.lp: waitForSelector" {
     try ctx.processMessage(.{
         .id = 3,
         .method = "LP.waitForSelector",
-        .params = .{ .selector = "#nonexistent", .timeout = 100 },
+        .params = .{ .selector = "#nonexistent", .timeout = 20 },
     });
     const err_obj = (try ctx.getSentMessage(2)).?.object.get("error").?.object;
     try testing.expect(err_obj.get("code") != null);

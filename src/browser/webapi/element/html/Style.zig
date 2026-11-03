@@ -16,11 +16,12 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../../js/js.zig");
-const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
@@ -94,7 +95,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLStyleElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

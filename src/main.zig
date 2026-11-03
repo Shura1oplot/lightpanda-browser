@@ -32,13 +32,13 @@ pub const std_options: std.Options = .{
 
 pub fn main(init: std.process.Init) !void {
     // allocator
-    // - in Debug mode we use the General Purpose Allocator to detect memory leaks
+    // - in Debug mode we use the SafeAllocator to detect memory leaks
     // - in Release mode we use the c allocator
-    var gpa_instance: std.heap.DebugAllocator(.{ .stack_trace_frames = 10 }) = .init;
+    var gpa_instance: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 10 });
     const gpa = if (lp.IS_DEBUG) gpa_instance.allocator() else std.heap.c_allocator;
 
     defer if (lp.IS_DEBUG) {
-        if (gpa_instance.detectLeaks() != 0) std.process.exit(1);
+        if (gpa_instance.deinit() != 0) std.process.exit(1);
     };
 
     // arena for main-specific allocations
@@ -61,8 +61,19 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args) !void {
     lp.core_dump.disableIfRequested();
+    lp.malloc_tuning.apply();
+    lp.crash_handler.attachSignalHandlers();
 
-    const args = try Config.parseArgs(main_arena, proc_args);
+    const args = Config.parseArgs(main_arena, proc_args) catch |err| switch (err) {
+        // Already logged where they were found.
+        error.UnknownCommand,
+        error.UnknownOption,
+        error.InvalidArgument,
+        error.MissingArgument,
+        error.TooManyPositionalArguments,
+        => std.process.exit(1),
+        else => return err,
+    };
     defer args.deinit(main_arena);
 
     switch (args.mode) {
@@ -74,6 +85,14 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 var stdout = std.Io.File.stdout().writerStreaming(lp.io, &.{});
                 try stdout.interface.print("{s}\n", .{lp.build_config.version});
             }
+            return std.process.cleanExit(lp.io);
+        },
+        .completion => |opts| {
+            const shell = opts.shell orelse return args.printUsageAndExit(main_arena, .completion, false);
+            var buf: [4096]u8 = undefined;
+            var stdout = std.Io.File.stdout().writerStreaming(lp.io, &buf);
+            try lp.completion.write(&stdout.interface, shell, args.exec_name);
+            try stdout.interface.flush();
             return std.process.cleanExit(lp.io);
         },
         .agent => |opts| if (opts.list_models) {
@@ -104,21 +123,27 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
     switch (args.mode) {
         .serve => |opts| {
             log.debug(.app, "startup", .{ .mode = "serve", .snapshot = app.snapshot.fromEmbedded() });
-            const address = std.Io.net.IpAddress.parse(opts.host, opts.port) catch |err| {
-                log.fatal(.app, "invalid server address", .{ .err = err, .host = opts.host, .port = opts.port });
-                return args.printUsageAndExit(main_arena, .serve, false);
+            const address: lp.Server.Address = if (opts.unix_socket) |path| .{ .unix = path } else .{
+                .ip = std.Io.net.IpAddress.parse(args.serveHost(), args.port()) catch |err| {
+                    log.fatal(.app, "invalid server address", .{ .err = err, .host = args.serveHost(), .port = args.port() });
+                    return args.printUsageAndExit(main_arena, .serve, false);
+                },
             };
 
             var server = lp.Server.init(app, address) catch |err| {
-                if (err == error.AddressInUse) {
-                    log.fatal(.app, "address already in use", .{
-                        .host = opts.host,
-                        .port = opts.port,
+                if (err != error.AddressInUse) {
+                    log.fatal(.app, "server run error", .{ .err = err });
+                } else switch (address) {
+                    .ip => log.fatal(.app, "address already in use", .{
+                        .host = args.serveHost(),
+                        .port = args.port(),
                         .hint = "Another process is already listening on this address. " ++
                             "Stop the other process or use --port to choose a different port.",
-                    });
-                } else {
-                    log.fatal(.app, "server run error", .{ .err = err });
+                    }),
+                    .unix => |path| log.fatal(.app, "address already in use", .{
+                        .path = path,
+                        .hint = "The path already exists. If no other process is listening on it, delete it.",
+                    }),
                 }
                 return err;
             };
@@ -130,11 +155,6 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
         },
         .fetch => |opts| {
             const urls = opts.url.items;
-
-            if (urls.len == 0) {
-                log.fatal(.app, "missing URL", .{});
-                return error.MissingArgument;
-            }
 
             // Plain (non-JSON) dump writes one document to stdout with no
             // framing, so it can't disambiguate more than one page.
@@ -170,6 +190,14 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 log.fatal(.app, "--dump-max-bytes needs text", .{ .dump = opts.dump, .allowed = "html, markdown" });
                 return error.InvalidArgument;
             }
+            if (opts.markdown_alternate and opts.dump != .markdown) {
+                log.fatal(.app, "invalid --markdown-alternate", .{ .needs = "--dump markdown" });
+                return error.InvalidArgument;
+            }
+            if (opts.markdown_alternate and opts.dump_selector != null) {
+                log.fatal(.app, "invalid --markdown-alternate", .{ .conflicts_with = "--dump-selector" });
+                return error.InvalidArgument;
+            }
 
             var fetch_opts = lp.FetchOpts{
                 .wait_ms = opts.wait_ms,
@@ -180,6 +208,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                 .dump_mode = opts.dump,
                 .selector = opts.dump_selector,
                 .fail_on_http_error = opts.fail_on_http_error,
+                .markdown_alternate = opts.markdown_alternate,
                 .dump = .{
                     .strip = opts.strip_mode,
                     .with_base = opts.with_base,
@@ -241,7 +270,7 @@ fn run(allocator: Allocator, main_arena: Allocator, proc_args: std.process.Args)
                     log.fatal(.mcp, "invalid cdp address", .{ .err = err, .port = port });
                     return;
                 };
-                cdp_server = try lp.Server.init(app, address);
+                cdp_server = try lp.Server.init(app, .{ .ip = address });
                 try sighandler.on(lp.Server.shutdown, .{cdp_server.?});
             }
             defer if (cdp_server) |s| s.deinit();
@@ -400,6 +429,9 @@ fn mcpThread(allocator: std.mem.Allocator, app: *App, cdp_server: ?*lp.Server, e
 }
 
 fn logConfigTips(config: *const Config) void {
+    // Only for a person reading the terminal, not for scripts capturing stderr.
+    if (!Config.stderrIsTty()) return;
+
     var count: usize = 0;
     var tips: [2]log.KV = undefined;
     if (config.obeyRobots() == false) {

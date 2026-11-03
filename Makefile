@@ -93,7 +93,7 @@ help:
 
 # $(ZIG) commands
 # ------------
-.PHONY: build build-v8-snapshot build-dev check-curl-impersonate download-v8 run run-release test bench data end2end clean
+.PHONY: build build-v8-snapshot build-dev check-curl-impersonate download-v8 run run-release test coverage bench data end2end clean
 
 check-curl-impersonate:
 	@test -f "$(CURL_IMPERSONATE_ARCHIVE)" || (printf "\033[33mMissing curl-impersonate archive: %s\033[0m\n" "$(CURL_IMPERSONATE_ARCHIVE)"; exit 1)
@@ -106,27 +106,27 @@ download-v8:
 		printf "\033[36mDownloading prebuilt V8 $(V8_VERSION) ($(ZIG_V8_TAG))...\033[0m\n"; \
 		curl -fL --progress-bar -o $(V8_CACHE) \
 			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_ARCHIVE) \
-		|| (rm -f $(V8_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
-	@printf "\033[33mV8 ready: %s\033[0m\n" "$(V8_CACHE)"
+		|| (rm -f $(V8_CACHE); printf "\033[31mDownload ERROR\033[0m\n"; exit 1) )
+	@printf "\033[32mV8 ready: %s\033[0m\n" "$(V8_CACHE)"
 ifeq ($(OS)_$(ARCH),linux_x86_64)
 	@test -f $(V8_SO_CACHE) || ( \
 		printf "\033[36mDownloading prebuilt shared V8 $(V8_VERSION) ($(ZIG_V8_TAG))...\033[0m\n"; \
 		curl -fL --progress-bar -o $(V8_SO_CACHE) \
 			https://github.com/lightpanda-io/zig-v8-fork/releases/download/$(ZIG_V8_TAG)/$(V8_SO_ASSET) \
-		|| (rm -f $(V8_SO_CACHE); printf "\033[33mDownload ERROR\033[0m\n"; exit 1) )
-	@printf "\033[33mShared V8 ready: %s\033[0m\n" "$(V8_SO_CACHE)"
+		|| (rm -f $(V8_SO_CACHE); printf "\033[31mDownload ERROR\033[0m\n"; exit 1) )
+	@printf "\033[32mShared V8 ready: %s\033[0m\n" "$(V8_SO_CACHE)"
 endif
 
 ## Build v8 snapshot
 build-v8-snapshot: check-curl-impersonate
 	@printf "\033[36mBuilding v8 snapshot (release safe)...\033[0m\n"
-	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=ReleaseFast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=fast snapshot_creator -- src/snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in release-fast mode
 build: build-v8-snapshot
 	@printf "\033[36mBuilding (release fast)...\033[0m\n"
-	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=ReleaseFast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
+	@$(ZIG) build $(BUILD_FLAGS) -Doptimize=fast -Dsnapshot_path=../../snapshot.bin || (printf "\033[33mBuild ERROR\033[0m\n"; exit 1;)
 	@printf "\033[33mBuild OK\033[0m\n"
 
 ## Build in debug mode
@@ -138,15 +138,20 @@ build-dev: check-curl-impersonate
 ## Run the server in release mode
 run: build
 	@printf "\033[36mRunning...\033[0m\n"
-	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
+	@./zig-out/bin/lightpanda || (printf "\033[31mRun ERROR\033[0m\n"; exit 1;)
 
 ## Run the server in debug mode
 run-debug: build-dev
 	@printf "\033[36mRunning...\033[0m\n"
-	@./zig-out/bin/lightpanda || (printf "\033[33mRun ERROR\033[0m\n"; exit 1;)
+	@./zig-out/bin/lightpanda || (printf "\033[31mRun ERROR\033[0m\n"; exit 1;)
 
 test: check-curl-impersonate
 	TEST_FILTER="$(or $(F),$(TEST_FILTER))" $(ZIG) build $(BUILD_FLAGS) test -freference-trace
+
+## Run unit tests under kcov, report in zig-out/coverage/index.html (F= filters)
+coverage:
+	TEST_FILTER="$(or $(F),$(TEST_FILTER))" $(ZIG) build $(BUILD_FLAGS) coverage
+	@echo "Coverage report: zig-out/coverage/index.html"
 
 ## Run demo/runner end to end tests
 end2end:

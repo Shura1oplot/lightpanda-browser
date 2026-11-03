@@ -23,7 +23,9 @@ const HttpClient = @import("../network/HttpClient.zig");
 
 const js = @import("js/js.zig");
 const Frame = @import("Frame.zig");
+const Mime = @import("Mime.zig");
 const ImportMap = @import("ImportMap.zig");
+const h5e = @import("parser/html5ever.zig");
 
 const Element = @import("webapi/Element.zig");
 const WorkerGlobalScope = @import("webapi/WorkerGlobalScope.zig");
@@ -212,24 +214,30 @@ pub fn preloadImport(self: *ScriptManagerBase, url: [:0]const u8, referrer: []co
     self.async_scripts.append(&script.node);
 
     const owner = self.owner;
-    owner.makeRequest(.{
-        .ctx = script,
-        .url = url,
-        .method = .GET,
-        .origin = owner.origin(),
-        .request_mode = .cors,
-        .credentials_mode = .same_origin,
-        .resource_type = .script,
-        .start_callback = if (log.enabled(.http, .debug)) Script.startCallback else null,
-        .header_callback = Script.headerCallback,
-        .data_callback = Script.dataCallback,
-        .done_callback = Script.doneCallback,
-        .error_callback = Script.errorCallback,
-        .shutdown_callback = Script.shutdownCallback,
-    }) catch |err| {
-        self.async_scripts.remove(&script.node);
-        return err;
+    const transfer = blk: {
+        errdefer self.async_scripts.remove(&script.node);
+        const transfer = try owner.newRequest(.{
+            .ctx = script,
+            .url = url,
+            .method = .GET,
+            .origin = owner.origin(),
+            .request_mode = .cors,
+            .credentials_mode = .same_origin,
+            .resource_type = .script,
+            .start_callback = if (log.enabled(.http, .debug)) Script.startCallback else null,
+            .header_callback = Script.headerCallback,
+            .data_callback = Script.dataCallback,
+            .done_callback = Script.doneCallback,
+            .error_callback = Script.errorCallback,
+            .shutdown_callback = Script.shutdownCallback,
+        });
+        errdefer transfer.deinit();
+        try owner.headersForRequest(transfer, .{});
+        break :blk transfer;
     };
+    gop.value_ptr.transfer_id = transfer.id;
+    // A synchronous failure is delivered through Script.errorCallback.
+    transfer.submit() catch {};
 }
 
 // <link rel=modulepreload href=...> (element set) or the prescan finding a
@@ -247,8 +255,14 @@ pub fn preloadModuleHint(self: *ScriptManagerBase, element: ?*Element.Html, url:
 
 // A <script type=module src=...> whose URL was hinted (modulepreload link or
 // prescan)
-pub fn takeModuleHint(self: *ScriptManagerBase, url: [:0]const u8) ?*Script {
+pub fn takeModuleHint(self: *ScriptManagerBase, url: [:0]const u8) !?*Script {
     const entry = self.imported_modules.getEntry(url) orelse return null;
+    if (entry.value_ptr.state == .err) {
+        // for loading/done, we'll remove the entry (because the script will
+        // get consumed). For err, we can keep the failure in the map to
+        // prevent a 2nd loader from needlessly trying to load this script
+        return try self.failedScript(url, .import);
+    }
     if (entry.value_ptr.hint == false) {
         // The script was preloaded, but not because of a hint. It came from v8
         // telling us to preload the module. We cannot take it here because we know
@@ -262,12 +276,28 @@ pub fn takeModuleHint(self: *ScriptManagerBase, url: [:0]const u8) ?*Script {
             break :blk script;
         },
         .done => |script| script,
-        // The hint's fetch failed; give the script its own attempt.
-        // I'm not sure if this is the right behavior. Why would a preload fail
-        // but the "real" load work? But it's definetly safer.
-        .err => return null,
+        .err => unreachable, // handled above
     };
     self.imported_modules.removeByPtr(entry.key_ptr);
+    return script;
+}
+
+// A dummy script for a module whose fetch already failed, to trigger the
+// consumer's failure path (Script.eval fails on status == 0)
+fn failedScript(self: *ScriptManagerBase, url: [:0]const u8, extra: Script.Extra) !*Script {
+    const arena = try self.acquireArena(.tiny, "SM.failedScript");
+    errdefer arena.release();
+    const script = try arena.create(Script);
+    script.* = .{
+        .arena = arena,
+        .url = url,
+        .status = 0,
+        .node = .{},
+        .manager = self,
+        .complete = true,
+        .source = .{ .remote = .empty },
+        .extra = extra,
+    };
     return script;
 }
 
@@ -277,6 +307,24 @@ pub fn waitForImport(self: *ScriptManagerBase, url: [:0]const u8) !ModuleSource 
     defer self.endEvaluationWindow(was_evaluating);
 
     var client = self.client;
+
+    // We're inside V8's module instantiation. Nothing but this module's
+    // transfer may be delivered: any other callback can run JS (e.g. a fetch()
+    // resolving), and JS that import()s a module of the graph V8 is still
+    // linking re-enters instantiation and crashes V8.
+    const frame_id = self.owner.frameId();
+    const blocked = blk: {
+        const entry = self.imported_modules.get(url) orelse break :blk false;
+        if (entry.state != .loading) {
+            break :blk false;
+        }
+        try client.blockOn(frame_id, entry.transfer_id);
+        break :blk true;
+    };
+    defer if (blocked) {
+        client.releaseBlocking(frame_id);
+    };
+
     while (true) {
         // imported_modules can be mutated by client.tick, so we need to lookup
         // the entry on each iteration.
@@ -330,6 +378,12 @@ pub fn releaseImport(self: *ScriptManagerBase, url: [:0]const u8) void {
 pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsync.Callback, cb_data: *anyopaque, referrer: []const u8) !void {
     // A <link rel=modulepreload> hint may already be fetching/fetched this module
     if (self.imported_modules.getEntry(url)) |entry| {
+        if (entry.value_ptr.state == .err) {
+            const script = try self.failedScript(url, .{ .import_async = .{ .callback = cb, .data = cb_data } });
+            self.ready_scripts.append(&script.node);
+            self.evaluate();
+            return;
+        }
         if (entry.value_ptr.hint) {
             switch (entry.value_ptr.state) {
                 .loading => |script| {
@@ -357,8 +411,7 @@ pub fn getAsyncImport(self: *ScriptManagerBase, url: [:0]const u8, cb: ImportAsy
                     self.evaluate();
                     return;
                 },
-                // The hint's fetch failed; give the import its own attempt.
-                .err => {},
+                .err => unreachable, // handled above
             }
         }
     }
@@ -551,6 +604,9 @@ pub const Script = struct {
     // limited .large arena pool
     source_arena: ?*lp.Arena = null,
 
+    // The encoding a remote script's Content-Type charset names.
+    encoding: ?h5e.EncodingInfo = null,
+
     extra: Extra,
     node: std.DoublyLinkedList.Node,
     manager: *ScriptManagerBase,
@@ -639,6 +695,32 @@ pub const Script = struct {
         return (self.source_arena orelse self.arena).allocator();
     }
 
+    pub fn setContentType(self: *Script, content_type: ?[]const u8) void {
+        const mime = Mime.parse(content_type orelse return) catch return;
+        self.encoding = .forLabel(mime.explicitCharset());
+    }
+
+    /// A classic script's text. Remote bytes are decoded with the
+    /// Content-Type charset, else the element's charset attribute, else the
+    /// document's encoding; a BOM overrides all three.
+    /// https://html.spec.whatwg.org/#fetch-a-classic-script
+    fn classicText(self: *Script, fe: Extra.FrameExtra) ![]const u8 {
+        if (self.source != .remote) {
+            return self.source.content();
+        }
+        const bytes = self.source.content();
+        const encoding = self.encoding orelse
+            h5e.EncodingInfo.forLabel(fe.script_element.asElement().getAttributeSafe(comptime .wrap("charset"))) orelse
+            h5e.EncodingInfo.forLabel(fe.frame.charset) orelse
+            h5e.EncodingInfo.utf8();
+        // V8 reads UTF-8 itself, replacing malformed sequences as decoding
+        // would, so only a UTF-16 BOM needs the decoder.
+        if (encoding.isUtf8() and !std.mem.startsWith(u8, bytes, "\xFE\xFF") and !std.mem.startsWith(u8, bytes, "\xFF\xFE")) {
+            return bytes;
+        }
+        return h5e.decodeToUtf8(self.sourceAllocator(), encoding.handle.?, bytes);
+    }
+
     pub fn startCallback(transfer: *HttpClient.Transfer) !void {
         log.debug(.http, "script fetch start", .{ .req = transfer });
     }
@@ -647,6 +729,7 @@ pub const Script = struct {
         const self: *Script = @ptrCast(@alignCast(transfer.req.ctx));
 
         self.status = transfer.responseStatus().?;
+        self.manager.owner.pageStatus().noteResponse(.script, transfer);
         if (transfer.responseStatus() != 200) {
             log.info(.http, "script header", .{
                 .req = transfer,
@@ -696,6 +779,8 @@ pub const Script = struct {
             self.debug_transfer_easy_id = if (transfer._conn) |c| @intFromPtr(c._easy) else 0;
         }
 
+        self.setContentType(transfer.contentType());
+
         lp.assert(self.source.remote.capacity == 0, "ScriptManagerBase.Header buffer", .{ .capacity = self.source.remote.capacity });
 
         const body_len = transfer.bodyLen();
@@ -713,7 +798,7 @@ pub const Script = struct {
     pub fn dataCallback(transfer: *HttpClient.Transfer, data: []const u8) !void {
         const self: *Script = @ptrCast(@alignCast(transfer.req.ctx));
         self._dataCallback(transfer, data) catch |err| {
-            log.err(.http, "SM.dataCallback", .{ .err = err, .transfer = transfer, .len = data.len });
+            log.debug(.http, "SM.dataCallback", .{ .err = err, .transfer = transfer, .len = data.len });
             return err;
         };
     }
@@ -757,13 +842,16 @@ pub const Script = struct {
 
     pub fn errorCallback(ctx: *anyopaque, err: anyerror) void {
         const self: *Script = @ptrCast(@alignCast(ctx));
+        if (self.status == 0) {
+            self.manager.owner.pageStatus().noteError(.script, err);
+        }
         if (self.status == 404) {
             log.info(.http, "script 404", .{
                 .req = self.url,
                 .extra = std.meta.activeTag(self.extra),
             });
         } else {
-            log.warn(.http, "script fetch error", .{
+            log.debug(.http, "script fetch error", .{
                 .err = err,
                 .req = self.url,
                 .extra = std.meta.activeTag(self.extra),
@@ -828,6 +916,12 @@ pub const Script = struct {
             return;
         }
 
+        if (self.source == .remote and (self.status < 200 or self.status > 299)) {
+            // An adopted preload / module hint that had already failed.
+            self.executeCallback(comptime .wrap("error"));
+            return;
+        }
+
         const previous_script = frame.document._current_script;
         frame.document._current_script = fe.script_element;
         defer frame.document._current_script = previous_script;
@@ -865,8 +959,8 @@ pub const Script = struct {
         // Handle importmap special case here: the content is a JSON containing imports.
         // Multiple <script type="importmap"> elements merge with first-wins semantics.
         if (fe.kind == .importmap) {
-            self.manager.importmap.merge(frame.arena, frame.base(), self.source.content()) catch |err| {
-                log.err(.browser, "parse importmap script", .{
+            self.manager.importmap.merge(frame.page_arena, frame.base(), self.source.content()) catch |err| {
+                log.debug(.browser, "parse importmap script", .{
                     .err = err,
                     .src = url,
                     .kind = fe.kind,
@@ -890,12 +984,14 @@ pub const Script = struct {
         defer frame._ce_reactions.popAndInvoke(ce_checkpoint, frame);
 
         const success = blk: {
-            const content = self.source.content();
             switch (fe.kind) {
-                .javascript => _ = local.eval(content, url) catch break :blk false,
+                .javascript => {
+                    const text = self.classicText(fe) catch break :blk false;
+                    _ = local.eval(text, url) catch break :blk false;
+                },
                 .module => {
                     // We don't care about waiting for the evaluation here.
-                    frame.js.module(false, local, content, url, cacheable) catch break :blk false;
+                    frame.js.module(false, local, self.source.content(), url, cacheable) catch break :blk false;
                 },
                 .importmap => unreachable, // handled before the try/catch.
             }
@@ -910,29 +1006,30 @@ pub const Script = struct {
             return;
         }
 
-        defer {
-            local.runMacrotasks(); // also runs microtasks
-            _ = frame.js.scheduler.run() catch |err| {
-                log.err(.frame, "scheduler", .{ .err = err });
-            };
-        }
+        defer if (frame.js.call_depth == 0) {
+            local.runMacrotasks();
+        };
 
         if (success) {
             self.executeCallback(comptime .wrap("load"));
             return;
         }
 
-        const caught = try_catch.caughtOrError(frame.local_arena, error.Unknown);
         lp.metrics.script_errors.incr();
-        log.warn(.js, "eval script", .{
-            .url = url,
-            .caught = caught,
-        });
 
+        // Report before caughtOrError: reading the exception's stack drops
+        // the frames reportError needs for the error's location.
         if (try_catch.exceptionValue()) |exc| {
             frame.window.reportError(exc, frame) catch |err| {
-                log.warn(.js, "eval script report error", .{ .url = url, .err = err });
+                log.debug(.js, "eval script report error", .{ .url = url, .err = err });
             };
+        }
+
+        if (log.enabled(.js, .debug)) {
+            log.debug(.js, "eval script", .{
+                .url = url,
+                .caught = try_catch.caughtOrError(frame.local_arena, error.Unknown),
+            });
         }
 
         // a classic script that throws is still "loaded". For a module, we can't
@@ -956,7 +1053,7 @@ pub const Script = struct {
         const frame = fe.frame;
         const Event = @import("webapi/Event.zig");
         const event = Event.initTrusted(typ, .{}, frame.page) catch |err| {
-            log.warn(.js, "script internal callback", .{
+            log.debug(.js, "script internal callback", .{
                 .url = self.url,
                 .type = typ,
                 .err = err,
@@ -964,7 +1061,7 @@ pub const Script = struct {
             return;
         };
         frame._event_manager.dispatch(fe.script_element.asNode().asEventTarget(), event) catch |err| {
-            log.warn(.js, "script callback", .{
+            log.debug(.js, "script callback", .{
                 .url = self.url,
                 .type = typ,
                 .err = err,
@@ -983,7 +1080,7 @@ pub const Script = struct {
         // hints only originate from a <link> in a frame, never from a worker
         const frame = self.manager.owner.frame;
         frame.queueElementEvent(element, kind) catch |err| {
-            log.warn(.js, "script hint event", .{ .url = self.url, .kind = kind, .err = err });
+            log.debug(.js, "script hint event", .{ .url = self.url, .kind = kind, .err = err });
         };
     }
 };
@@ -1018,6 +1115,9 @@ const ImportedModule = struct {
     // will never collect it (see preloadModuleHint). A dynamic import may
     // adopt a hint entry outright (see getAsyncImport).
     hint: bool = false,
+    // The transfer fetching the module, which waitForImport lets through the
+    // HttpClient's gate.
+    transfer_id: u32 = 0,
     state: State,
     buffer: std.ArrayList(u8) = .empty,
 
@@ -1075,9 +1175,6 @@ test "ScriptManagerBase: import whose submit fails synchronously releases its ar
     client.test_fail_submit = error.TestSubmitFailure;
     defer client.test_fail_submit = null;
 
-    // Script.errorCallback logs the fetch error.
-    testing.expectLog(&.{.http});
-
     const url: [:0]const u8 = "http://127.0.0.1:9582/fails-at-submit.js";
     try sm.preloadImport(url, frame.url, .{});
 
@@ -1096,9 +1193,6 @@ test "ScriptManagerBase: dynamic import whose submit fails synchronously rejects
     const client = sm.client;
     client.test_fail_submit = error.TestSubmitFailure;
     defer client.test_fail_submit = null;
-
-    // Script.errorCallback logs the fetch error.
-    testing.expectLog(&.{.http});
 
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);

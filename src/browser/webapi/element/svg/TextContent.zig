@@ -21,6 +21,7 @@ const lp = @import("lightpanda");
 const js = @import("../../../js/js.zig");
 const Frame = @import("../../../Frame.zig");
 const text_measure = @import("../../../text_measure.zig");
+const StyleManager = @import("../../../StyleManager.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
@@ -89,7 +90,7 @@ fn text(self: *TextContent, frame: *Frame) []const u8 {
 
 fn fontSize(self: *TextContent, frame: *Frame) f64 {
     const element = self.asElement();
-    const owner = element.ownerFrame(frame) orelse return frame._style_manager.computedFontSize(null);
+    const owner = element.ownerFrame(frame) orelse return StyleManager.DEFAULT_FONT_SIZE;
     return owner._style_manager.computedFontSize(element);
 }
 
@@ -117,7 +118,6 @@ pub const JsApi = struct {
     pub const bridge = js.Bridge(TextContent);
     pub const Meta = struct {
         pub const name = "SVGTextContentElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

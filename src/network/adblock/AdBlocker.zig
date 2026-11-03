@@ -29,7 +29,8 @@ const Parser = @import("Parser.zig");
 const Engine = @import("Engine.zig");
 const HostnameTrie = @import("HostnameTrie.zig");
 const NetworkFilter = @import("NetworkFilter.zig");
-const Regex = @import("Regex.zig");
+const repeat = @import("../../string.zig").repeat;
+const Regex = lp.Regex;
 
 const log = lp.log;
 
@@ -52,7 +53,7 @@ badfilters: std.AutoHashMapUnmanaged(u64, void),
 /// filter; they are freed here, not through `filters`.
 regexes: std.ArrayList(*const Regex),
 /// What the regexes are compiled and run with; PCRE2 allocates through it.
-regex_context: *Regex.Context,
+regex_context: *const Regex.Context,
 built: bool,
 trie: HostnameTrie,
 blocked: u32,
@@ -82,9 +83,7 @@ rules_cosmetic: usize,
 /// Real-world rules are well under 1KB; the parser skips anything longer.
 const LINE_MAX = 8 * 1024;
 
-pub fn init(allocator: Allocator) Allocator.Error!AdBlocker {
-    const regex_context: *Regex.Context = try .init(allocator);
-    errdefer regex_context.deinit();
+pub fn init(allocator: Allocator, regex_context: *const Regex.Context) Allocator.Error!AdBlocker {
     var trie: HostnameTrie = try .init(allocator);
     errdefer trie.deinit(allocator);
     const blocked = try trie.createTrie(allocator);
@@ -121,7 +120,6 @@ pub fn deinit(self: *AdBlocker) void {
     self.badfilters.deinit(self.allocator);
     for (self.regexes.items) |regex| regex.deinit();
     self.regexes.deinit(self.allocator);
-    self.regex_context.deinit();
     self.filters.deinit(self.allocator);
     self.trie.deinit(self.allocator);
     self.arena.deinit();
@@ -129,7 +127,7 @@ pub fn deinit(self: *AdBlocker) void {
 
 /// Builds the blocker from `--adblock-lists`, or null when the option is
 /// unset. Lists accumulate into the one instance.
-pub fn fromConfig(allocator: Allocator, config: *const Config) !?AdBlocker {
+pub fn fromConfig(allocator: Allocator, config: *const Config, regex_context: *const Regex.Context) !?AdBlocker {
     var paths = config.adblockLists() orelse return null;
 
     var adblocker: ?AdBlocker = null;
@@ -140,7 +138,7 @@ pub fn fromConfig(allocator: Allocator, config: *const Config) !?AdBlocker {
 
     while (paths.next()) |path| {
         if (path.len == 0) continue;
-        if (adblocker == null) adblocker = try AdBlocker.init(allocator);
+        if (adblocker == null) adblocker = try AdBlocker.init(allocator, regex_context);
         loadList(&adblocker.?, path, buf) catch |err| {
             log.err(.app, "adblock list load failed", .{ .path = path, .err = err });
             return err;
@@ -225,9 +223,15 @@ pub fn parse(self: *AdBlocker, reader: *Io.Reader) !void {
 
         if (filter.kind == .regex) {
             const body = filter.pattern[1 .. filter.pattern.len - 1];
-            const compiled = Regex.compile(self.regex_context, body, !filter.match_case) catch |err| switch (err) {
+            var diag: Regex.Diagnostic = .{};
+            const compiled = self.regex_context.compile(body, .{ .case_insensitive = !filter.match_case }, &diag) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.InvalidRegex => {
+                    log.debug(.app, "adblock regex rejected", .{
+                        .pattern = body,
+                        .err = diag.message(),
+                        .offset = diag.offset,
+                    });
                     self.rules_skipped += 1;
                     continue;
                 },
@@ -258,7 +262,7 @@ fn exceptionHostname(line: []const u8, buf: []u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "@@||")) return null;
     const rest = line[4..];
 
-    const end = std.mem.indexOfAny(u8, rest, "/^$*|") orelse rest.len;
+    const end = std.mem.findAny(u8, rest, "/^$*|") orelse rest.len;
     if (end == 0 or end > buf.len) return null;
 
     const hostname = std.ascii.lowerString(buf[0..end], rest[0..end]);
@@ -270,7 +274,7 @@ fn exceptionHostname(line: []const u8, buf: []u8) ?[]const u8 {
         };
         if (!ok) return null;
     }
-    if (std.mem.indexOfScalar(u8, hostname, '.') == null) return null;
+    if (std.mem.findScalar(u8, hostname, '.') == null) return null;
     return hostname;
 }
 
@@ -440,7 +444,7 @@ fn identity(filter: *const NetworkFilter) u64 {
     }
     hasher.update(&std.mem.toBytes(filter.types.bits()));
     hasher.update(&.{
-        @intFromEnum(filter.kind),
+        @backingInt(filter.kind),
         @intFromBool(filter.exception),
         @intFromBool(filter.important),
         @intFromBool(filter.first_party),
@@ -481,7 +485,7 @@ const document: ResourceTypes = .{ .document = true };
 const frame: ResourceTypes = .{ .subdocument = true };
 
 test "adblock.AdBlocker: the doubleclick rules from EasyList" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -523,7 +527,7 @@ test "adblock.AdBlocker: the doubleclick rules from EasyList" {
 }
 
 test "adblock.AdBlocker: the youtube rules from EasyList" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -559,7 +563,7 @@ test "adblock.AdBlocker: the youtube rules from EasyList" {
 }
 
 test "adblock.AdBlocker: parse accumulates across lists" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     var first: Io.Reader = .fixed(
@@ -596,7 +600,7 @@ test "adblock.AdBlocker: parse accumulates across lists" {
 }
 
 test "adblock.AdBlocker: tokens past the request buffer still match" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -605,7 +609,7 @@ test "adblock.AdBlocker: tokens past the request buffer still match" {
 
     // 140 tokens of query noise push the filter's token ("utm", its rarest)
     // past what the request holds; the engine walks the rest of the URL.
-    const noise = "https://example.com/?" ++ "a=1&" ** 70;
+    const noise = "https://example.com/?" ++ repeat("a=1&", 70);
     var buf: [512]u8 = undefined;
     const overflowing: Request = Request.init(noise ++ "utm_tracker=1", &buf, "a.com", script).?;
     try testing.expect(overflowing.tail.len != 0);
@@ -616,7 +620,7 @@ test "adblock.AdBlocker: tokens past the request buffer still match" {
 }
 
 test "adblock.AdBlocker: cosmetic-realm rules are not skipped rules" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -633,7 +637,7 @@ test "adblock.AdBlocker: cosmetic-realm rules are not skipped rules" {
 }
 
 test "adblock.AdBlocker: the regex rules from EasyList" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -666,7 +670,7 @@ test "adblock.AdBlocker: the regex rules from EasyList" {
 }
 
 test "adblock.AdBlocker: a regex is found under every token it may match" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -679,7 +683,7 @@ test "adblock.AdBlocker: a regex is found under every token it may match" {
 }
 
 test "adblock.AdBlocker: $badfilter removes a regex rule" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -692,7 +696,7 @@ test "adblock.AdBlocker: $badfilter removes a regex rule" {
 }
 
 test "adblock.AdBlocker: verdict precedence" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -717,7 +721,7 @@ test "adblock.AdBlocker: verdict precedence" {
 }
 
 test "adblock.AdBlocker: $badfilter removes its target" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -743,7 +747,7 @@ test "adblock.AdBlocker: $badfilter removes its target" {
 }
 
 test "adblock.AdBlocker: exceptions we cannot read suppress their hostname" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -769,7 +773,7 @@ test "adblock.AdBlocker: exceptions we cannot read suppress their hostname" {
 }
 
 test "adblock.AdBlocker: trie absorbs every pure-hostname form" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     try testLoad(&blocker,
@@ -795,7 +799,7 @@ test "adblock.AdBlocker: trie absorbs every pure-hostname form" {
 }
 
 test "adblock.AdBlocker: $important on an exception is invalid" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
 
     // uBO rejects `@@…$important`, so nothing outranks a `$important`
@@ -812,7 +816,7 @@ test "adblock.AdBlocker: $important on an exception is invalid" {
 }
 
 test "adblock.AdBlocker: an empty blocker decides nothing" {
-    var blocker: AdBlocker = try .init(testing.allocator);
+    var blocker: AdBlocker = try .init(testing.allocator, testing.test_app.regex_context);
     defer blocker.deinit();
     try blocker.build();
 

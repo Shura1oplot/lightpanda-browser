@@ -27,6 +27,7 @@ const Link = @import("Link.zig");
 
 const CDP = @import("cdp/CDP.zig");
 const BiDi = @import("bidi/BiDi.zig");
+const http_command = @import("bidi/http_command.zig");
 
 const log = lp.log;
 
@@ -106,7 +107,7 @@ pub fn onMessage(self: *const Driver, msg: *Inbox.Message) anyerror!void {
 pub fn onPing(self: *const Driver, body: []const u8) void {
     const l = self.link() orelse return;
     l.sendPong(body) catch |err| {
-        log.warn(self.scope, "pong", .{ .err = err });
+        log.debug(self.scope, "pong", .{ .err = err });
     };
 }
 
@@ -122,13 +123,25 @@ pub fn onLink(self: *const Driver, l: *Link) void {
     }
 }
 
+// Worker Thread. An HTTP WebDriver command; its connection waits on our answer.
+pub fn onHttp(self: *const Driver, command: http_command.Command) void {
+    switch (self.impl) {
+        .bidi => |bidi| bidi.onHttpCommand(command),
+        .cdp => {
+            if (comptime lp.IS_DEBUG) {
+                lp.assert(false, "Driver.onHttp cdp", .{});
+            }
+        },
+    }
+}
+
 // Worker Thread. The websocket is closing. Should we kill the worker? That's
 // up to the implementation (hint: for CDP, it's always "yes" and for WebDriver
 // it's "yes" for a BiDi-only session)
 pub fn onClose(self: *const Driver) bool {
     if (self.link()) |l| {
         l.send(&WS.CLOSE_NORMAL) catch |err| {
-            log.warn(self.scope, "close reply", .{ .err = err });
+            log.debug(self.scope, "close reply", .{ .err = err });
         };
     }
     return self.onDisconnect(null);
@@ -139,7 +152,7 @@ pub fn onClose(self: *const Driver) bool {
 pub fn onQuit(self: *const Driver) void {
     if (self.link()) |l| {
         l.send(&WS.CLOSE_NORMAL) catch |err| {
-            log.warn(self.scope, "quit close", .{ .err = err });
+            log.debug(self.scope, "quit close", .{ .err = err });
         };
     }
     log.info(self.scope, "session ended", .{});
@@ -204,7 +217,7 @@ fn tick(self: *const Driver) !bool {
         // the close frame here can't interleave with another write.
         if (self.link()) |l| {
             l.send(&WS.CLOSE_GOING_AWAY) catch |err| {
-                log.warn(self.scope, "terminate close", .{ .err = err });
+                log.debug(self.scope, "terminate close", .{ .err = err });
             };
         }
         return false;

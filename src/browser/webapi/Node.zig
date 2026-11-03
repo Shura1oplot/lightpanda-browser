@@ -241,28 +241,6 @@ pub fn parentElement(self: *const Node) ?*Element {
     return parent.is(Element);
 }
 
-// Validates that a node can be inserted as a child of parent.
-fn validateNodeInsertion(parent: *Node, node: *Node) !void {
-    // Check if parent is a valid type to have children
-    if (parent._type != .document and parent._type != .element and parent._type != .document_fragment) {
-        return error.HierarchyError;
-    }
-
-    // Check if node contains parent (would create a cycle)
-    if (node.contains(parent)) {
-        return error.HierarchyError;
-    }
-
-    if (node._type == .attribute) {
-        return error.HierarchyError;
-    }
-
-    // Doctype nodes can only be inserted into a Document
-    if (node._type == .document_type and parent._type != .document) {
-        return error.HierarchyError;
-    }
-}
-
 // DOM "ensure pre-insert validity" (and its replaceChild variant), with the
 // checks in spec order: parent type, cycle, child-parent (NotFoundError),
 // node type, then the document-parent structure rules.
@@ -274,7 +252,7 @@ fn ensurePreInsertValidity(parent: *Node, node: *Node, child: ?*Node, comptime m
         else => return error.HierarchyError,
     }
 
-    if (node.contains(parent)) {
+    if (node.isHostIncludingInclusiveAncestorOf(parent)) {
         return error.HierarchyError;
     }
 
@@ -481,9 +459,9 @@ pub fn setTextContent(self: *Node, data: []const u8, frame: *Frame) !void {
         .element => {
             const el = self.subtype(Element);
             if (data.len == 0) {
-                return el.replaceChildren(&.{}, frame);
+                return el.replaceChildren(.init(&.{}), frame);
             }
-            return el.replaceChildren(&.{.{ .text = data }}, frame);
+            return el.replaceChildren(.init(&.{.{ .text = data }}), frame);
         },
         // Per spec, setting textContent on CharacterData runs replaceData(0, length, value)
         .cdata => {
@@ -495,17 +473,17 @@ pub fn setTextContent(self: *Node, data: []const u8, frame: *Frame) !void {
         .document_fragment => {
             const frag = self.subtype(DocumentFragment);
             if (data.len == 0) {
-                return frag.replaceChildren(&.{}, frame);
+                return frag.replaceChildren(.init(&.{}), frame);
             }
-            return frag.replaceChildren(&.{.{ .text = data }}, frame);
+            return frag.replaceChildren(.init(&.{.{ .text = data }}), frame);
         },
         .attribute => return self.subtype(Element.Attribute).setValue(.wrap(data), frame),
     }
 }
 
-pub fn getNodeName(self: *const Node, buf: []u8) []const u8 {
+pub fn getNodeName(self: *const Node, allocator: Allocator) []const u8 {
     return switch (self._type) {
-        .element => self.subtype(Element).getTagNameSpec(buf),
+        .element => self.subtype(Element).getTagNameSpec(allocator),
         .cdata => {
             const cd = self.subtype(CData);
             return switch (cd._type) {
@@ -700,32 +678,32 @@ pub fn contains(self: *const Node, child_: ?*const Node) bool {
     return false;
 }
 
+// Like contains(), but also climbs from a shadow root or template contents.
+pub fn isHostIncludingInclusiveAncestorOf(self: *const Node, other: *Node) bool {
+    var node = other;
+    while (node != self) {
+        if (node._parent) |parent| {
+            node = parent;
+        } else {
+            const fragment = node.is(DocumentFragment) orelse return false;
+            node = (fragment.getHost() orelse return false).asNode();
+        }
+    }
+    return true;
+}
+
 pub fn ownerDocument(self: *const Node, frame: *const Frame) ?*Document {
     // A document node does not have an owner.
     if (self._type == .document) {
         return null;
     }
-
-    // An attribute node follows its element (including across adoption).
-    if (self._type == .attribute) {
-        if (self.subtype(Element.Attribute)._element) |element| {
-            return element.asNode().ownerDocument(frame);
-        }
-    }
-
-    // The table is the browser's, so any frame of it will do.
-    return frame._session.browser.documents.get(self._owner);
+    return self.getDocument(frame);
 }
 
 // The spec's "node document": every node has one, a document's is itself.
 // `frame` only reaches the registry; any frame will do.
 pub fn getDocument(self: *const Node, frame: *const Frame) *Document {
-    if (self._type == .document) {
-        return self.subtype(Document);
-    }
-    const doc = self.ownerDocument(frame);
-    lp.assert(doc != null, "null node document", .{ .type = self.getNodeType() });
-    return doc.?;
+    return frame.documents.get(self._owner);
 }
 
 // Returns the Frame that owns this node's tree, or null when the node's
@@ -967,7 +945,7 @@ pub fn moveBefore(self: *Node, node_val: js.Value, child_val: js.Value, frame: *
         else => return error.HierarchyError,
     }
 
-    if (node.contains(self)) {
+    if (node.isHostIncludingInclusiveAncestorOf(self)) {
         return error.HierarchyError;
     }
 
@@ -1029,14 +1007,22 @@ pub fn moveBefore(self: *Node, node_val: js.Value, child_val: js.Value, frame: *
     const connected = node.isConnected();
     const previous_root = node.getRootNode(.{});
 
-    if (node._parent) |old_parent| {
-        frame.removeNode(old_parent, node, .{ .reconnect_to = self });
+    const old_parent = node._parent;
+    if (old_parent) |op| {
+        frame.removeNode(op, node, .{ .reconnect_to = self, .move = true });
     }
 
     if (ref) |r| {
         try frame.insertNodeRelative(self, node, .{ .before = r }, .{ .previous_root = previous_root });
     } else {
         try frame.appendNode(self, node, .{ .previous_root = previous_root });
+    }
+
+    if (old_parent) |op| {
+        // the removal skipped this to not expose the intermediate state
+        if (op != self and frame._form_associated.items.len != 0) {
+            Element.Html.Custom.formLegendMoved(op, node, frame);
+        }
     }
 
     if (connected) {
@@ -1436,15 +1422,18 @@ pub fn getElementsByTagName(self: *Node, tag_name: []const u8, frame: *Frame) !G
         };
     }
 
-    const lower = std.ascii.lowerString(&frame.buf, tag_name);
+    const lower = if (Element.Attribute.needsLowerCasing(tag_name))
+        try std.ascii.allocLowerString(frame.local_arena, tag_name)
+    else
+        tag_name;
     if (Node.Element.Tag.parseForMatch(lower)) |known| {
-        // optimized for known tag names, comparis
+        // optimized for known tag names, comparison
         return .{
             .tag = collections.NodeLive(.tag).init(self, known, frame),
         };
     }
 
-    const arena = frame.arena;
+    const arena = frame.page_arena;
     const filter = try String.init(arena, tag_name, .{});
     return .{ .tag_name = collections.NodeLive(.tag_name).init(self, filter, frame) };
 }
@@ -1463,13 +1452,13 @@ pub fn getElementsByTagNameNS(self: *Node, namespace: ?[]const u8, local_name: [
 
     return collections.NodeLive(.tag_name_ns).init(self, .{
         .namespace = ns,
-        .local_name = try String.init(frame.arena, local_name, .{}),
+        .local_name = try String.init(frame.page_arena, local_name, .{}),
     }, frame);
 }
 
 // Not exposed in the WebAPI, but used by both Element and Document
 pub fn getElementsByClassName(self: *Node, class_name: []const u8, frame: *Frame) !collections.NodeLive(.class_name) {
-    const arena = frame.arena;
+    const arena = frame.page_arena;
 
     // Parse space-separated class names
     var class_names: std.ArrayList([]const u8) = .empty;
@@ -1526,49 +1515,109 @@ pub fn prependNodes(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void
     _ = try self.insertBefore(fragment_node, self.firstChild(), frame);
 }
 
-/// Shared implementation of replaceChildren for Element, Document, and DocumentFragment.
-/// Validates all nodes, removes existing children, then appends new children.
-pub fn replaceChildren(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void {
-    // First pass: validate all nodes and collect them
-    // We need to collect because DocumentFragments contribute their children, not themselves
-    var children_to_add: std.ArrayList(*Node) = .empty;
+/// Element and CharacterData replaceWith.
+pub fn replaceWithNodes(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void {
+    const parent = self._parent orelse return;
+    const viable_next = NodeOrText.viableNextSibling(self, nodes);
 
+    if (nodes.len == 1) {
+        const node = try nodes[0].toNode(self.getDocument(frame));
+        _ = try parent.replaceChild(node, self, frame);
+        return;
+    }
+
+    const fragment = try DocumentFragment.init(self.getDocument(frame), frame);
+    const fragment_node = fragment.asNode();
+    defer if (fragment_node.firstChild() == null) {
+        frame._factory.destroy(fragment);
+    };
     for (nodes) |node_or_text| {
         const child = try node_or_text.toNode(self.getDocument(frame));
+        _ = try fragment_node.appendChild(child, frame);
+    }
 
-        // DocumentFragments contribute their children, not themselves
-        if (child.is(DocumentFragment)) |frag| {
-            var frag_it = frag.asNode().childrenIterator();
-            while (frag_it.next()) |frag_child| {
-                try validateNodeInsertion(self, frag_child);
-                try children_to_add.append(frame.call_arena, frag_child);
-            }
-        } else {
-            try validateNodeInsertion(self, child);
-            try children_to_add.append(frame.call_arena, child);
+    // self may itself be one of the nodes, now moved into the fragment.
+    if (self._parent == parent) {
+        _ = try parent.replaceChild(fragment_node, self, frame);
+    } else {
+        _ = try parent.insertBefore(fragment_node, viable_next, frame);
+    }
+}
+
+/// Shared implementation of replaceChildren for Element, Document, and DocumentFragment.
+pub fn replaceChildren(self: *Node, nodes: []const NodeOrText, frame: *Frame) !void {
+    if (nodes.len > 1) {
+        // Several nodes are converted into a fragment first, as append and
+        // prepend do: a node passed twice is inserted once, and nodes taken
+        // from this parent don't leave a removal record behind.
+        const fragment = try DocumentFragment.init(self.getDocument(frame), frame);
+        const fragment_node = fragment.asNode();
+        defer if (fragment_node.firstChild() == null) frame._factory.destroy(fragment);
+        for (nodes) |node_or_text| {
+            const child = try node_or_text.toNode(self.getDocument(frame));
+            _ = try fragment_node.appendChild(child, frame);
         }
+        return self.replaceAll(fragment_node, frame);
+    }
+    const node = if (nodes.len == 1) try nodes[0].toNode(self.getDocument(frame)) else null;
+    return self.replaceAll(node, frame);
+}
+
+// DOM "replace all": observers get one combined record with every removed
+// and added node, so per-node notification is suppressed.
+fn replaceAll(self: *Node, node_: ?*Node, frame: *Frame) !void {
+    if (node_) |node| {
+        try ensurePreInsertValidity(self, node, null, .insert);
     }
 
     frame.domChanged();
-
-    // Per the "replace all" algorithm, observers get one combined mutation
-    // record with all removed and added nodes, so per-node notification is
-    // suppressed here.
     const notify = Frame.observers.hasMutationObservers(frame);
-    const removed = try self.removeAllChildrenCollecting(notify, frame);
 
-    // Append new children
-    for (children_to_add.items) |child| {
-        var previous_root: ?*Node = null;
-        if (child._parent) |previous_parent| {
-            previous_root = child.getRootNode(.{});
-            frame.removeNode(previous_parent, child, .{ .reconnect_to = self });
+    var added: std.ArrayList(*Node) = .empty;
+    if (notify) {
+        if (node_) |node| {
+            if (node.is(DocumentFragment)) |_| {
+                var it = node.childrenIterator();
+                while (it.next()) |child| {
+                    try added.append(frame.call_arena, child);
+                }
+            } else {
+                try added.append(frame.call_arena, node);
+            }
         }
-        try frame.appendNode(self, child, .{ .previous_root = previous_root, .notify_observers = false });
     }
 
-    if (notify and (removed.items.len > 0 or children_to_add.items.len > 0)) {
-        Frame.observers.notifyChildListChange(frame, self, children_to_add.items, removed.items, null, null);
+    const removed = try self.removeAllChildrenCollecting(notify, frame);
+
+    if (node_) |node| {
+        if (node.is(DocumentFragment)) |_| {
+            try frame.moveAllChildren(node, self, null, .silent_parent);
+        } else {
+            // A Document can't be inserted, so every other node has an owner.
+            const child_owner = node.ownerDocument(frame).?;
+            const parent_owner = self.ownerDocument(frame) orelse self.as(Document);
+            const adopting = child_owner != parent_owner;
+
+            var previous_root: ?*Node = null;
+            if (node._parent) |previous_parent| {
+                previous_root = node.getRootNode(.{});
+                frame.removeNode(previous_parent, node, .{
+                    .reconnect_to = if (adopting) null else self,
+                });
+            }
+            if (adopting) {
+                try frame.adoptNodeTree(node, child_owner, parent_owner);
+            }
+            try frame.appendNode(self, node, .{
+                .previous_root = previous_root,
+                .adopting_to_new_document = adopting,
+                .notify_observers = false,
+            });
+        }
+    }
+
+    if (notify and (removed.items.len > 0 or added.items.len > 0)) {
+        Frame.observers.notifyChildListChange(frame, self, added.items, removed.items, null, null);
     }
 }
 
@@ -1610,6 +1659,28 @@ pub fn setHTML(self: *Node, html: []const u8, opts: Frame.parse.FragmentParseOpt
         if (removed.items.len > 0 or added.items.len > 0) {
             Frame.observers.notifyChildListChange(frame, self, added.items, removed.items, null, null);
         }
+    }
+}
+
+pub fn replaceAllWithFragment(self: *Node, fragment: *Node, frame: *Frame) !void {
+    frame.domChanged();
+
+    const notify = Frame.observers.hasMutationObservers(frame);
+    var added: std.ArrayList(*Node) = .empty;
+    if (notify) {
+        var it = fragment.childrenIterator();
+        while (it.next()) |child| {
+            try added.append(frame.call_arena, child);
+        }
+    }
+
+    const removed = try self.removeAllChildrenCollecting(notify, frame);
+    try frame.moveAllChildren(fragment, self, null, .silent_parent);
+
+    if (notify and (removed.items.len > 0 or added.items.len > 0)) {
+        // The point here is to batch all of the adds/remove and get a combined
+        // mutation record
+        Frame.observers.notifyChildListChange(frame, self, added.items, removed.items, null, null);
     }
 }
 
@@ -1699,12 +1770,59 @@ pub fn assignedSlot(self: *Node, frame: *const Frame) ?*Element.Html.Slot {
     return frame.page._assigned_slots.get(self);
 }
 
+/// Inert applies to the whole subtree, so any inert flat-tree ancestor counts.
+pub fn isInert(self: *Node, frame: *const Frame) bool {
+    var current: ?*Node = self;
+    while (current) |node| : (current = node.flatTreeParent(frame)) {
+        if (node.is(Element)) |el| {
+            if (el._namespace == .html and el.hasAttributeSafe(comptime .wrap("inert"))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// The parent in the flat tree: an assigned slottable's slot, a shadow root's
+/// host, else the DOM parent.
+pub fn flatTreeParent(self: *Node, frame: *const Frame) ?*Node {
+    if (self.assignedSlot(frame)) |slot| {
+        return slot.asNode();
+    }
+    if (self.is(ShadowRoot)) |shadow| {
+        return shadow._host.asNode();
+    }
+    return self._parent;
+}
+
+/// The flat-tree parent element: shadow content inherits from its host, a
+/// slotted node from its slot.
+pub fn flatTreeParentElement(self: *Node, frame: *const Frame) ?*Element {
+    const parent = self.flatTreeParent(frame) orelse return null;
+    if (parent.is(Element)) |el| {
+        return el;
+    }
+    // A shadow root's flat-tree parent is its host
+    return (parent.flatTreeParent(frame) orelse return null).is(Element);
+}
+
+/// Like flatTreeParent, but never a shadow root: the parent as
+/// TreeWalker.Flat walks, which doesn't visit shadow roots.
+pub fn flatParent(self: *Node, frame: *const Frame) ?*Node {
+    const parent = self.flatTreeParent(frame) orelse return null;
+    // A shadow tree's top-level nodes have the shadow root as their parent;
+    // skip to its host.
+    if (parent.is(ShadowRoot)) |shadow| {
+        return shadow._host.asNode();
+    }
+    return parent;
+}
+
 pub const JsApi = struct {
     pub const bridge = js.Bridge(Node);
 
     pub const Meta = struct {
         pub const name = "Node";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -1730,12 +1848,16 @@ pub const JsApi = struct {
 
     pub const nodeName = bridge.accessor(struct {
         fn wrap(self: *const Node, frame: *Frame) []const u8 {
-            return self.getNodeName(&frame.buf);
+            return self.getNodeName(frame.local_arena);
         }
     }.wrap, null, .{});
     pub const nodeType = bridge.accessor(Node.getNodeType, null, .{});
 
-    pub const textContent = bridge.accessor(_textContext, Node.setTextContent, .{ .ce_reactions = true });
+    pub const textContent = bridge.accessor(_textContext, _setTextContent, .{ .ce_reactions = true });
+    // textContent is a nullable DOMString: null (and undefined) mean the empty string.
+    fn _setTextContent(self: *Node, data: ?[]const u8, frame: *Frame) !void {
+        return self.setTextContent(data orelse "", frame);
+    }
     fn _textContext(self: *Node, frame: *const Frame) !?[]const u8 {
         // cdata and attributes can return value directly, avoiding the copy
         switch (self._type) {
@@ -1764,8 +1886,14 @@ pub const JsApi = struct {
     pub const isConnected = bridge.accessor(Node.isConnected, null, .{});
     pub const ownerDocument = bridge.accessor(Node.ownerDocument, null, .{});
     pub const hasChildNodes = bridge.function(Node.hasChildNodes, .{});
-    pub const isSameNode = bridge.function(Node.isSameNode, .{});
-    pub const contains = bridge.function(Node.contains, .{});
+    pub const isSameNode = bridge.function(_isSameNode, .{});
+    fn _isSameNode(self: *const Node, other: js.Nullable(*Node)) bool {
+        return self.isSameNode(other.value);
+    }
+    pub const contains = bridge.function(_contains, .{});
+    fn _contains(self: *const Node, other: js.Nullable(*const Node)) bool {
+        return self.contains(other.value);
+    }
     pub const removeChild = bridge.function(Node.removeChild, .{ .ce_reactions = true });
     pub const nodeValue = bridge.accessor(Node.getNodeValue, Node.setNodeValue, .{ .ce_reactions = true });
     pub const insertBefore = bridge.function(_insertBefore, .{ .ce_reactions = true });
@@ -1782,10 +1910,22 @@ pub const JsApi = struct {
     fn _getRootNode(self: *Node, opts: ?GetRootNodeOpts) *Node {
         return self.getRootNode(opts orelse .{});
     }
-    pub const isEqualNode = bridge.function(Node.isEqualNode, .{});
-    pub const lookupNamespaceURI = bridge.function(Node.lookupNamespaceURI, .{});
-    pub const lookupPrefix = bridge.function(Node.lookupPrefix, .{});
-    pub const isDefaultNamespace = bridge.function(Node.isDefaultNamespace, .{});
+    pub const isEqualNode = bridge.function(_isEqualNode, .{});
+    fn _isEqualNode(self: *Node, other: js.Nullable(*Node)) bool {
+        return self.isEqualNode(other.value orelse return false);
+    }
+    pub const lookupNamespaceURI = bridge.function(_lookupNamespaceURI, .{});
+    fn _lookupNamespaceURI(self: *Node, prefix: js.Nullable([]const u8), frame: *Frame) ?[]const u8 {
+        return self.lookupNamespaceURI(prefix.value, frame);
+    }
+    pub const lookupPrefix = bridge.function(_lookupPrefix, .{});
+    fn _lookupPrefix(self: *Node, namespace: js.Nullable([]const u8), frame: *Frame) ?[]const u8 {
+        return self.lookupPrefix(namespace.value, frame);
+    }
+    pub const isDefaultNamespace = bridge.function(_isDefaultNamespace, .{});
+    fn _isDefaultNamespace(self: *Node, namespace: js.Nullable([]const u8), frame: *Frame) bool {
+        return self.isDefaultNamespace(namespace.value, frame);
+    }
 
     pub const baseURI = bridge.accessor(_baseURI, null, .{});
     fn _baseURI(self: *Node, frame: *const Frame) []const u8 {

@@ -27,8 +27,6 @@ const RenewResponse = Cache.RenewResponse;
 const CachePutRequest = Cache.CachePutRequest;
 const CacheGetResult = Cache.CacheGetResult;
 const CachedResponse = Cache.CachedResponse;
-const CacheControl = Cache.CacheControl;
-const parseDeltaSeconds = Cache.parseDeltaSeconds;
 
 const Http = @import("../http.zig");
 const Blob = @import("../../storage/sqlite/Sqlite.zig").Blob;
@@ -97,7 +95,34 @@ const SqliteCachePath = union(enum) {
     }
 };
 
+const db_name = "cache.db";
+const db_files = [_][]const u8{ db_name, db_name ++ "-wal", db_name ++ "-shm" };
+
 pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u32) !SqliteCache {
+    return open(allocator, path, entry_limit) catch |err| {
+        const cache_dir = switch (path) {
+            .path => |p| p,
+            .memory => return err,
+        };
+        switch (err) {
+            error.NotADB, error.Corrupt => {},
+            else => return err,
+        }
+        // It's only a cache: start over rather than fail to start.
+        log.warn(.cache, "discarding unreadable cache", .{ .kind = "SqliteCache", .path = cache_dir, .err = err });
+        var dir = try std.Io.Dir.cwd().openDir(lp.io, cache_dir, .{});
+        defer dir.close(lp.io);
+        for (db_files) |name| {
+            dir.deleteFile(lp.io, name) catch |delete_err| switch (delete_err) {
+                error.FileNotFound => {},
+                else => return delete_err,
+            };
+        }
+        return open(allocator, path, entry_limit);
+    };
+}
+
+fn open(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u32) !SqliteCache {
     var pool = switch (path) {
         .memory => try Pool.init(allocator, ":memory:"),
         .path => |cache_dir| blk: {
@@ -110,9 +135,8 @@ pub fn init(allocator: std.mem.Allocator, path: SqliteCachePath, entry_limit: u3
                 return e;
             };
 
-            const full_path = try std.fmt.allocPrintSentinel(
-                allocator,
-                "{s}/cache.db",
+            const full_path = try allocator.printSentinel(
+                "{s}/" ++ db_name,
                 .{std.mem.trimEnd(u8, cache_dir, &.{'/'})},
                 0,
             );
@@ -351,25 +375,7 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
     try conn.begin(.immediate);
     defer conn.rollback() catch {};
 
-    var age_at_store: u64 = 0;
-    var content_type: ?[]const u8 = null;
-    var etag: ?[]const u8 = null;
-    var last_modified: ?[]const u8 = null;
-    var cache_control: ?CacheControl = null;
-
-    for (req.headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "Age")) {
-            age_at_store = parseDeltaSeconds(h.value) orelse 0;
-        } else if (std.ascii.eqlIgnoreCase(h.name, "Cache-Control")) {
-            cache_control = CacheControl.parse(h.value) orelse continue;
-        } else if (std.ascii.eqlIgnoreCase(h.name, "ETag")) {
-            etag = h.value;
-        } else if (std.ascii.eqlIgnoreCase(h.name, "Last-Modified")) {
-            last_modified = h.value;
-        } else if (std.ascii.eqlIgnoreCase(h.name, "Content-Type")) {
-            content_type = h.value;
-        }
-    }
+    const directive = req.directive();
 
     try conn.exec(
         \\ update cache
@@ -382,13 +388,13 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
         \\     last_modified = coalesce($7, last_modified)
         \\ where url = $8
     , .{
-        req.timestamp,
-        age_at_store,
-        if (cache_control) |cc| cc.max_age else null,
-        if (cache_control) |cc| cc.must_revalidate else null,
-        content_type,
-        etag,
-        last_modified,
+        directive.timestamp,
+        directive.age_at_store,
+        directive.max_age,
+        directive.must_revalidate,
+        directive.content_type,
+        directive.etag,
+        directive.last_modified,
         req.url,
     });
 
@@ -398,13 +404,29 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
         return error.CacheEntryNotFound;
     }
 
-    // Clear old non-Vary headers.
-    try conn.exec("delete from header where url = $1 and vary = false", .{req.url});
-
+    // replace headers with the same name.
     var lower_name: [256]u8 = undefined;
     for (req.headers) |h| {
-        if (h.name.len > lower_name.len) return error.HeaderNameTooLong;
+        if (h.name.len > lower_name.len) {
+            return error.HeaderNameTooLong;
+        }
         const name = std.ascii.lowerString(lower_name[0..h.name.len], h.name);
+        if (std.mem.eql(u8, name, "content-length")) {
+            // content-length describes the 304 response itself
+            continue;
+        }
+
+        try conn.exec(
+            "delete from header where url = $1 and name = $2 and vary = false",
+            .{ req.url, name },
+        );
+    }
+
+    for (req.headers) |h| {
+        const name = std.ascii.lowerString(lower_name[0..h.name.len], h.name);
+        if (std.mem.eql(u8, name, "content-length")) {
+            continue;
+        }
         try conn.exec(
             "insert into header (url, name, value, vary) values ($1, $2, $3, false)",
             .{ req.url, name, Blob{ .data = h.value } },
@@ -419,7 +441,7 @@ pub fn renew(self: *SqliteCache, _: std.mem.Allocator, req: RenewResponse) !void
     });
 }
 
-const testing = std.testing;
+const testing = @import("../../testing.zig");
 
 fn setupCache(allocator: std.mem.Allocator) !Cache {
     return Cache{ .kind = .{ .sqlite = try .init(allocator, .memory, 0) } };
@@ -467,9 +489,9 @@ test "SqliteCache: basic put and get" {
     );
 
     try testing.expect(result == .hit);
-    try testing.expectEqualStrings("hello world", result.hit.data.buffer);
+    try testing.expectEqual("hello world", result.hit.data.buffer);
     try testing.expectEqual(@as(u16, 200), result.hit.status);
-    try testing.expectEqualStrings("text/html", result.hit.content_type);
+    try testing.expectEqual("text/html", result.hit.content_type);
 }
 
 test "SqliteCache: get expiration" {
@@ -516,7 +538,7 @@ test "SqliteCache: get expiration" {
         },
     );
     try testing.expect(stale == .revalidate);
-    try testing.expectEqualStrings("hello world", stale.revalidate.data.buffer);
+    try testing.expectEqual("hello world", stale.revalidate.data.buffer);
 }
 
 test "SqliteCache: get expiration (without validators)" {
@@ -593,7 +615,7 @@ test "SqliteCache: put override" {
             },
         );
         try testing.expect(result == .hit);
-        try testing.expectEqualStrings("hello world", result.hit.data.buffer);
+        try testing.expectEqual("hello world", result.hit.data.buffer);
     }
 
     {
@@ -618,7 +640,7 @@ test "SqliteCache: put override" {
             },
         );
         try testing.expect(result == .hit);
-        try testing.expectEqualStrings("goodbye world", result.hit.data.buffer);
+        try testing.expectEqual("goodbye world", result.hit.data.buffer);
     }
 }
 
@@ -651,7 +673,7 @@ test "SqliteCache: vary hit and miss" {
         .request_headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
     });
     try testing.expect(hit == .hit);
-    try testing.expectEqualStrings("hello world", hit.hit.data.buffer);
+    try testing.expectEqual("hello world", hit.hit.data.buffer);
 
     const mismatch = try cache.get(arena.allocator(), .{
         .url = "https://example.com",
@@ -701,7 +723,7 @@ test "SqliteCache: vary multiple headers" {
         },
     });
     try testing.expect(hit == .hit);
-    try testing.expectEqualStrings("hello world", hit.hit.data.buffer);
+    try testing.expectEqual("hello world", hit.hit.data.buffer);
 
     const mismatch = try cache.get(arena.allocator(), .{
         .url = "https://example.com",
@@ -822,7 +844,7 @@ test "SqliteCache: put after clear works" {
         },
     );
     try testing.expect(result == .hit);
-    try testing.expectEqualStrings("after clear", result.hit.data.buffer);
+    try testing.expectEqual("after clear", result.hit.data.buffer);
 }
 
 test "SqliteCache: evict removes entry" {
@@ -944,7 +966,67 @@ test "SqliteCache: renew preserves body" {
         },
     );
     try testing.expect(result == .hit);
-    try testing.expectEqualStrings("original body", result.hit.data.buffer);
+    try testing.expectEqual("original body", result.hit.data.buffer);
+}
+
+test "SqliteCache: renew merges the 304's headers into the stored ones" {
+    var cache = try setupCache(testing.allocator);
+    defer cache.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const now: u64 = @intCast(std.Io.Timestamp.now(testing.io, .boot).toSeconds());
+    try cache.put(.{
+        .url = "https://example.com",
+        .content_type = "application/json",
+        .status = 200,
+        .stored_at = now,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = 0 },
+        .etag = "\"v1\"",
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Content-Length", .value = "11" },
+            .{ .name = "ETag", .value = "\"v1\"" },
+            .{ .name = "Link", .value = "</old>" },
+        },
+        .vary_headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
+    }, "hello world");
+
+    try cache.renew(arena.allocator(), .{
+        .url = "https://example.com",
+        .timestamp = now + 100,
+        .headers = &.{
+            .{ .name = "etag", .value = "\"v2\"" },
+            .{ .name = "cache-control", .value = "max-age=600" },
+            .{ .name = "content-length", .value = "0" },
+            .{ .name = "link", .value = "</a>" },
+            .{ .name = "link", .value = "</b>" },
+        },
+    });
+
+    const result = try cache.get(arena.allocator(), .{
+        .url = "https://example.com",
+        .timestamp = now + 100,
+        .request_headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
+    });
+    try testing.expect(result == .hit);
+
+    const expected = [_]Http.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "content-length", .value = "11" },
+        .{ .name = "etag", .value = "\"v2\"" },
+        .{ .name = "cache-control", .value = "max-age=600" },
+        .{ .name = "link", .value = "</a>" },
+        .{ .name = "link", .value = "</b>" },
+    };
+    const headers = result.hit.headers;
+    try testing.expectEqual(expected.len, headers.len);
+    for (expected, headers) |e, h| {
+        try testing.expectEqual(e.name, h.name);
+        try testing.expectEqual(e.value, h.value);
+    }
 }
 
 test "SqliteCache: maintenance purges expired entries without validators" {
@@ -1024,7 +1106,7 @@ test "SqliteCache: expired purge uses the cache_expiry index" {
     defer plan.deinit();
 
     const detail = plan.get([]const u8, 3);
-    if (std.mem.indexOf(u8, detail, "cache_expiry") == null) {
+    if (std.mem.find(u8, detail, "cache_expiry") == null) {
         std.debug.print("query plan: {s}\n", .{detail});
         return error.FullTableScan;
     }
@@ -1075,6 +1157,43 @@ test "SqliteCache: evicts oldest entries over the limit" {
             .request_headers = &.{},
         });
         try testing.expect(hit == .hit);
-        try testing.expectEqualStrings(url, hit.hit.data.buffer);
+        try testing.expectEqual(url, hit.hit.data.buffer);
     }
+}
+
+test "SqliteCache: starts over from an unreadable database" {
+    testing.expectLog(&.{.cache});
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "cache.db", .data = "This is not an SQLite database, only a page of text where its header would be." });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "cache.db-wal", .data = "stale" });
+
+    const cache_dir = try std.Io.Dir.path.join(testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+    defer testing.allocator.free(cache_dir);
+
+    var cache = Cache{ .kind = .{ .sqlite = try .init(testing.allocator, .{ .path = cache_dir }, 0) } };
+    defer cache.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const now: u64 = @intCast(std.Io.Timestamp.now(testing.io, .boot).toSeconds());
+    try cache.put(.{
+        .url = "https://example.com",
+        .content_type = "text/html",
+        .status = 200,
+        .stored_at = now,
+        .age_at_store = 0,
+        .cache_control = .{ .max_age = 600 },
+        .headers = &.{},
+        .vary_headers = &.{},
+    }, "hello world");
+
+    const result = try cache.get(arena.allocator(), .{
+        .url = "https://example.com",
+        .timestamp = now,
+        .request_headers = &.{},
+    });
+    try testing.expect(result == .hit);
+    try testing.expectEqual("hello world", result.hit.data.buffer);
 }

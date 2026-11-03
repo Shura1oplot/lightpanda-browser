@@ -29,12 +29,12 @@ const browsing_context = @import("browsing_context.zig");
 const log = lp.log;
 const Allocator = std.mem.Allocator;
 
-pub fn processMessage(cmd: *const BiDi.Command) !void {
+pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
     const command = std.meta.stringToEnum(enum {
         evaluate,
         callFunction,
         disown,
-    }, cmd.action) orelse return error.UnknownCommand;
+    }, action) orelse return error.UnknownCommand;
 
     switch (command) {
         .evaluate => return evaluate(cmd),
@@ -53,7 +53,7 @@ const Target = struct {
 
 const ResultOwnership = enum { root, none };
 
-fn evaluate(cmd: *const BiDi.Command) !void {
+fn evaluate(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         expression: []const u8,
         target: Target,
@@ -84,7 +84,7 @@ fn evaluate(cmd: *const BiDi.Command) !void {
     return settle(&reply, frame, &ls.local, value, p.awaitPromise, p.serializationOptions.options(p.resultOwnership == .root));
 }
 
-fn callFunction(cmd: *const BiDi.Command) !void {
+fn callFunction(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         functionDeclaration: []const u8,
         target: Target,
@@ -114,7 +114,7 @@ fn callFunction(cmd: *const BiDi.Command) !void {
     // parenthesized is what turns it into something callable. \n added incase
     // the functionDeclaration has a trailing comment.
     const arena = cmd.arena;
-    const source = try std.fmt.allocPrint(arena, "({s}\n)", .{p.functionDeclaration});
+    const source = try arena.print("({s}\n)", .{p.functionDeclaration});
     const reply: Reply = .init(cmd, ctx);
     const declaration = ls.local.exec(source, "bidi.callFunction") catch |err| {
         return sendException(&reply, frame, &ls.local, &try_catch, err);
@@ -139,7 +139,7 @@ fn callFunction(cmd: *const BiDi.Command) !void {
     return settle(&reply, frame, &ls.local, value, p.awaitPromise, p.serializationOptions.options(p.resultOwnership == .root));
 }
 
-fn disown(cmd: *const BiDi.Command) !void {
+fn disown(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         handles: []const []const u8,
         target: Target,
@@ -162,14 +162,14 @@ fn disown(cmd: *const BiDi.Command) !void {
 // reply and one sent from a promise callback after the Command (and its
 // message_arena) is gone.
 const Reply = struct {
-    id: u64,
+    to: BiDi.Reply,
     bidi: *BiDi,
     arena: Allocator,
     realm_id: [36]u8,
 
-    fn init(cmd: *const BiDi.Command, ctx: *const browsing_context.Context) Reply {
+    fn init(cmd: *BiDi.Command, ctx: *const browsing_context.Context) Reply {
         return .{
-            .id = cmd.id,
+            .to = cmd.takeReply(),
             .bidi = cmd.bidi,
             .arena = cmd.arena,
             .realm_id = ctx.realm_id,
@@ -177,11 +177,11 @@ const Reply = struct {
     }
 
     fn sendResult(self: *const Reply, result: anytype) !void {
-        return self.bidi.sendResult(self.id, result);
+        return self.bidi.replyResult(self.to, result);
     }
 
     fn sendError(self: *const Reply, code: []const u8, message: []const u8) !void {
-        return self.bidi.sendError(self.id, code, message);
+        return self.bidi.replyError(self.to, code, message);
     }
 };
 
@@ -238,7 +238,7 @@ pub const Pending = struct {
             .arena = arena,
             .js_context_id = promise.local.ctx.id,
             .reply = .{ // clone reply, injecting our Pending's arena
-                .id = reply.id,
+                .to = reply.to,
                 .bidi = reply.bidi,
                 .arena = arena.allocator(),
                 .realm_id = reply.realm_id,
@@ -290,7 +290,7 @@ pub const Pending = struct {
         };
 
         result catch |err| {
-            log.err(.bidi, "await promise", .{ .err = err, .id = reply.id });
+            log.debug(.bidi, "await promise", .{ .err = err, .reply = reply.to });
         };
     }
 
@@ -419,14 +419,14 @@ fn serialize(
         if (err == error.OutOfMemory) {
             return err;
         }
-        log.warn(.bidi, "serialize", .{ .err = err });
+        log.debug(.bidi, "serialize", .{ .err = err });
         try reply.sendError("unknown error", "cannot serialize result");
         return null;
     };
 }
 
 // returns null when an error response was already sent.
-fn toJs(cmd: *const BiDi.Command, local: *const js.Local, value: std.json.Value) !?js.Value {
+fn toJs(cmd: *BiDi.Command, local: *const js.Local, value: std.json.Value) !?js.Value {
     const bidi = cmd.bidi;
     return remote_value.toJs(local, &bidi.handles, &bidi.node_registry, value) catch |err| switch (err) {
         error.NoSuchHandle => {
@@ -447,7 +447,7 @@ fn toJs(cmd: *const BiDi.Command, local: *const js.Local, value: std.json.Value)
 
 // Answers the client and returns null when the target doesn't name our one
 // context, so callers can `orelse return`.
-fn resolveTarget(cmd: *const BiDi.Command, target: Target) !?*browsing_context.Context {
+fn resolveTarget(cmd: *BiDi.Command, target: Target) !?*browsing_context.Context {
     if (target.sandbox != null) {
         try cmd.sendError("unsupported operation", "sandboxes are not supported");
         return null;
@@ -1171,7 +1171,6 @@ test "bidi.script: callFunction arguments" {
 }
 
 test "bidi.script: handles" {
-    testing.expectLog(&.{.bidi});
     var ctx = try testing.context();
     defer ctx.deinit();
 

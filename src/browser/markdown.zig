@@ -20,21 +20,27 @@ const std = @import("std");
 
 const URL = @import("URL.zig");
 const Frame = @import("Frame.zig");
+const Session = @import("Session.zig");
+const Selector = @import("webapi/selector/Selector.zig");
 const RenderTree = @import("RenderTree.zig");
 const StyleManager = @import("StyleManager.zig");
 
 const Node = @import("webapi/Node.zig");
+const Document = @import("webapi/Document.zig");
 const Element = @import("webapi/Element.zig");
 const Slot = @import("webapi/element/html/Slot.zig");
 
 const LimitedWriter = @import("../LimitedWriter.zig");
 const isAllWhitespace = @import("../string.zig").isAllWhitespace;
+const repeat = @import("../string.zig").repeat;
 
 pub const Opts = struct {
     max_bytes: ?u32 = null,
 };
 
 const truncation_marker = LimitedWriter.truncation_marker;
+
+const Error = error{ WriteFailed, OutOfMemory };
 
 const State = struct {
     const ListType = enum { ordered, unordered };
@@ -46,6 +52,7 @@ const State = struct {
     list_depth: usize = 0,
     list_stack: [32]ListState = undefined,
     pre_node: ?*Node = null,
+    in_code: bool = false,
     in_table: bool = false,
     table_row_index: usize = 0,
     table_col_count: usize = 0,
@@ -63,11 +70,68 @@ fn getAnchorLabel(el: *Element) ?[]const u8 {
     return el.getAttributeInterned("aria-label") orelse el.getAttributeInterned("title");
 }
 
+/// The fence info string for a `<pre>`: the `language-*` (or `lang-*`) class
+/// on the `<pre>` itself or on a `<code>` that is its first element child.
+fn codeLanguage(pre: *Element) ?[]const u8 {
+    if (classLanguage(pre)) |lang| return lang;
+    const child = pre.firstElementChild() orelse return null;
+    if (child.getTag() != .code) return null;
+    return classLanguage(child);
+}
+
+fn classLanguage(el: *Element) ?[]const u8 {
+    const class = el.getClassName() orelse return null;
+    var it = std.mem.tokenizeAny(u8, class, &std.ascii.whitespace);
+    while (it.next()) |token| {
+        for ([_][]const u8{ "language-", "lang-" }) |prefix| {
+            if (!std.mem.startsWith(u8, token, prefix)) continue;
+            const lang = token[prefix.len..];
+            // A backtick would end the fence's info string early.
+            if (lang.len > 0 and std.mem.findScalar(u8, lang, '`') == null) return lang;
+        }
+    }
+    return null;
+}
+
+fn longestBacktickRun(text: []const u8) usize {
+    var longest: usize = 0;
+    var run: usize = 0;
+    for (text) |c| {
+        run = if (c == '`') run + 1 else 0;
+        longest = @max(longest, run);
+    }
+    return longest;
+}
+
+// Iterative else large trees will stackoverflow
 const Context = struct {
     state: State,
     writer: *std.Io.Writer,
     frame: *Frame,
     tree: RenderTree,
+    stack: std.ArrayList(Open) = .empty,
+
+    // Content still to render, followed by what closes the element.
+    const Open = struct {
+        iter: RenderTree.Slotted,
+        epilogue: Epilogue,
+    };
+
+    // what follows after the children
+    const Epilogue = union(enum) {
+        none,
+        // A standalone anchor without href: its own line, but no link syntax.
+        standalone_text,
+        element: Element.Tag,
+        block_anchor: struct { href: []const u8, label: ?[]const u8 },
+        inline_anchor: struct { href: []const u8, standalone: bool },
+        // The length of the backtick fence around an inline code span.
+        inline_code: usize,
+    };
+
+    fn deinit(self: *Context) void {
+        self.stack.deinit(self.frame.local_arena);
+    }
 
     fn ensureNewline(self: *Context) !void {
         if (!self.state.last_char_was_newline) {
@@ -76,18 +140,32 @@ const Context = struct {
         }
     }
 
-    fn render(self: *Context, node: *Node) error{WriteFailed}!void {
+    fn render(self: *Context, node: *Node) Error!void {
         switch (node._type) {
-            .document, .document_fragment => try self.renderChildren(node, false),
+            .document, .document_fragment => try self.open(.init(self.tree.children(node, false)), .none),
             else => {
                 if (self.tree.classify(node, .{})) |child| {
                     try self.renderChild(child);
                 }
             },
         }
+
+        while (self.stack.items.len > 0) {
+            // renderChild can grow the stack, so we can't re-use top on continue
+            const top = &self.stack.items[self.stack.items.len - 1];
+            if (top.iter.next()) |child| {
+                try self.renderChild(child);
+                continue;
+            }
+            try self.close(self.stack.pop().?.epilogue);
+        }
     }
 
-    fn renderChild(self: *Context, child: RenderTree.Child) error{WriteFailed}!void {
+    fn open(self: *Context, iter: RenderTree.Slotted, epilogue: Epilogue) Error!void {
+        return self.stack.append(self.frame.local_arena, .{ .iter = iter, .epilogue = epilogue });
+    }
+
+    fn renderChild(self: *Context, child: RenderTree.Child) Error!void {
         switch (child.what) {
             .element => |display| {
                 const el = child.node.subtype(Node.Element);
@@ -105,28 +183,8 @@ const Context = struct {
         }
     }
 
-    fn renderChildren(self: *Context, parent: *Node, boxed: bool) error{WriteFailed}!void {
-        var it = self.tree.children(parent, boxed);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderContent(self: *Context, el: *Element, boxed: bool) error{WriteFailed}!void {
-        var it = self.tree.content(el, boxed);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderSlotContent(self: *Context, slot: *Slot) error{WriteFailed}!void {
-        var it = self.tree.slotted(slot);
-        while (it.next()) |child| {
-            try self.renderChild(child);
-        }
-    }
-
-    fn renderElement(self: *Context, el: *Element, display: StyleManager.Display) !void {
+    // write the element's opening markers and push its contents
+    fn renderElement(self: *Context, el: *Element, display: StyleManager.Display) Error!void {
         const tag = el.getTag();
         const boxed = display == .flex or display == .grid;
 
@@ -190,15 +248,28 @@ const Context = struct {
                 self.state.last_char_was_newline = false;
             },
             .pre => {
-                try self.writer.writeAll("```\n");
+                try self.writer.writeAll("```");
+                if (codeLanguage(el)) |lang| try self.writer.writeAll(lang);
+                try self.writer.writeByte('\n');
                 self.state.pre_node = el.asNode();
                 self.state.last_char_was_newline = true;
             },
             .code => {
-                if (self.state.pre_node == null) {
-                    try self.writer.writeByte('`');
-                    self.state.last_char_was_newline = false;
+                if (self.state.pre_node != null or self.state.in_code) {
+                    return self.open(.init(self.tree.content(el, boxed)), .none);
                 }
+                // Backslash escapes are literal inside a code span, so its
+                // text is written as-is. The fence has to be longer than any
+                // run of backticks in the text, and is padded with a space
+                // (stripped by the reader) so a leading or trailing backtick
+                // doesn't merge with it.
+                const text = try el.asNode().getTextContentAlloc(self.frame.call_arena);
+                const ticks = longestBacktickRun(text) + 1;
+                try self.writer.splatByteAll('`', ticks);
+                if (ticks > 1) try self.writer.writeByte(' ');
+                self.state.in_code = true;
+                self.state.last_char_was_newline = false;
+                return self.open(.init(self.tree.content(el, boxed)), .{ .inline_code = ticks });
             },
             .b, .strong => {
                 try self.writer.writeAll("**");
@@ -241,28 +312,26 @@ const Context = struct {
                 self.state.last_char_was_newline = false;
                 return;
             },
-            .anchor => {
+            .a => {
                 const frame = self.frame;
+                // Without href, <a> is a placeholder, not a hyperlink.
+                const href_raw = el.getAttributeInterned("href") orelse {
+                    if (!RenderTree.isStandaloneAnchor(el, frame)) {
+                        return self.open(.init(self.tree.content(el, boxed)), .none);
+                    }
+                    try self.ensureNewline();
+                    return self.open(.init(self.tree.content(el, boxed)), .standalone_text);
+                };
+
                 const info = RenderTree.analyzeContent(el.asNode(), frame);
                 const label = getAnchorLabel(el);
-                const href_raw = el.getAttributeInterned("href");
-
-                if (!info.has_visible and label == null and href_raw == null) return;
-
-                const href = if (href_raw) |h| URL.resolve(frame.local_arena, frame.base(), h, .{ .encoding = frame.charset }) catch h else null;
+                const href = URL.resolve(frame.local_arena, frame.base(), href_raw, .{ .encoding = frame.charset }) catch href_raw;
 
                 if (info.has_block) {
-                    try self.renderContent(el, boxed);
-                    if (href) |h| {
-                        if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
-                        try self.writer.writeByte('[');
-                        try self.writer.writeAll(label orelse h);
-                        try self.writer.writeAll("](");
-                        try self.writer.writeAll(h);
-                        try self.writer.writeAll(")\n");
-                        self.state.last_char_was_newline = true;
-                    }
-                    return;
+                    return self.open(.init(self.tree.content(el, boxed)), .{ .block_anchor = .{
+                        .href = href,
+                        .label = label,
+                    } });
                 }
 
                 const standalone = RenderTree.isStandaloneAnchor(el, frame);
@@ -270,23 +339,13 @@ const Context = struct {
                     if (!self.state.last_char_was_newline) try self.writer.writeByte('\n');
                 }
                 try self.writer.writeByte('[');
+
+                const epilogue: Epilogue = .{ .inline_anchor = .{ .href = href, .standalone = standalone } };
                 if (info.has_visible) {
-                    try self.renderContent(el, boxed);
-                } else {
-                    try self.writer.writeAll(label orelse "");
+                    return self.open(.init(self.tree.content(el, boxed)), epilogue);
                 }
-                try self.writer.writeAll("](");
-                if (href) |h| {
-                    try self.writer.writeAll(h);
-                }
-                try self.writer.writeByte(')');
-                if (standalone) {
-                    try self.writer.writeByte('\n');
-                    self.state.last_char_was_newline = true;
-                } else {
-                    self.state.last_char_was_newline = false;
-                }
-                return;
+                try self.writer.writeAll(label orelse "");
+                return self.close(epilogue);
             },
             .input => {
                 const type_attr = el.getAttributeInterned("type") orelse return;
@@ -297,26 +356,57 @@ const Context = struct {
                 }
                 return;
             },
-            .slot => return self.renderSlotContent(el.as(Slot)),
+            .slot => return self.open(self.tree.slotted(el.as(Slot)), .none),
             else => {},
         }
 
-        try self.renderContent(el, boxed);
+        return self.open(.init(self.tree.content(el, boxed)), .{ .element = tag });
+    }
+
+    // Finish the element after renderElement has written the children
+    fn close(self: *Context, epilogue: Epilogue) Error!void {
+        const tag = switch (epilogue) {
+            .none => return,
+            .standalone_text => {
+                try self.ensureNewline();
+                return;
+            },
+            .element => |t| t,
+            .block_anchor => |anchor| {
+                try self.ensureNewline();
+                try self.writer.writeByte('[');
+                try self.writer.writeAll(anchor.label orelse anchor.href);
+                try self.writer.writeAll("](");
+                try self.writer.writeAll(anchor.href);
+                try self.writer.writeAll(")\n");
+                return;
+            },
+            .inline_anchor => |anchor| {
+                try self.writer.writeAll("](");
+                try self.writer.writeAll(anchor.href);
+                try self.writer.writeByte(')');
+                if (anchor.standalone) {
+                    try self.writer.writeByte('\n');
+                    self.state.last_char_was_newline = true;
+                } else {
+                    self.state.last_char_was_newline = false;
+                }
+                return;
+            },
+            .inline_code => |ticks| {
+                if (ticks > 1) try self.writer.writeByte(' ');
+                try self.writer.splatByteAll('`', ticks);
+                self.state.in_code = false;
+                self.state.last_char_was_newline = false;
+                return;
+            },
+        };
 
         switch (tag) {
             .pre => {
-                if (!self.state.last_char_was_newline) {
-                    try self.writer.writeByte('\n');
-                }
+                try self.ensureNewline();
                 try self.writer.writeAll("```\n");
                 self.state.pre_node = null;
-                self.state.last_char_was_newline = true;
-            },
-            .code => {
-                if (self.state.pre_node == null) {
-                    try self.writer.writeByte('`');
-                    self.state.last_char_was_newline = false;
-                }
             },
             .b, .strong => {
                 try self.writer.writeAll("**");
@@ -387,7 +477,11 @@ const Context = struct {
                 try self.writer.writeByte(' ');
             }
 
-            try self.escape(word);
+            if (self.state.in_code) {
+                try self.writeCode(word);
+            } else {
+                try self.escape(word);
+            }
             self.state.last_char_was_newline = false;
             first = false;
         }
@@ -396,6 +490,20 @@ const Context = struct {
         if (!first and !self.state.last_char_was_newline and std.ascii.isWhitespace(text[text.len - 1])) {
             try self.writer.writeByte(' ');
         }
+    }
+
+    // A GFM table splits a row into cells before it parses code spans, so
+    // a `|` inside a code span in a table still has to be escaped.
+    fn writeCode(self: *Context, text: []const u8) !void {
+        if (!self.state.in_table) return self.writer.writeAll(text);
+        var start: usize = 0;
+        for (text, 0..) |c, i| {
+            if (c != '|') continue;
+            if (i > start) try self.writer.writeAll(text[start..i]);
+            try self.writer.writeAll("\\|");
+            start = i + 1;
+        }
+        if (start < text.len) try self.writer.writeAll(text[start..]);
     }
 
     fn escape(self: *Context, text: []const u8) !void {
@@ -415,8 +523,78 @@ const Context = struct {
     }
 };
 
+/// A text/markdown response is loaded as a text document, its body a single
+/// `<pre>`. Converting that would fence the whole file, so the document's
+/// text, which is the markdown the server sent, is written as-is.
+fn markdownSource(node: *Node) ?*Node {
+    const doc = node.is(Document) orelse return null;
+    if (!std.mem.eql(u8, doc.getContentType(), "text/markdown")) return null;
+    const root = doc.getDocumentElement() orelse return null;
+    return root.asNode();
+}
+
+fn writeSource(source: *Node, max_bytes: ?u32, writer: *std.Io.Writer) !void {
+    var lw = LimitedWriter.init(writer, max_bytes);
+    source.getTextContent(&lw.writer) catch |err| {
+        if (!lw.truncated) return err;
+        try writer.writeAll(truncation_marker);
+    };
+}
+
+/// The http(s) URL of the page's `<link rel="alternate" type="text/markdown">`:
+/// the author's own markdown version of the page.
+pub fn alternateUrl(arena: std.mem.Allocator, frame: *Frame) !?[:0]const u8 {
+    const selector = "link[rel~=alternate i][type=\"text/markdown\" i][href]";
+    const link = try Selector.querySelector(frame.document.asNode(), selector, frame) orelse return null;
+    const href = link.getAttributeInterned("href") orelse return null;
+    const url = URL.resolve(arena, frame.base(), href, .{ .encoding = frame.charset }) catch |err| switch (err) {
+        error.TypeError => return null,
+        else => return err,
+    };
+    if (!URL.isRemoteScheme(url)) return null;
+    return url;
+}
+
+/// Starts loading the page's markdown alternate in a new page of the same
+/// session. Null when the page has no alternate, or failed itself: the
+/// alternate of a 404 or a bot challenge page would hide the failure behind
+/// its own 200.
+pub fn openAlternate(arena: std.mem.Allocator, session: *Session, frame: *Frame) !?Session.PageHandle {
+    if (frame._last_navigate_error != null or frame._bot_challenge != null) return null;
+    if (frame._http_status) |status| {
+        if (status >= 400) return null;
+    }
+    const url = try alternateUrl(arena, frame) orelse return null;
+    const page = try session.createPage();
+    page.navigate(url, .{ .reason = .address_bar, .kind = .{ .push = null } }) catch {
+        page.close();
+        return null;
+    };
+    return page;
+}
+
+/// Whether a loaded alternate can stand in for the page: a 2xx text/markdown
+/// or text/plain response. The link already says the file is markdown, and
+/// many servers send `.md` files as text/plain.
+pub fn isAlternateLoaded(frame: *Frame) bool {
+    if (frame._last_navigate_error != null) return false;
+    const status = frame._http_status orelse return false;
+    if (status < 200 or status >= 300) return false;
+    const content_type = frame.document.getContentType();
+    return std.mem.eql(u8, content_type, "text/markdown") or std.mem.eql(u8, content_type, "text/plain");
+}
+
+/// Writes an alternate that passed `isAlternateLoaded` as-is.
+pub fn dumpAlternate(frame: *Frame, max_bytes: ?u32, writer: *std.Io.Writer) !void {
+    const root = frame.document.getDocumentElement() orelse return;
+    return writeSource(root.asNode(), max_bytes, writer);
+}
+
 pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: *Frame) !void {
     const node = state.root;
+    if (markdownSource(node)) |source| {
+        return writeSource(source, opts.max_bytes, writer);
+    }
     if (opts.max_bytes) |limit| {
         var lw = LimitedWriter.init(writer, limit);
         var ctx: Context = .{
@@ -425,7 +603,9 @@ pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: 
             .frame = frame,
             .tree = .{ .frame = frame, .state = state },
         };
+        defer ctx.deinit();
         ctx.render(node) catch |err| switch (err) {
+            error.OutOfMemory => return err,
             error.WriteFailed => {
                 if (!lw.truncated) return err;
                 try writer.writeAll(truncation_marker);
@@ -444,6 +624,7 @@ pub fn dump(state: RenderTree.State, opts: Opts, writer: *std.Io.Writer, frame: 
         .frame = frame,
         .tree = .{ .frame = frame, .state = state },
     };
+    defer ctx.deinit();
     try ctx.render(node);
     if (!ctx.state.last_char_was_newline) {
         try writer.writeByte('\n');
@@ -589,6 +770,53 @@ test "browser.markdown: code" {
     );
 }
 
+test "browser.markdown: inline code" {
+    try testMarkdownHTML("<p>Set <code>max_retries</code> to <code>2*n</code></p>",
+        \\
+        \\Set `max_retries` to `2*n`
+        \\
+    );
+    try testMarkdownHTML("<p><code>a`b</code> and <code>``x``</code></p>",
+        \\
+        \\`` a`b `` and ``` ``x`` ```
+        \\
+    );
+    try testMarkdownHTML(
+        \\<table><thead><tr><th>Type</th></tr></thead>
+        \\<tbody><tr><td><code>string | null</code></td></tr></tbody></table>
+    ,
+        \\
+        \\| Type |
+        \\|---|
+        \\| `string \| null` |
+        \\
+    );
+}
+
+test "browser.markdown: code fence keeps the language" {
+    try testMarkdownHTML("<pre><code class=\"hljs language-zig\">const x = 1;</code></pre>",
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+        \\
+    );
+    try testMarkdownHTML("<pre class=\"lang-sh\">ls</pre>",
+        \\
+        \\```sh
+        \\ls
+        \\```
+        \\
+    );
+    try testMarkdownHTML("<pre class=\"language-\">x</pre>",
+        \\
+        \\```
+        \\x
+        \\```
+        \\
+    );
+}
+
 test "browser.markdown: block link" {
     try testMarkdownHTML(
         \\<a href="https://example.com">
@@ -723,6 +951,20 @@ test "browser.markdown: anchor fallback label" {
     , "[](http://localhost/no-label)\n");
 }
 
+test "browser.markdown: anchor without href is plain text" {
+    try testMarkdownHTML(
+        \\<p>Read the <a class="term">glossary</a> first.</p>
+    , "\nRead the glossary first.\n");
+
+    try testMarkdownHTML(
+        \\<nav><a class="x">Home</a><a class="x"><b>About</b></a></nav>
+    , "Home\n**About**\n");
+
+    try testMarkdownHTML(
+        \\<a aria-label="Menu"><svg></svg></a>
+    , "");
+}
+
 test "browser.markdown: hidden elements are skipped" {
     try testMarkdownHTML(
         \\<p>before</p>
@@ -842,7 +1084,7 @@ test "browser.markdown: max_bytes truncates with marker" {
 
     const doc = frame.window._document;
     const div = try doc.createElement("div", null, frame);
-    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<p>" ++ ("AAAA " ** 100) ++ "</p>");
+    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<p>" ++ (repeat("AAAA ", 100)) ++ "</p>");
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
@@ -851,6 +1093,68 @@ test "browser.markdown: max_bytes truncates with marker" {
     const out = aw.written();
     try testing.expect(std.mem.endsWith(u8, out, "[truncated]\n"));
     try testing.expect(out.len <= 50 + truncation_marker.len);
+}
+
+test "browser.markdown: a text/markdown document is written as-is" {
+    var page = try testing.pageTest("markdown_source.md", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    const source = @embedFile("tests/markdown_source.md");
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try dump(.{ .root = frame.window._document.asNode() }, .{}, &aw.writer, frame);
+    try testing.expectString(source, aw.written());
+
+    var capped: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try dump(.{ .root = frame.window._document.asNode() }, .{ .max_bytes = 7 }, &capped.writer, frame);
+    try testing.expectString("# Title" ++ truncation_marker, capped.written());
+}
+
+test "browser.markdown: a text/markdown document keeps its leading newlines" {
+    var page = try testing.pageTest("markdown_leading_blank.md", .{});
+    defer page.close();
+    const frame = page.frame().?;
+
+    var aw: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try dump(.{ .root = frame.window._document.asNode() }, .{}, &aw.writer, frame);
+    try testing.expectString(@embedFile("tests/markdown_leading_blank.md"), aw.written());
+}
+
+test "browser.markdown: text/plain is written as-is only as a followed alternate" {
+    var page = try testing.pageTest("markdown_source.txt", .{});
+    defer page.close();
+    const frame = page.frame().?;
+    const source = @embedFile("tests/markdown_source.txt");
+
+    // Plain text loaded directly isn't necessarily markdown: it stays fenced.
+    var direct: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try dump(.{ .root = frame.window._document.asNode() }, .{}, &direct.writer, frame);
+    try testing.expect(std.mem.find(u8, direct.written(), "```") != null);
+    try testing.expect(!std.mem.eql(u8, direct.written(), source));
+
+    var followed: std.Io.Writer.Allocating = .init(testing.arena_allocator);
+    try dumpAlternate(frame, null, &followed.writer);
+    try testing.expectString(source, followed.written());
+}
+
+test "browser.markdown: alternateUrl" {
+    {
+        var page = try testing.pageTest("markdown_alternate.html", .{});
+        defer page.close();
+        const url = try alternateUrl(testing.arena_allocator, page.frame().?);
+        try testing.expectString("http://127.0.0.1:9582/src/browser/tests/markdown_source.md", url.?);
+    }
+    {
+        // Only http(s): a page can't point the reader at a local file.
+        var page = try testing.pageTest("markdown_alternate_file.html", .{});
+        defer page.close();
+        try testing.expect(try alternateUrl(testing.arena_allocator, page.frame().?) == null);
+    }
+    {
+        var page = try testing.pageTest("markdown_flex.html", .{});
+        defer page.close();
+        try testing.expect(try alternateUrl(testing.arena_allocator, page.frame().?) == null);
+    }
 }
 
 // Builds a shadow host <div>, populates its light DOM with `light` and its
@@ -919,11 +1223,33 @@ test "browser.markdown: declarative shadow DOM renders through piercing" {
     const host = try doc.createElement("div", null, frame);
     try host.setHTMLUnsafe(
         \\<div><template shadowrootmode="open"><p>shadow content</p></template></div>
-    , frame);
+    , null, frame);
 
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try dump(.{ .root = host.asNode() }, .{}, &aw.writer, frame);
 
     try testing.expectString("\nshadow content\n", aw.written());
+}
+
+test "browser.markdown: deep nesting doesn't overflow the native stack" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+
+    const depth = 50_000;
+    const doc = frame.window._document;
+    var top = (try doc.createElement("i", null, frame)).asNode();
+    for (1..depth) |_| {
+        const parent = (try doc.createElement("i", null, frame)).asNode();
+        _ = try parent.appendChild(top, frame);
+        top = parent;
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try dump(.{ .root = top }, .{}, &aw.writer, frame);
+
+    // Every <i> opens and closes with a '*', then dump's trailing newline.
+    try testing.expectEqual(depth * 2 + 1, aw.written().len);
+    try testing.expectString("**", aw.written()[0..2]);
 }

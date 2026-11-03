@@ -67,6 +67,29 @@
   }
 </script>
 
+<script id=fetch_no_cors_method type=module>
+  {
+    const state = await testing.async();
+    let error;
+    try {
+      await fetch('http://127.0.0.1:9582/xhr', { mode: 'no-cors', method: 'PUT' });
+    } catch (e) {
+      error = e.toString();
+    }
+
+    // A bad init rejects the promise; fetch() itself doesn't throw.
+    const pending = fetch('http://127.0.0.1:9582/xhr', { headers: { 'bad name': 'x' } });
+    const header_error = await pending.catch((e) => e.toString());
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual("TypeError: 'PUT' is unsupported in no-cors mode", error);
+      testing.expectEqual(true, pending instanceof Promise);
+      testing.expectEqual('TypeError: Invalid header name', header_error);
+    });
+  }
+</script>
+
 <script id=fetch_redirect type=module>
   {
     const state = await testing.async();
@@ -315,12 +338,88 @@
   }
 </script>
 
+<script id=abort_reasons type=module>
+  {
+    const state = await testing.async();
+
+    async function rejection(promise) {
+      try {
+        await promise;
+        return 'resolved';
+      } catch (e) {
+        return e;
+      }
+    }
+
+    // /xhr/hang takes 2s: the abort must not wait for it
+    const c1 = new AbortController();
+    setTimeout(() => c1.abort(), 10);
+    const start = Date.now();
+    const inflight = await rejection(fetch('http://127.0.0.1:9582/xhr/hang', { signal: c1.signal }));
+    const elapsed = Date.now() - start;
+
+    const c2 = new AbortController();
+    const custom = new Error('mine');
+    setTimeout(() => c2.abort(custom), 10);
+    const custom_reason = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', { signal: c2.signal }));
+
+    const timeout = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', { signal: AbortSignal.timeout(10) }));
+
+    const c3 = new AbortController();
+    setTimeout(() => c3.abort('any'), 10);
+    const any = await rejection(fetch('http://127.0.0.1:9582/xhr/slow', {
+      signal: AbortSignal.any([new AbortController().signal, c3.signal]),
+    }));
+
+    const pre_aborted = await rejection(fetch('http://127.0.0.1:9582/xhr', { signal: AbortSignal.abort(custom) }));
+
+    // aborting after the body was read is a no-op
+    const c4 = new AbortController();
+    const response = await fetch('http://127.0.0.1:9582/xhr', { signal: c4.signal });
+    const text = await response.text();
+    c4.abort();
+
+    // aborting after resolve errors an unread body, with the signal's reason
+    const c5 = new AbortController();
+    const unread = await fetch('http://127.0.0.1:9582/xhr', { signal: c5.signal });
+    const unread_clone = unread.clone();
+    c5.abort(custom);
+    const unread_text = await rejection(unread.text());
+    const unread_clone_json = await rejection(unread_clone.json());
+
+    const c6 = new AbortController();
+    const streamed = await fetch('http://127.0.0.1:9582/xhr', { signal: c6.signal });
+    c6.abort();
+    const stream_read = await rejection(streamed.body.getReader().read());
+
+    const c7 = new AbortController();
+    const streamed_custom = await fetch('http://127.0.0.1:9582/xhr', { signal: c7.signal });
+    c7.abort(custom);
+    const stream_read_custom = await rejection(streamed_custom.body.getReader().read());
+
+    state.resolve();
+    await state.done(() => {
+      testing.expectEqual('AbortError', inflight.name);
+      testing.expectTrue(elapsed < 1000, 'abort waited for the response: ' + elapsed);
+      testing.expectEqual(custom, custom_reason);
+      testing.expectEqual('TimeoutError', timeout.name);
+      testing.expectEqual('any', any);
+      testing.expectEqual(custom, pre_aborted);
+      testing.expectEqual(100, text.length);
+      testing.expectEqual(custom, unread_text);
+      testing.expectEqual(custom, unread_clone_json);
+      testing.expectEqual('AbortError', stream_read.name);
+      testing.expectEqual(custom, stream_read_custom);
+    });
+  }
+</script>
+
 <script id=fetch_in_worker type=module>
   {
     const state = await testing.async();
     const worker = new Worker('./fetch-worker.js');
     worker.onmessage = (e) => state.resolve(e.data);
-    setTimeout(() => worker.postMessage({ kind: 'basic' }), 100);
+    worker.postMessage({ kind: 'basic' });
 
     await state.done((data) => {
       testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
@@ -338,7 +437,7 @@
     const state = await testing.async();
     const worker = new Worker('./fetch-worker.js');
     worker.onmessage = (e) => state.resolve(e.data);
-    setTimeout(() => worker.postMessage({ kind: 'post' }), 100);
+    worker.postMessage({ kind: 'post' });
 
     await state.done((data) => {
       testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
@@ -440,7 +539,7 @@
     const state = await testing.async();
     const worker = new Worker('./fetch-worker.js');
     worker.onmessage = (e) => state.resolve(e.data);
-    setTimeout(() => worker.postMessage({ kind: 'blob' }), 100);
+    worker.postMessage({ kind: 'blob' });
 
     await state.done((data) => {
       testing.expectTrue(data.ok, 'worker fetch error: ' + data.err);
@@ -507,6 +606,35 @@
   }
 </script>
 
+<script id=fetch_metadata_headers type=module>
+  {
+    // The test server is loopback, so potentially trustworthy.
+    const state = await testing.async();
+    const parse = (text) => {
+      const got = {};
+      for (const line of text.trim().split('\n')) {
+        const sep = line.indexOf(': ');
+        got[line.slice(0, sep).toLowerCase()] = line.slice(sep + 2);
+      }
+      return got;
+    };
+    const same = parse(await (await fetch('/echo_headers')).text());
+    const same_origin_mode = parse(await (await fetch('/echo_headers', { mode: 'same-origin' })).text());
+    // 127.0.0.1 -> localhost is cross-site, and the chain keeps it.
+    const cross = parse(await (await fetch('/redirect_cross_echo_headers')).text());
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual('same-origin', same['sec-fetch-site']);
+      testing.expectEqual('cors', same['sec-fetch-mode']);
+      testing.expectEqual('empty', same['sec-fetch-dest']);
+      testing.expectEqual(undefined, same['sec-fetch-user']);
+      testing.expectEqual('same-origin', same_origin_mode['sec-fetch-mode']);
+      testing.expectEqual('cross-site', cross['sec-fetch-site']);
+    });
+  }
+</script>
+
 <script id=fetch_redirect_referer type=module>
   {
     const state = await testing.async();
@@ -532,6 +660,66 @@
       testing.expectEqual(null, response.headers.get('set-cookie'));
       testing.expectEqual(0, response.headers.getSetCookie().length);
       testing.expectEqual(false, [...response.headers.keys()].includes('set-cookie'));
+    });
+  }
+</script>
+
+<script id=fetch_null_body type=module>
+  {
+    const state = await testing.async();
+    const results = [];
+    for (const [url, method] of [
+      ['http://127.0.0.1:9582/status/204', 'GET'],
+      ['http://127.0.0.1:9582/status/205', 'POST'],
+      ['http://127.0.0.1:9582/status/304', 'GET'],
+      ['http://127.0.0.1:9582/xhr', 'HEAD'],
+    ]) {
+      const response = await fetch(url, { method });
+      results.push([response.body, response.bodyUsed, await response.text()]);
+    }
+    const ok = await fetch('http://127.0.0.1:9582/xhr');
+    state.resolve();
+
+    await state.done(() => {
+      for (const [body, bodyUsed, text] of results) {
+        testing.expectEqual(null, body);
+        testing.expectEqual(false, bodyUsed);
+        testing.expectEqual('', text);
+      }
+      testing.expectEqual(true, ok.body !== null);
+    });
+  }
+</script>
+
+<script id=fetch_bad_content_encoding type=module>
+  {
+    const state = await testing.async();
+    const url = 'http://127.0.0.1:9582/xhr/bad_gzip';
+    const response = await fetch(url);
+    const errors = [];
+    for (const method of ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text']) {
+      const res = await fetch(url);
+      try {
+        await res[method]();
+        errors.push(null);
+      } catch (e) {
+        errors.push([e instanceof TypeError, res.bodyUsed]);
+      }
+    }
+    let stream_error = null;
+    try {
+      await response.body.getReader().read();
+    } catch (e) {
+      stream_error = e;
+    }
+    state.resolve();
+
+    await state.done(() => {
+      testing.expectEqual(200, response.status);
+      for (const err of errors) {
+        testing.expectEqual([true, true], err);
+      }
+      testing.expectEqual(true, stream_error !== null);
     });
   }
 </script>

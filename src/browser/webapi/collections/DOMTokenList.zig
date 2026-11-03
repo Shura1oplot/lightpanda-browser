@@ -34,7 +34,22 @@ pub const DOMTokenList = @This();
 // is that lists tend to be very short (often just 1 item).
 
 _element: *Element,
-_attribute_name: String,
+_attribute: Attribute,
+
+pub const Attribute = enum {
+    class,
+    part,
+    rel,
+    sizes,
+    sandbox,
+    @"for",
+
+    fn name(self: Attribute) String {
+        return switch (self) {
+            inline else => |a| comptime .wrap(@tagName(a)),
+        };
+    }
+};
 
 pub const KeyIterator = GenericIterator(Iterator, "0");
 pub const ValueIterator = GenericIterator(Iterator, "1");
@@ -70,15 +85,22 @@ pub fn item(self: *const DOMTokenList, index: usize, frame: *Frame) !?[]const u8
 }
 
 /// https://dom.spec.whatwg.org/#dom-domtokenlist-supports
-/// Only `rel` defines supported tokens here; per spec every other backing
-/// attribute throws. Loaders probe `relList.supports("modulepreload")` and
-/// fall back to fetch()-based legacy loading when it fails.
 pub fn supports(self: *const DOMTokenList, token: []const u8, frame: *Frame) !bool {
-    if (!std.ascii.eqlIgnoreCase(self._attribute_name.str(), "rel")) {
-        return error.TypeError;
-    }
-    const supported = [_][]const u8{ "stylesheet", "preload", "modulepreload" };
     const lower = try std.ascii.allocLowerString(frame.local_arena, token);
+
+    const supported: []const []const u8 = switch (self._attribute) {
+        // we don't currently sandbox anything, so every known value is allowed
+        .sandbox => &.{
+            "allow-downloads",                         "allow-forms",                              "allow-modals",                            "allow-orientation-lock",
+            "allow-pointer-lock",                      "allow-popups",                             "allow-popups-to-escape-sandbox",          "allow-presentation",
+            "allow-same-origin",                       "allow-scripts",                            "allow-storage-access-by-user-activation", "allow-top-navigation",
+            "allow-top-navigation-by-user-activation", "allow-top-navigation-to-custom-protocols",
+        },
+        .rel => &.{ "stylesheet", "preload", "modulepreload" },
+        // no supported tokens defined
+        .class, .part, .sizes, .@"for" => return error.TypeError,
+    };
+
     for (supported) |s| {
         if (std.mem.eql(u8, lower, s)) return true;
     }
@@ -95,29 +117,29 @@ pub fn contains(self: *const DOMTokenList, search: []const u8) !bool {
     return false;
 }
 
-pub fn add(self: *DOMTokenList, tokens: []const []const u8, frame: *Frame) !void {
-    for (tokens) |token| {
+pub fn add(self: *DOMTokenList, tokens: js.Variadic([]const u8), frame: *Frame) !void {
+    for (tokens.values) |token| {
         try validateToken(token);
     }
 
     const allocator = frame.local_arena;
     var lookup = try self.getTokens(allocator);
-    try lookup.ensureUnusedCapacity(allocator, tokens.len);
+    try lookup.ensureUnusedCapacity(allocator, tokens.values.len);
 
-    for (tokens) |token| {
+    for (tokens.values) |token| {
         try lookup.put(allocator, token, {});
     }
 
     try self.updateAttribute(lookup, frame);
 }
 
-pub fn remove(self: *DOMTokenList, tokens: []const []const u8, frame: *Frame) !void {
-    for (tokens) |token| {
+pub fn remove(self: *DOMTokenList, tokens: js.Variadic([]const u8), frame: *Frame) !void {
+    for (tokens.values) |token| {
         try validateToken(token);
     }
 
     var lookup = try self.getTokens(frame.local_arena);
-    for (tokens) |token| {
+    for (tokens.values) |token| {
         _ = lookup.orderedRemove(token);
     }
     try self.updateAttribute(lookup, frame);
@@ -132,24 +154,24 @@ pub fn toggle(self: *DOMTokenList, token: []const u8, force: ?bool, frame: *Fram
         if (f) {
             if (!has_token) {
                 const tokens_to_add = [_][]const u8{token};
-                try self.add(&tokens_to_add, frame);
+                try self.add(.init(&tokens_to_add), frame);
             }
             return true;
         } else {
             if (has_token) {
                 const tokens_to_remove = [_][]const u8{token};
-                try self.remove(&tokens_to_remove, frame);
+                try self.remove(.init(&tokens_to_remove), frame);
             }
             return false;
         }
     } else {
         if (has_token) {
             const tokens_to_remove = [_][]const u8{token};
-            try self.remove(tokens_to_remove[0..], frame);
+            try self.remove(.init(&tokens_to_remove), frame);
             return false;
         } else {
             const tokens_to_add = [_][]const u8{token};
-            try self.add(tokens_to_add[0..], frame);
+            try self.add(.init(&tokens_to_add), frame);
             return true;
         }
     }
@@ -160,10 +182,10 @@ pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8
     if (old_token.len == 0 or new_token.len == 0) {
         return error.SyntaxError;
     }
-    if (std.mem.indexOfAny(u8, old_token, WHITESPACE) != null) {
+    if (std.mem.findAny(u8, old_token, WHITESPACE) != null) {
         return error.InvalidCharacterError;
     }
-    if (std.mem.indexOfAny(u8, new_token, WHITESPACE) != null) {
+    if (std.mem.findAny(u8, new_token, WHITESPACE) != null) {
         return error.InvalidCharacterError;
     }
 
@@ -213,11 +235,11 @@ pub fn replace(self: *DOMTokenList, old_token: []const u8, new_token: []const u8
 }
 
 pub fn getValue(self: *const DOMTokenList) []const u8 {
-    return self._element.getAttributeSafe(self._attribute_name) orelse "";
+    return self._element.getAttributeSafe(self._attribute.name()) orelse "";
 }
 
 pub fn setValue(self: *DOMTokenList, value: String, frame: *Frame) !void {
-    try self._element.setAttribute(self._attribute_name, value, frame);
+    try self._element.setAttribute(self._attribute.name(), value, frame);
 }
 
 pub fn keys(self: *DOMTokenList, frame: *Frame) !*KeyIterator {
@@ -276,7 +298,7 @@ fn validateToken(token: []const u8) !void {
     if (token.len == 0) {
         return error.SyntaxError;
     }
-    if (std.mem.indexOfAny(u8, token, &std.ascii.whitespace) != null) {
+    if (std.mem.findAny(u8, token, &std.ascii.whitespace) != null) {
         return error.InvalidCharacterError;
     }
 }
@@ -284,13 +306,13 @@ fn validateToken(token: []const u8) !void {
 fn updateAttribute(self: *DOMTokenList, tokens: Lookup, frame: *Frame) !void {
     if (tokens.count() > 0) {
         const joined = try std.mem.join(frame.call_arena, " ", tokens.keys());
-        return self._element.setAttribute(self._attribute_name, .wrap(joined), frame);
+        return self._element.setAttribute(self._attribute.name(), .wrap(joined), frame);
     }
 
     // Only remove attribute if it didn't exist before (was null)
     // If it existed (even as ""), set it to "" to preserve its existence
-    if (self._element.hasAttributeSafe(self._attribute_name)) {
-        try self._element.setAttribute(self._attribute_name, .wrap(""), frame);
+    if (self._element.hasAttributeSafe(self._attribute.name())) {
+        try self._element.setAttribute(self._attribute.name(), .wrap(""), frame);
     }
 }
 
@@ -313,7 +335,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DOMTokenList";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

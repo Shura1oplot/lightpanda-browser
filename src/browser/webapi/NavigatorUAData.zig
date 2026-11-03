@@ -104,7 +104,7 @@ fn fullVersionList() []const Brand {
 }
 
 fn uaPlatform() []const u8 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => "macOS",
         .windows => "Windows",
         .linux => "Linux",
@@ -114,7 +114,7 @@ fn uaPlatform() []const u8 {
 }
 
 fn uaArchitecture() []const u8 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .x86, .x86_64 => "x86",
         .aarch64, .aarch64_be, .arm, .armeb => "arm",
         else => "",
@@ -122,7 +122,7 @@ fn uaArchitecture() []const u8 {
 }
 
 fn uaBitness() []const u8 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .x86_64, .aarch64, .aarch64_be, .powerpc64, .powerpc64le, .riscv64 => "64",
         else => "32",
     };
@@ -133,7 +133,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "NavigatorUAData";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
         pub const empty_with_no_proto = true;
     };

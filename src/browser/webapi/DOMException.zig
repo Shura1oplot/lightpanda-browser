@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const js = @import("../js/js.zig");
+const Page = @import("../Page.zig");
 
 const DOMException = @This();
 
@@ -73,7 +74,7 @@ fn getCode(self: *const DOMException) u8 {
     return switch (self._code) {
         // no legacy numeric code
         .operation_error, .data_error, .constraint_error, .version_error, .transaction_inactive_error, .read_only_error => 0,
-        else => @intFromEnum(self._code),
+        else => @backingInt(self._code),
     };
 }
 
@@ -162,7 +163,19 @@ pub fn toString(self: *const DOMException, exec: *js.Execution) ![]const u8 {
             else => break :blk self.getMessage(),
         }
     };
-    return std.fmt.bufPrint(exec.buf, "{s}: {s}", .{ self.getName(), msg }) catch return msg;
+    return exec.local_arena.print("{s}: {s}", .{ self.getName(), msg });
+}
+
+pub fn structuredSerialize(self: *const DOMException, writer: *js.StructuredWriter) !void {
+    writer.writeBytes(self.getName());
+    writer.writeBytes(self.getMessage());
+}
+
+pub fn structuredDeserialize(reader: *js.StructuredReader, _: *Page) !DOMException {
+    const arena = reader.local.ctx.arena.allocator();
+    const name = try arena.dupe(u8, try reader.readBytes());
+    const message = try arena.dupe(u8, try reader.readBytes());
+    return init(message, name);
 }
 
 const Code = enum(u8) {
@@ -244,7 +257,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DOMException";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

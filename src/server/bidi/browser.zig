@@ -26,23 +26,25 @@ const browsing_context = @import("browsing_context.zig");
 
 const log = lp.log;
 
-pub fn processMessage(cmd: *const BiDi.Command) !void {
+pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
     const command = std.meta.stringToEnum(enum {
         close,
+        getClientWindows,
         getUserContexts,
         createUserContext,
         removeUserContext,
-    }, cmd.action) orelse return error.UnknownCommand;
+    }, action) orelse return error.UnknownCommand;
 
     switch (command) {
         .close => return close(cmd),
+        .getClientWindows => return getClientWindows(cmd),
         .getUserContexts => return getUserContexts(cmd),
         .createUserContext => return createUserContext(cmd),
         .removeUserContext => return removeUserContext(cmd),
     }
 }
 
-fn close(cmd: *const BiDi.Command) !void {
+fn close(cmd: *BiDi.Command) !void {
     try cmd.sendResult(struct {}{});
 
     const bidi = cmd.bidi;
@@ -50,9 +52,36 @@ fn close(cmd: *const BiDi.Command) !void {
     bidi.inbox.push(arena, .quit);
 }
 
+const ClientWindowInfo = struct {
+    active: bool,
+    clientWindow: []const u8,
+    state: []const u8,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+fn getClientWindows(cmd: *BiDi.Command) !void {
+    const bidi = cmd.bidi;
+    if (bidi.browsing_context == null) {
+        return cmd.sendResult(.{ .clientWindows = &[_]ClientWindowInfo{} });
+    }
+    const viewport = bidi.browser.getViewport();
+    return cmd.sendResult(.{ .clientWindows = &[_]ClientWindowInfo{.{
+        .active = true,
+        .clientWindow = browsing_context.client_window,
+        .state = "normal",
+        .x = 0,
+        .y = 0,
+        .width = viewport.width,
+        .height = viewport.height,
+    }} });
+}
+
 const UserContextInfo = struct { userContext: []const u8 };
 
-fn getUserContexts(cmd: *const BiDi.Command) !void {
+fn getUserContexts(cmd: *BiDi.Command) !void {
     const bidi = cmd.bidi;
     var infos: [2]UserContextInfo = .{ .{ .userContext = "default" }, undefined };
     var len: usize = 1;
@@ -63,20 +92,20 @@ fn getUserContexts(cmd: *const BiDi.Command) !void {
     return cmd.sendResult(.{ .userContexts = infos[0..len] });
 }
 
-fn createUserContext(cmd: *const BiDi.Command) !void {
+fn createUserContext(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         proxy: ?std.json.Value = null,
         acceptInsecureCerts: ?bool = null,
         unhandledPromptBehavior: ?std.json.Value = null,
     });
     if (p.proxy != null or p.acceptInsecureCerts != null or p.unhandledPromptBehavior != null) {
-        log.warn(.not_implemented, "bidi.createUserContext", .{ .proxy = p.proxy != null, .acceptInsecureCerts = p.acceptInsecureCerts, .unhandledPromptBehavior = p.unhandledPromptBehavior != null });
+        log.debug(.not_implemented, "bidi.createUserContext", .{ .proxy = p.proxy != null, .acceptInsecureCerts = p.acceptInsecureCerts, .unhandledPromptBehavior = p.unhandledPromptBehavior != null });
         return cmd.sendError("unsupported operation", "user context options are not supported");
     }
 
     const bidi = cmd.bidi;
     if (bidi.user_context.isDefault() == false) {
-        log.warn(.not_implemented, "bidi.createUserContext", .{ .feature = "multiple user contexts" });
+        log.debug(.not_implemented, "bidi.createUserContext", .{ .feature = "multiple user contexts" });
         return cmd.sendError("unsupported operation", "only one user context can exist besides the default");
     }
 
@@ -92,7 +121,7 @@ fn createUserContext(cmd: *const BiDi.Command) !void {
     return cmd.sendResult(.{ .userContext = &id });
 }
 
-fn removeUserContext(cmd: *const BiDi.Command) !void {
+fn removeUserContext(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         userContext: []const u8,
     });
@@ -204,4 +233,36 @@ test "bidi.browser: user contexts" {
     // With a page open in the default, its Session can't be swapped out.
     try ctx.processMessage(.{ .id = 14, .method = "browser.createUserContext", .params = struct {}{} });
     try ctx.expectSentError("unsupported operation", null, .{ .id = 14 });
+}
+
+test "bidi.browser: client windows" {
+    var ctx = try testing.context();
+    defer ctx.deinit();
+
+    try ctx.startSession();
+    try ctx.processMessage(.{
+        .id = 1,
+        .method = "session.subscribe",
+        .params = .{ .events = .{"browsingContext"} },
+    });
+
+    try ctx.processMessage(.{ .id = 2, .method = "browser.getClientWindows" });
+    try ctx.expectSentResult(.{ .clientWindows = .{} }, .{ .id = 2 });
+
+    try ctx.processMessage(.{ .id = 3, .method = "browsingContext.create", .params = .{ .type = "tab" } });
+    try ctx.expectSentEvent("browsingContext.contextCreated", .{ .clientWindow = "default" });
+
+    try ctx.processMessage(.{ .id = 4, .method = "browsingContext.getTree" });
+    try ctx.expectSentResult(.{ .contexts = .{.{ .clientWindow = "default" }} }, .{ .id = 4 });
+
+    try ctx.processMessage(.{ .id = 5, .method = "browser.getClientWindows" });
+    try ctx.expectSentResult(.{ .clientWindows = .{.{
+        .active = true,
+        .clientWindow = "default",
+        .state = "normal",
+        .x = 0,
+        .y = 0,
+        .width = 1920,
+        .height = 1080,
+    }} }, .{ .id = 5 });
 }

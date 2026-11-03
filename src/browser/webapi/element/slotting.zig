@@ -129,6 +129,8 @@ fn _assignSlottables(slot: *Slot, frame: *Frame) !void {
     }
 
     frame.signalSlotChange(slot);
+    // A slotted node inherits from its slot
+    frame.renderingChanged();
 
     const page = frame.page;
     for (old) |node| {
@@ -138,9 +140,9 @@ fn _assignSlottables(slot: *Slot, frame: *Frame) !void {
         }
     }
     slot._assigned.clearRetainingCapacity();
-    try slot._assigned.appendSlice(frame.arena, slottables.items);
+    try slot._assigned.appendSlice(frame.page_arena, slottables.items);
     for (slottables.items) |node| {
-        try page._assigned_slots.put(page.frame_arena, node, slot);
+        try page._assigned_slots.put(page.arena, node, slot);
         node._flags.assigned_slot = true;
     }
 }
@@ -151,11 +153,9 @@ fn assignASlot(slottable: *Node, frame: *Frame) void {
 }
 
 pub fn assignSlottablesForTree(root: *Node, frame: *Frame) void {
-    var tw = TreeWalker.Full.Elements.init(root, .{});
-    while (tw.next()) |el| {
-        if (el.is(Slot)) |slot| {
-            assignSlottables(slot, frame);
-        }
+    var tw = TreeWalker.Full.ElementsOf(Slot).init(root, .{});
+    while (tw.next()) |slot| {
+        assignSlottables(slot, frame);
     }
 }
 
@@ -163,13 +163,8 @@ fn subtreeHasSlot(node: *Node) bool {
     if (node.is(Element) == null) {
         return false;
     }
-    var tw = TreeWalker.Full.Elements.init(node, .{});
-    while (tw.next()) |el| {
-        if (el.is(Slot) != null) {
-            return true;
-        }
-    }
-    return false;
+    var tw = TreeWalker.Full.ElementsOf(Slot).init(node, .{});
+    return tw.next() != null;
 }
 
 pub fn insertionSteps(parent: *Node, child: *Node, in_fragment_parse: bool, frame: *Frame) void {

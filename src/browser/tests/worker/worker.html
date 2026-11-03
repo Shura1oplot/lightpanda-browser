@@ -283,6 +283,7 @@
       testing.expectEqual(true, r.permissions_distinct);
       testing.expectEqual('geolocation', r.permission_name);
       testing.expectEqual('prompt', r.permission_state);
+      testing.expectEqual(true, r.permission_is_target);
 
       // StorageManager (transitive: StorageManager -> StorageEstimate)
       testing.expectEqual(0, r.storage_usage);
@@ -383,7 +384,7 @@
       testing.expectEqual(42, r.setTimeout_string_ran);
       testing.expectEqual(true, r.setInterval_string_ran);
 
-      testing.expectEqual(true, r.setTimeout_invalid_throws);
+      testing.expectEqual(true, r.setTimeout_non_string_id_is_number);
     });
   }
 </script>
@@ -572,6 +573,21 @@
     await state.done((fired) => {
       testing.expectEqual(null, fired);
       URL.revokeObjectURL(blobUrl);
+    });
+  }
+</script>
+
+<script id="worker_reports_callback_exceptions" type=module>
+  {
+    const state = await testing.async();
+    const worker = new Worker('./report-error-worker.js');
+    worker.onmessage = (e) => state.resolve(e.data);
+    worker.postMessage('throw');
+
+    await state.done((data) => {
+      testing.expectEqual('listener,onmessage,queueMicrotask,reentrant,setTimeout', data.seen.join(','));
+      testing.expectEqual(1, data.reentrant);
+      worker.terminate();
     });
   }
 </script>

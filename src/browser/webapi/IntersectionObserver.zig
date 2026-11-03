@@ -22,6 +22,7 @@ const js = @import("../js/js.zig");
 
 const Page = @import("../Page.zig");
 const Frame = @import("../Frame.zig");
+const Tokenizer = @import("../css/Tokenizer.zig");
 
 const Node = @import("Node.zig");
 const Element = @import("Element.zig");
@@ -43,21 +44,28 @@ _arena: *lp.Arena,
 _callback: js.Function.Global,
 _observing: std.ArrayList(*Element) = .empty,
 _root: ?*Element = null,
-_root_margin: []const u8 = "0px",
+/// The `root` option as given (an Element or the Document), for the getter;
+/// `_root` is the element intersections are computed against.
+_root_node: ?*Node = null,
+/// rootMargin and scrollMargin, parsed and serialized back (four values).
+_root_margin: []const u8 = "0px 0px 0px 0px",
+_scroll_margin: []const u8 = "0px 0px 0px 0px",
+/// Sorted ascending, each in [0, 1].
 _threshold: []const f64 = &.{0.0},
+_delay: i32 = 0,
+_track_visibility: bool = false,
 // these are RC'd (by us, and v8)
 _pending_entries: std.ArrayList(*IntersectionObserverEntry) = .empty,
 // tracked targets that aren't reported yet
 _tracked: std.AutoHashMapUnmanaged(*Element, void) = .{},
 
-// Shared zero rect (plain values) for non-intersecting elements. Materialized
-// into a DOMRect only if it ends up on a delivered entry.
-const zero_rect: DOMRect.Data = .{};
-
 const ObserverInit = struct {
+    delay: i32 = 0,
     root: ?*Node = null,
     rootMargin: ?[]const u8 = null,
+    scrollMargin: ?[]const u8 = null,
     threshold: Threshold = .{ .scalar = 0.0 },
+    trackVisibility: bool = false,
 
     const Threshold = union(enum) {
         scalar: f64,
@@ -70,16 +78,17 @@ pub fn init(callback: js.Function.Global, options: ?ObserverInit, frame: *Frame)
     errdefer arena.release();
 
     const opts = options orelse ObserverInit{};
-    const root_margin = if (opts.rootMargin) |rm| try arena.dupe(u8, rm) else "0px";
 
-    const threshold = switch (opts.threshold) {
-        .scalar => |s| blk: {
-            const arr = try arena.alloc(f64, 1);
-            arr[0] = s;
-            break :blk arr;
-        },
-        .array => |arr| try arena.dupe(f64, arr),
+    // The options' WebIDL conversion comes first, so its TypeErrors do: a
+    // root that's neither an Element nor a Document (below), and a threshold
+    // that isn't a finite (restricted) double.
+    const given_thresholds: []const f64 = switch (opts.threshold) {
+        .scalar => |*value| value[0..1],
+        .array => |arr| arr,
     };
+    for (given_thresholds) |value| {
+        if (!std.math.isFinite(value)) return error.TypeError;
+    }
 
     const root: ?*Element = blk: {
         const root_opt = opts.root orelse break :blk null;
@@ -95,15 +104,118 @@ pub fn init(callback: js.Function.Global, options: ?ObserverInit, frame: *Frame)
         }
     };
 
+    const root_margin = try serializeMargin(arena.allocator(), try parseMargin(opts.rootMargin orelse "0px"));
+    const scroll_margin = try serializeMargin(arena.allocator(), try parseMargin(opts.scrollMargin orelse "0px"));
+
+    // Each threshold is in [0, 1], sorted ascending; an empty list is [0].
+    const threshold = blk: {
+        if (given_thresholds.len == 0) {
+            break :blk &[_]f64{0.0};
+        }
+        const sorted = try arena.dupe(f64, given_thresholds);
+        for (sorted) |value| {
+            if (value < 0 or value > 1) return error.RangeError;
+        }
+        std.mem.sort(f64, sorted, {}, std.sort.asc(f64));
+        break :blk sorted;
+    };
+
+    // Tracking visibility raises the delay to at least 100ms.
+    const delay = if (opts.trackVisibility and opts.delay < 100) 100 else opts.delay;
+
     const self = try arena.create(IntersectionObserver);
     self.* = .{
         ._arena = arena,
         ._callback = callback,
         ._root = root,
+        ._root_node = opts.root,
         ._root_margin = root_margin,
+        ._scroll_margin = scroll_margin,
         ._threshold = threshold,
+        ._delay = delay,
+        ._track_visibility = opts.trackVisibility,
     };
     return self;
+}
+
+/// One side of a rootMargin or scrollMargin: a length in px, or a percentage.
+const Margin = struct {
+    value: f32,
+    percent: bool,
+};
+
+/// "Parse a margin": one to four px lengths or percentages, expanded like CSS
+/// margins to top, right, bottom, left. An empty string is all zero. Any other
+/// token (a unitless number, another unit, calc(), a comma) is a SyntaxError.
+fn parseMargin(text: []const u8) error{SyntaxError}![4]Margin {
+    var margins: [4]Margin = undefined;
+    var count: usize = 0;
+    var tokenizer: Tokenizer = .{ .input = text };
+    while (tokenizer.next()) |token| {
+        const margin: Margin = switch (token) {
+            .white_space, .comment => continue,
+            .dimension => |d| blk: {
+                if (std.ascii.eqlIgnoreCase(d.unit, "px") == false) {
+                    return error.SyntaxError;
+                }
+                break :blk .{ .value = d.value, .percent = false };
+            },
+            // unit_value is divided by 100; prefer the exact integer.
+            .percentage => |p| .{
+                .value = if (p.int_value) |int| @floatFromInt(int) else p.unit_value * 100,
+                .percent = true,
+            },
+            else => return error.SyntaxError,
+        };
+        if (count == 4) {
+            return error.SyntaxError;
+        }
+        margins[count] = margin;
+        count += 1;
+    }
+    const zero: Margin = .{ .value = 0, .percent = false };
+    return switch (count) {
+        0 => .{ zero, zero, zero, zero },
+        1 => .{ margins[0], margins[0], margins[0], margins[0] },
+        2 => .{ margins[0], margins[1], margins[0], margins[1] },
+        3 => .{ margins[0], margins[1], margins[2], margins[1] },
+        else => margins,
+    };
+}
+
+/// The four margins as the rootMargin/scrollMargin attributes give them.
+fn serializeMargin(allocator: std.mem.Allocator, margins: [4]Margin) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    for (margins, 0..) |margin, i| {
+        if (i > 0) try out.writer.writeByte(' ');
+        // + 0 turns -0 into 0, which a JS number prints as "0".
+        try out.writer.print("{d}{s}", .{ margin.value + 0, if (margin.percent) "%" else "px" });
+    }
+    return out.written();
+}
+
+pub fn getRoot(self: *const IntersectionObserver) ?*Node {
+    return self._root_node;
+}
+
+pub fn getRootMargin(self: *const IntersectionObserver) []const u8 {
+    return self._root_margin;
+}
+
+pub fn getScrollMargin(self: *const IntersectionObserver) []const u8 {
+    return self._scroll_margin;
+}
+
+pub fn getThresholds(self: *const IntersectionObserver) []const f64 {
+    return self._threshold;
+}
+
+pub fn getDelay(self: *const IntersectionObserver) i32 {
+    return self._delay;
+}
+
+pub fn getTrackVisibility(self: *const IntersectionObserver) bool {
+    return self._track_visibility;
 }
 
 pub fn deinit(self: *IntersectionObserver, page: *Page) void {
@@ -207,7 +319,6 @@ fn releaseAll(entries: []const *IntersectionObserverEntry, page: *Page) void {
 fn calculateIntersection(
     self: *IntersectionObserver,
     target: *Element,
-    has_parent: bool,
     frame: *Frame,
 ) !IntersectionData {
     const target_rect = target.boundingClientRectValues(frame);
@@ -226,23 +337,15 @@ fn calculateIntersection(
     // For a headless browser without real layout, we treat all elements as fully visible.
     // This avoids fingerprinting issues (massive viewports) and matches the behavior
     // scripts expect when querying element visibility.
-    // However, elements without a parent cannot intersect (they have no containing block).
-    const intersection_ratio: f64 = if (has_parent) 1.0 else 0.0;
-
-    // Intersection rect is the same as the target rect if visible, otherwise zero rect
-    const intersection_rect = if (has_parent) target_rect else zero_rect;
-
     return .{
-        .is_intersecting = has_parent,
-        .intersection_ratio = intersection_ratio,
-        .intersection_rect = intersection_rect,
+        .intersection_ratio = 1.0,
+        .intersection_rect = target_rect,
         .bounding_client_rect = target_rect,
         .root_bounds = root_rect,
     };
 }
 
 const IntersectionData = struct {
-    is_intersecting: bool,
     intersection_ratio: f64,
     intersection_rect: DOMRect.Data,
     bounding_client_rect: DOMRect.Data,
@@ -266,17 +369,19 @@ fn checkIntersection(self: *IntersectionObserver, target: *Element, frame: *Fram
         return;
     };
 
-    const has_parent = target.asNode().parentNode() != null;
-    const is_now_intersecting = has_parent and self.meetsThreshold(1.0);
+    // Frameless documents (DOMParser, createHTMLDocument) aren't rendered.
+    const node = target.asNode();
+    const connected = node.ownerFrame(frame) != null and node.isConnected();
+    const is_now_intersecting = connected and self.meetsThreshold(1.0);
     if (!is_now_intersecting) {
-        // Not intersecting yet (e.g. observed while still orphaned) — keep
+        // Not intersecting yet (e.g. observed while still detached) — keep
         // tracking so a later attach is reported.
         return;
     }
 
     // Building the entry is the expensive part — getBoundingClientRect walks the
     // document to fake a position (O(node count)) — so it only runs here.
-    const data = try self.calculateIntersection(target, has_parent, frame);
+    const data = try self.calculateIntersection(target, frame);
     const arena = try frame.getArena(.tiny, "IntersectionObserverEntry");
     errdefer arena.release();
 
@@ -319,14 +424,12 @@ pub fn deliverEntries(self: *IntersectionObserver, frame: *Frame) !void {
     // whether we safely deliver these to v8 or not, we're done with these
     defer releaseAll(entries, frame.page);
 
-    var caught: js.TryCatch.Caught = .{};
-
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
 
-    ls.toLocal(self._callback).tryCall(void, .{ entries, self }, &caught) catch |err| {
-        log.err(.frame, "IntsctObserver.deliverEntries", .{ .err = err, .caught = caught });
+    ls.toLocal(self._callback).callWithThisReport(self, .{ entries, self }) catch |err| {
+        log.debug(.frame, "IntsctObserver.deliverEntries", .{ .err = err });
         return err;
     };
 }
@@ -387,7 +490,6 @@ pub const IntersectionObserverEntry = struct {
 
         pub const Meta = struct {
             pub const name = "IntersectionObserverEntry";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 
@@ -406,11 +508,17 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "IntersectionObserver";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
     pub const constructor = bridge.constructor(init, .{});
+
+    pub const root = bridge.accessor(IntersectionObserver.getRoot, null, .{});
+    pub const rootMargin = bridge.accessor(IntersectionObserver.getRootMargin, null, .{});
+    pub const scrollMargin = bridge.accessor(IntersectionObserver.getScrollMargin, null, .{});
+    pub const thresholds = bridge.accessor(IntersectionObserver.getThresholds, null, .{});
+    pub const delay = bridge.accessor(IntersectionObserver.getDelay, null, .{});
+    pub const trackVisibility = bridge.accessor(IntersectionObserver.getTrackVisibility, null, .{});
 
     pub const observe = bridge.function(IntersectionObserver.observe, .{});
     pub const unobserve = bridge.function(IntersectionObserver.unobserve, .{});
@@ -421,12 +529,13 @@ pub const JsApi = struct {
 const testing = @import("../../testing.zig");
 
 // Infinite scroll: the callback observes a fresh sentinel, which we report as
-// intersecting the moment it is attached, so the page never settles on its own.
+// intersecting the moment it is connected, so the page never settles on its own.
 // Old sentinels stay observed (_tracked keeps them from re-firing) so that the
 // observer stays registered on the frame for as long as it is alive. `deferred`
 // re-observes from a timer, one delivery per macrotask tick, the way a
 // fetch-driven pager behaves; otherwise the chain never leaves the microtask
-// checkpoint.
+// checkpoint. New sentinels go first: an appended one would measure every
+// earlier sibling, making the chain quadratic.
 fn observeSentinelChain(frame: *Frame, comptime deferred: bool) !void {
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
@@ -434,8 +543,9 @@ fn observeSentinelChain(frame: *Frame, comptime deferred: bool) !void {
 
     try ls.local.eval(
         \\(function(deferred) {
-        \\  const list = document.createElement('div');
-        \\  const observe = () => io.observe(list.appendChild(document.createElement('div')));
+        \\  const root = document.documentElement ?? document.appendChild(document.createElement('html'));
+        \\  const list = root.appendChild(document.createElement('div'));
+        \\  const observe = () => io.observe(list.insertBefore(document.createElement('div'), list.firstChild));
         \\  const io = new IntersectionObserver((entries) => {
         \\    for (const entry of entries) {
         \\      if (!entry.isIntersecting) continue;

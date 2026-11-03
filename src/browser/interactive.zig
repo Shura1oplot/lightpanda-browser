@@ -20,6 +20,7 @@ const std = @import("std");
 
 const Frame = @import("Frame.zig");
 const URL = @import("URL.zig");
+const Regex = @import("../Regex.zig");
 const TreeWalker = @import("webapi/TreeWalker.zig");
 const Label = @import("webapi/element/html/Label.zig");
 const AXNode = @import("../server/cdp/AXNode.zig");
@@ -149,11 +150,18 @@ pub fn collectInteractiveElements(
     return walkInteractive(root, arena, frame, .{});
 }
 
+pub const Name = union(enum) {
+    /// Case-insensitive.
+    substring: []const u8,
+    /// Unanchored.
+    regex: Regex,
+};
+
 const FindFilter = struct {
     /// Exact role match (case-insensitive). When null, role is not filtered.
     role: ?[]const u8 = null,
-    /// Accessible-name substring match (case-insensitive). When null, name is not filtered.
-    name: ?[]const u8 = null,
+    /// Accessible-name match. When null, name is not filtered.
+    name: ?Name = null,
     /// Stop walking once this many matches accumulate. When null, walks the full subtree.
     max: ?usize = null,
 };
@@ -205,9 +213,20 @@ fn walkInteractive(
             else => {},
         }
 
-        if (frame._style_manager.hasDisplayNone(el)) {
+        // Not just the element's own display: a slotted element inherits
+        // from its slot, which this light-tree walk never visits.
+        const owner = el.ownerFrame(frame) orelse {
             tw.skipChildren();
             continue;
+        };
+        switch (owner._style_manager.rendering(el)) {
+            .none => {
+                tw.skipChildren();
+                continue;
+            },
+            // A descendant can set visibility back to visible.
+            .invisible => continue,
+            .visible => {},
         }
 
         const html_el = el.is(Element.Html) orelse continue;
@@ -227,7 +246,11 @@ fn walkInteractive(
             if (role == null) try getTextContent(node, arena) else null;
         if (filter.name) |nf| {
             const n = name orelse continue;
-            if (std.ascii.indexOfIgnoreCase(n, nf) == null) continue;
+            const hit = switch (nf) {
+                .substring => |s| std.ascii.findIgnoreCase(n, s) != null,
+                .regex => |re| re.matches(n),
+            };
+            if (!hit) continue;
         }
 
         const listener_types = getListenerTypes(el.asEventTarget(), listener_targets);
@@ -269,24 +292,16 @@ pub const ListenerTargetMap = std.AutoHashMapUnmanaged(usize, std.ArrayList([]co
 pub fn buildListenerTargetMap(frame: *Frame, arena: Allocator) !ListenerTargetMap {
     var map = ListenerTargetMap{};
 
-    // addEventListener registrations
-    var it = frame._event_manager.base.lookup.iterator();
+    // Listeners, event handlers (onclick, ...) included
+    var it = frame.page.event_listeners.lookup.iterator();
     while (it.next()) |entry| {
-        const list = entry.value_ptr.*;
-        if (list.first != null) {
-            const gop = try map.getOrPut(arena, entry.key_ptr.event_target);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(arena, entry.key_ptr.type_string.str());
+        for (entry.value_ptr.items) |*type_listeners| {
+            if (type_listeners.list.first != null) {
+                const gop = try map.getOrPut(arena, entry.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(arena, type_listeners.typ.str());
+            }
         }
-    }
-
-    // Inline handlers (onclick, onmousedown, etc.)
-    var attr_it = frame._event_target_attr_listeners.iterator();
-    while (attr_it.next()) |entry| {
-        const gop = try map.getOrPut(arena, @intFromPtr(entry.key_ptr.target));
-        if (!gop.found_existing) gop.value_ptr.* = .empty;
-        // Strip "on" prefix to get the event type name.
-        try gop.value_ptr.append(arena, @tagName(entry.key_ptr.handler)[2..]);
     }
 
     return map;
@@ -303,7 +318,7 @@ pub fn classifyInteractivity(
     // 1. Native interactive by tag
     switch (el.getTag()) {
         .button, .summary, .details, .select, .textarea => return .native,
-        .anchor, .area => {
+        .a, .area => {
             if (el.getAttributeInterned("href") != null) return .native;
         },
         .input => {
@@ -319,8 +334,8 @@ pub fn classifyInteractivity(
         if (isInteractiveRole(role)) return .aria;
     }
 
-    // 3. contenteditable (15 bytes, exceeds SSO limit for comptime)
-    if (el.getAttributeSafe(.wrap("contenteditable"))) |ce| {
+    // 3. contenteditable
+    if (el.getAttributeInterned("contenteditable")) |ce| {
         if (ce.len == 0 or std.ascii.eqlIgnoreCase(ce, "true")) return .contenteditable;
     }
 
@@ -389,7 +404,12 @@ pub fn isContentRole(role: []const u8) bool {
 
 // ARIA `role` is a space-separated fallback list; the first token wins.
 pub fn explicitRole(el: *Element) ?[]const u8 {
-    const attr = el.getAttributeInterned("role") orelse return null;
+    // ElementInternals.role is a custom element's default role.
+    const attr = el.getAttributeInterned("role") orelse blk: {
+        const custom = el.is(Element.Html.Custom) orelse return null;
+        const internals = custom._internals orelse return null;
+        break :blk internals.getAria("role") orelse return null;
+    };
     var it = std.mem.tokenizeAny(u8, attr, " \t\n\r");
     return it.next();
 }
@@ -488,6 +508,30 @@ fn testInteractiveInBody(html: []const u8) ![]InteractiveElement {
     try Frame.parse.htmlAsChildren(frame, div.asNode(), html);
 
     return collectInteractiveElements(div.asNode(), frame.call_arena, frame);
+}
+
+test "browser.interactive: a name regex filters the walk" {
+    const frame = try testing.createFrame();
+    defer testing.test_session.closeAllPages();
+    const doc = frame.window._document;
+    const div = try doc.createElement("div", null, frame);
+    try Frame.parse.htmlAsChildren(frame, div.asNode(), "<button>Add to cart</button><button>Cart</button><a href=\"#\">Add item</a>");
+
+    const context = testing.test_app.regex_context;
+    const options: Regex.Options = .{ .case_insensitive = true, .unicode = true };
+
+    const starts_add = try context.compile("^add", options, null);
+    defer starts_add.deinit();
+    const found_add = try findInteractiveElements(div.asNode(), frame.call_arena, frame, .{ .name = .{ .regex = starts_add } });
+    try testing.expectEqual(2, found_add.len);
+    try testing.expectEqual("Add to cart", found_add[0].name.?);
+    try testing.expectEqual("Add item", found_add[1].name.?);
+
+    const only_cart = try context.compile("^cart$", options, null);
+    defer only_cart.deinit();
+    const found_cart = try findInteractiveElements(div.asNode(), frame.call_arena, frame, .{ .name = .{ .regex = only_cart } });
+    try testing.expectEqual(1, found_cart.len);
+    try testing.expectEqual("Cart", found_cart[0].name.?);
 }
 
 test "browser.interactive: names come from labels, like the tree" {
@@ -645,6 +689,16 @@ test "browser.interactive: disabled by fieldset" {
     try testing.expect(!elements[1].disabled);
 }
 
+test "browser.interactive: a slotted element inherits its slot's display" {
+    var page = try testing.pageTest("cdp/slotted_hidden.html", .{});
+    defer page.close();
+    const frame = page.frame().?;
+
+    const elements = try collectInteractiveElements(frame.window._document.asNode(), frame.call_arena, frame);
+    try testing.expectEqual(1, elements.len);
+    try testing.expectEqual("slotted-shown", elements[0].name.?);
+}
+
 test "browser.interactive: pointer-events none" {
     const elements = try testInteractive("<button style=\"pointer-events: none;\">Click me</button>");
     defer testing.test_session.closeAllPages();
@@ -699,4 +753,16 @@ test "browser.interactive: hidden elements are skipped" {
     try testing.expectEqual(1, elements.len);
     try testing.expectEqual("button", elements[0].tag_name);
     try testing.expectEqual("Visible", elements[0].name.?);
+}
+
+test "browser.interactive: visibility:hidden elements are skipped" {
+    const elements = try testInteractive(
+        \\<button style="visibility:hidden">Inline</button>
+        \\<div style="visibility:hidden"><a href="/x">Ancestor</a><button style="visibility:visible">Visible again</button></div>
+        \\<button style="opacity:0">Transparent</button>
+    );
+    defer testing.test_session.closeAllPages();
+    try testing.expectEqual(2, elements.len);
+    try testing.expectEqual("Visible again", elements[0].name.?);
+    try testing.expectEqual("Transparent", elements[1].name.?);
 }

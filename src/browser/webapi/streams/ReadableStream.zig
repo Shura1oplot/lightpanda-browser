@@ -47,7 +47,8 @@ _state: State,
 _execution: *const Execution,
 _reader: ?*ReadableStreamDefaultReader,
 _controller: *ReadableStreamDefaultController,
-_stored_error: ?[]const u8,
+/// What the stream errored with, e.g. the `e` of controller.error(e).
+_stored_error: ?js.Value.Global,
 _pull_fn: ?js.Function.Global = null,
 _pulling: bool = false,
 _pull_again: bool = false,
@@ -82,7 +83,7 @@ pub fn init(src_: ?UnderlyingSource, strategy_: ?QueueingStrategy, exec: *const 
 
     if (src_) |src| {
         if (src.start) |start| {
-            try start.call(void, .{self._controller});
+            try start.callRethrow(void, .{self._controller});
         }
 
         if (src.cancel) |callback| {
@@ -165,26 +166,19 @@ pub fn collectBodyBytes(self: *ReadableStream, arena: std.mem.Allocator) ![]cons
     var buf = std.Io.Writer.Allocating.init(arena);
     const queue = &self._controller._queue;
     for (queue.items) |chunk| {
-        const bytes: []const u8 = switch (chunk) {
-            .string => |s| s,
-            .uint8array => |arr| arr.values,
-            .js_value => |global| blk: {
-                const value = local.toLocal(global);
-                // toStringSmart falls back to toString(), which would turn a
-                // stray number or object into "42" / "[object Object]" bytes.
-                if (value.isString() == null and !value.isTypedArray() and
-                    !value.isArrayBufferView() and !value.isArrayBuffer())
-                {
-                    return error.TypeError;
-                }
-                break :blk try value.toStringSmart();
-            },
-        };
-        try buf.writer.writeAll(bytes);
+        const value = local.toLocal(chunk);
+        // toStringSmart falls back to toString(), which would turn a
+        // stray number or object into "42" / "[object Object]" bytes.
+        if (value.isString() == null and !value.isTypedArray() and
+            !value.isArrayBufferView() and !value.isArrayBuffer())
+        {
+            return error.TypeError;
+        }
+        try buf.writer.writeAll(try value.toStringSmart());
     }
 
     self._collected = true;
-    queue.clearRetainingCapacity();
+    self._controller.clearQueue();
     return buf.written();
 }
 
@@ -215,10 +209,18 @@ pub fn callPullIfNeeded(self: *ReadableStream) !void {
         exec.js.localScope(&ls);
         defer ls.deinit();
 
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(&ls.local);
+        defer try_catch.deinit();
+
         // Call the pull function
         // Note: In a complete implementation, we'd handle the promise returned by pull
         // and set _pulling = false when it resolves
-        try ls.toLocal(func).call(void, .{self._controller});
+        ls.toLocal(func).callRethrow(void, .{self._controller}) catch |err| {
+            if (err != error.TryCatchRethrow) return err;
+            const exc = try_catch.exceptionValue() orelse return err;
+            try self._controller.fail(&ls.local, exc);
+        };
     }
 
     self._pulling = false;
@@ -243,17 +245,25 @@ fn shouldCallPull(self: *const ReadableStream) bool {
     return desired_size > 0;
 }
 
-pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution) !js.Promise {
+pub fn cancel(self: *ReadableStream, reason: ?js.Value, exec: *const Execution) !js.Promise {
     const local = exec.js.local.?;
     self._disturbed = true;
 
-    if (self._state != .readable) {
-        if (self._cancel) |c| {
-            if (c.resolver) |r| {
-                return local.toLocal(r).promise();
+    switch (self._state) {
+        .readable => {},
+        .closed => {
+            if (self._cancel) |c| {
+                if (c.resolver) |r| {
+                    return local.toLocal(r).promise();
+                }
             }
-        }
-        return local.resolvePromise(.{});
+            return local.resolvePromise(.{});
+        },
+        .errored => {
+            const resolver = local.createPromiseResolver();
+            resolver.reject("ReadableStream.cancel", self._stored_error.?);
+            return resolver.promise();
+        },
     }
 
     if (self._cancel == null) {
@@ -280,7 +290,7 @@ pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution
     }
 
     self._state = .closed;
-    self._controller._queue.clearRetainingCapacity();
+    self._controller.clearQueue();
 
     const result = ReadableStreamDefaultReader.ReadResult{
         .done = true,
@@ -288,6 +298,7 @@ pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution
     };
     for (self._controller._pending_reads.items) |r| {
         local.toLocal(r).resolve("stream cancelled", result);
+        r.release();
     }
     self._controller._pending_reads.clearRetainingCapacity();
     resolver.resolve("ReadableStream.cancel", {});
@@ -296,12 +307,12 @@ pub fn cancel(self: *ReadableStream, reason: ?[]const u8, exec: *const Execution
 
 /// pipeThrough(transform) — pipes this readable stream through a transform stream,
 /// returning the readable side. `transform` is a JS object with `readable` and `writable` properties.
-const PipeTransform = struct {
+pub const PipeTransform = struct {
     readable: *ReadableStream,
     writable: *WritableStream,
 };
 
-fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const Execution) !*ReadableStream {
+pub fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const Execution) !*ReadableStream {
     if (self.getLocked()) {
         return exec.js.typeError("ReadableStream is locked");
     }
@@ -315,7 +326,7 @@ fn pipeThrough(self: *ReadableStream, transform: PipeTransform, exec: *const Exe
 /// Returns a promise that resolves when piping is complete.
 pub fn pipeTo(self: *ReadableStream, destination: *WritableStream, exec: *const Execution) !js.Promise {
     if (self.getLocked()) {
-        return exec.js.local.?.rejectPromise(.{ .type_error = "ReadableStream is locked" });
+        return exec.js.typeError("ReadableStream is locked");
     }
 
     const local = exec.js.local.?;
@@ -341,7 +352,7 @@ const PipeState = struct {
         exec: *const Execution,
     ) !void {
         const reader = try stream.getReader(exec);
-        const state = try exec.arena.create(PipeState);
+        const state = try exec.page_arena.create(PipeState);
         state.* = .{
             .execution = exec,
             .reader = reader,
@@ -417,7 +428,6 @@ const PipeState = struct {
 
 const Cancel = struct {
     callback: ?js.Function.Global = null,
-    reason: ?[]const u8 = null,
     resolver: ?js.PromiseResolver.Global = null,
 };
 
@@ -426,7 +436,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "ReadableStream";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -465,7 +474,6 @@ const AsyncIterator = struct {
 
         pub const Meta = struct {
             pub const name = "ReadableStreamAsyncIterator";
-            pub const prototype_chain = bridge.prototypeChain();
             pub var class_id: bridge.ClassId = undefined;
         };
 

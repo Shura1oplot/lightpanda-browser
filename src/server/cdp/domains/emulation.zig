@@ -91,17 +91,17 @@ fn setDeviceMetricsOverride(cmd: *CDP.Command) !void {
         screenHeight: ?u32 = null,
     })) orelse return error.InvalidParams;
 
-    // Not-yet-emulated parameters: accept them but warn so the caller knows
+    // Not-yet-emulated parameters: accept them but log so the caller knows
     // they are ignored.
     if (params.mobile) |v| {
-        if (v) log.warn(.not_implemented, "setDeviceMetricsOverride", .{
+        if (v) log.debug(.not_implemented, "setDeviceMetricsOverride", .{
             .cdp_cmd = "Emulation.setDeviceMetricsOverride",
             .param = "mobile",
             .value = v,
         });
     }
     if (params.scale) |v| {
-        if (v != 0) log.warn(.not_implemented, "setDeviceMetricsOverride", .{
+        if (v != 0) log.debug(.not_implemented, "setDeviceMetricsOverride", .{
             .cdp_cmd = "Emulation.setDeviceMetricsOverride",
             .param = "scale",
             .value = v,
@@ -147,7 +147,7 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     })) orelse return error.InvalidParams;
 
     if (params.platform) |v| {
-        log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "platform", .value = v });
+        log.debug(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "platform", .value = v });
     }
 
     const ua = params.userAgent;
@@ -169,7 +169,7 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
     }
 
     if (reserved) {
-        log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
+        log.debug(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
         return cmd.sendResult(null, .{});
     }
 
@@ -217,7 +217,7 @@ fn setLocaleOverride(cmd: *CDP.Command) !void {
     const Params = struct { locale: ?[]const u8 = null };
     const params = (try cmd.params(Params)) orelse Params{};
     if (params.locale) |v| {
-        log.warn(.not_implemented, "Emulation.setLocaleOverride", .{ .locale = v });
+        log.debug(.not_implemented, "Emulation.setLocaleOverride", .{ .locale = v });
     }
     return cmd.sendResult(null, .{});
 }
@@ -227,7 +227,7 @@ fn setTimezoneOverride(cmd: *CDP.Command) !void {
         timezoneId: []const u8,
     })) orelse return error.InvalidParams;
     if (params.timezoneId.len > 0) {
-        log.warn(.not_implemented, "Emulation.setTimezoneOverride", .{ .timezoneId = params.timezoneId });
+        log.debug(.not_implemented, "Emulation.setTimezoneOverride", .{ .timezoneId = params.timezoneId });
     }
     return cmd.sendResult(null, .{});
 }
@@ -293,7 +293,7 @@ test "cdp.Emulation: viewport override fires matchMedia change events" {
     var ls: js.Local.Scope = undefined;
     frame.js.localScope(&ls);
     defer ls.deinit();
-    const v = try ls.local.exec("events.join() === 'onchange:(max-width: 500px),listener:true,onchange:(max-width: 500px),listener:false'", null);
+    const v = try ls.local.exec("events.join() === 'listener:true,onchange:(max-width: 500px),listener:false,onchange:(max-width: 500px)'", null);
     try testing.expect(v.toBool());
 }
 
@@ -310,10 +310,10 @@ test "cdp.Emulation: setDeviceMetricsOverride screenWidth/screenHeight reach win
     try ctx.processMessage(.{
         .id = 1,
         .method = "Emulation.setDeviceMetricsOverride",
-        .params = .{ .width = 1280, .height = 720, .deviceScaleFactor = 1, .mobile = false, .screenWidth = 2560, .screenHeight = 1440 },
+        .params = .{ .width = 1280, .height = 720, .deviceScaleFactor = 2, .mobile = false, .screenWidth = 2560, .screenHeight = 1440 },
     });
     try ctx.expectSentResult(null, .{ .id = 1 });
-    var v = try ls.local.exec("screen.width === 2560 && screen.height === 1440 && innerWidth === 1280 && innerHeight === 720", null);
+    var v = try ls.local.exec("screen.width === 2560 && screen.height === 1440 && innerWidth === 1280 && innerHeight === 720 && devicePixelRatio === 2", null);
     try testing.expect(v.toBool());
 
     // 0 keeps the current value, as for width/height.
@@ -322,11 +322,11 @@ test "cdp.Emulation: setDeviceMetricsOverride screenWidth/screenHeight reach win
         .method = "Emulation.setDeviceMetricsOverride",
         .params = .{ .width = 1024, .height = 0, .deviceScaleFactor = 0, .mobile = false, .screenWidth = 0, .screenHeight = 0 },
     });
-    v = try ls.local.exec("screen.width === 2560 && screen.height === 1440 && innerWidth === 1024 && innerHeight === 720", null);
+    v = try ls.local.exec("screen.width === 2560 && screen.height === 1440 && innerWidth === 1024 && innerHeight === 720 && devicePixelRatio === 2", null);
     try testing.expect(v.toBool());
 
     try ctx.processMessage(.{ .id = 3, .method = "Emulation.clearDeviceMetricsOverride" });
-    v = try ls.local.exec("screen.width === innerWidth && screen.height === innerHeight", null);
+    v = try ls.local.exec("screen.width === innerWidth && screen.height === innerHeight && devicePixelRatio === 1", null);
     try testing.expect(v.toBool());
 }
 

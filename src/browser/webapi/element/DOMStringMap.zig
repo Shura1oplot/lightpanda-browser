@@ -136,7 +136,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DOMStringMap";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -162,7 +161,7 @@ pub const JsApi = struct {
     }
     fn indexName(idx: u32, frame: *Frame) !String {
         var buf: [15]u8 = undefined;
-        const name = std.fmt.bufPrint(&buf, "data-{d}", .{idx}) catch unreachable;
+        const name = std.mem.print(&buf, "data-{d}", .{idx}) catch unreachable;
         return String.init(frame.local_arena, name, .{});
     }
 

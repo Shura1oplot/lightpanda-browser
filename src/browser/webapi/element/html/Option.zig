@@ -26,6 +26,7 @@ const Frame = @import("../../../Frame.zig");
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
 const HtmlElement = @import("../Html.zig");
+const TreeWalker = @import("../../TreeWalker.zig");
 const Select = @import("Select.zig");
 
 const String = lp.String;
@@ -39,6 +40,26 @@ _value: ?[]const u8 = null,
 _selected: bool = false,
 _default_selected: bool = false,
 
+pub fn constructor(text_: ?js.NullableString, value_: ?js.NullableString, default_selected_: ?bool, selected_: ?bool, frame: *Frame) !*Option {
+    const node = try Frame.node_factory.createElementNS(frame.document, .html, "option", null);
+    const el = node.as(Element);
+
+    const text = if (text_) |t| t.value else "";
+    if (text.len > 0) {
+        _ = try node.appendChild(try frame.document.createTextNode(text), frame);
+    }
+    if (value_) |v| {
+        try el.setAttributeSafe(comptime .wrap("value"), .wrap(v.value), frame);
+    }
+    if (default_selected_ orelse false) {
+        try el.setAttributeSafe(comptime .wrap("selected"), comptime .wrap(""), frame);
+    }
+
+    const self = el.as(Option);
+    self._selected = selected_ orelse false;
+    return self;
+}
+
 pub fn asElement(self: *Option) *Element {
     return Factory.protoOf(self).asElement();
 }
@@ -50,14 +71,12 @@ pub fn asNode(self: *Option) *Node {
 }
 
 pub fn getValue(self: *Option, frame: *Frame) []const u8 {
-    // If value attribute exists, use that; otherwise use text content (stripped)
+    // If value attribute exists, use that; otherwise use the text
     if (self._value) |v| {
         return v;
     }
 
-    const node = self.asNode();
-    const text = node.getTextContentAlloc(frame.local_arena) catch return "";
-    return std.mem.trim(u8, text, &std.ascii.whitespace);
+    return self.strippedText(frame.local_arena);
 }
 
 pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
@@ -66,9 +85,43 @@ pub fn setValue(self: *Option, value: []const u8, frame: *Frame) !void {
     self._value = owned;
 }
 
-pub fn getText(self: *const Option, frame: *Frame) []const u8 {
-    const node: *Node = @constCast(self.asConstElement().asConstNode());
-    return node.getTextContentAlloc(frame.call_arena) catch "";
+pub fn getText(self: *Option, frame: *Frame) []const u8 {
+    return self.strippedText(frame.call_arena);
+}
+
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-text
+fn strippedText(self: *Option, allocator: std.mem.Allocator) []const u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var pending_space = false;
+    var tw = TreeWalker.FullExcludeSelf.init(self.asNode(), .{});
+    while (tw.next()) |node| {
+        if (node.is(Element)) |el| {
+            if (el.getTag() == .script) {
+                // script tags are called out as being ignored.
+                tw.skipChildren();
+            }
+            continue;
+        }
+        const cdata = node.is(Node.CData) orelse continue;
+        switch (cdata._type) {
+            .text, .cdata_section => {},
+            .comment, .processing_instruction => continue,
+        }
+        const data = cdata._data.str();
+        // +1 for a space pending from the previous node
+        result.ensureUnusedCapacity(allocator, data.len + 1) catch return "";
+        for (data) |c| switch (c) {
+            ' ', '\t', '\n', '\r', '\x0C' => pending_space = result.items.len > 0,
+            else => {
+                if (pending_space) {
+                    result.appendAssumeCapacity(' ');
+                    pending_space = false;
+                }
+                result.appendAssumeCapacity(c);
+            },
+        };
+    }
+    return result.items;
 }
 
 fn setText(self: *Option, value: []const u8, frame: *Frame) !void {
@@ -79,7 +132,7 @@ pub fn getSelected(self: *const Option) bool {
     return self._selected;
 }
 
-fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
+pub fn setSelected(self: *Option, selected: bool, frame: *Frame) !void {
     self.setSelectedness(selected);
     frame.domChanged();
 }
@@ -96,7 +149,7 @@ fn setSelectedness(self: *Option, selected: bool) void {
 }
 
 /// The <select> this option belongs to, directly or through an <optgroup>.
-fn ownerSelect(self: *Option) ?*Select {
+pub fn ownerSelect(self: *Option) ?*Select {
     var node = self.asNode().parentNode();
     while (node) |n| : (node = n.parentNode()) {
         if (n.is(Select)) |select| return select;
@@ -118,12 +171,18 @@ fn setDefaultSelected(self: *Option, value: bool, frame: *Frame) !void {
     }
 }
 
+// https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-index
+fn getIndex(self: *Option) u32 {
+    const select = self.ownerSelect() orelse return 0;
+    return select.optionIndex(self) orelse 0;
+}
+
 // https://html.spec.whatwg.org/multipage/form-elements.html#dom-option-label
 // On getting, return the `label` content attribute if present (verbatim, even
 // when empty), otherwise the value of the `text` IDL attribute. On setting,
 // reflect to the `label` content attribute.
-fn getLabel(self: *const Option, frame: *Frame) []const u8 {
-    return self.asConstElement().getAttributeSafe(comptime .wrap("label")) orelse self.getText(frame);
+fn getLabel(self: *Option, frame: *Frame) []const u8 {
+    return self.asElement().getAttributeSafe(comptime .wrap("label")) orelse self.getText(frame);
 }
 
 fn setLabel(self: *Option, label: []const u8, frame: *Frame) !void {
@@ -135,18 +194,20 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLOptionElement";
-        pub const prototype_chain = bridge.prototypeChain();
+        pub const constructor_alias = "Option";
         pub var class_id: bridge.ClassId = undefined;
     };
 
     const reflect = Element.Reflect(Option);
 
+    pub const constructor = bridge.constructor(Option.constructor, .{});
     pub const value = bridge.accessor(Option.getValue, Option.setValue, .{ .ce_reactions = true });
     pub const text = bridge.accessor(Option.getText, Option.setText, .{ .ce_reactions = true });
     pub const label = bridge.accessor(Option.getLabel, Option.setLabel, .{ .ce_reactions = true });
     pub const selected = bridge.accessor(Option.getSelected, Option.setSelected, .{});
     pub const defaultSelected = bridge.accessor(Option.getDefaultSelected, Option.setDefaultSelected, .{ .ce_reactions = true });
     pub const disabled = reflect.boolean("disabled");
+    pub const index = bridge.accessor(Option.getIndex, null, .{});
 };
 
 pub const Build = struct {

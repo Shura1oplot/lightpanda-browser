@@ -26,6 +26,7 @@ const Factory = @import("../../Factory.zig");
 
 const Event = @import("../Event.zig");
 const EventTarget = @import("../EventTarget.zig");
+const ErrorEvent = @import("../event/ErrorEvent.zig");
 
 const log = lp.log;
 
@@ -43,7 +44,6 @@ const NavigationHistoryEntry = @import("NavigationHistoryEntry.zig");
 const NavigationCurrentEntryChangeEvent = @import("../event/NavigationCurrentEntryChangeEvent.zig");
 
 _proto: *EventTarget,
-_on_currententrychange: ?js.Function.Global = null,
 
 _current_navigation_kind: ?NavigationKind = null,
 
@@ -58,18 +58,8 @@ _activation: ?NavigationActivation = null,
 // from that initial entry replaces it.
 _initial_entry: bool = false,
 
-fn asEventTarget(self: *Navigation) *EventTarget {
+pub fn asEventTarget(self: *Navigation) *EventTarget {
     return self._proto;
-}
-
-pub fn onRemoveFrame(self: *Navigation) void {
-    if (self._on_currententrychange) |cb| cb.release();
-    self._on_currententrychange = null;
-
-    for (self._entries.items) |entry| {
-        if (entry._on_dispose) |cb| cb.release();
-        entry._on_dispose = null;
-    }
 }
 
 fn getActivation(self: *const Navigation) ?NavigationActivation {
@@ -144,10 +134,20 @@ pub fn updateEntries(
 ) !void {
     switch (kind) {
         .replace => |state| {
-            _ = try self.replaceEntry(url, .{ .source = .navigation, .value = state }, frame, should_dispatch);
+            _ = try self.replaceEntry(
+                url,
+                .{ .source = .navigation, .value = state },
+                frame,
+                should_dispatch,
+            );
         },
         .push => |state| {
-            _ = try self.pushEntry(url, .{ .source = .navigation, .value = state }, frame, should_dispatch);
+            _ = try self.pushEntry(
+                url,
+                .{ .source = .navigation, .value = state },
+                frame,
+                should_dispatch,
+            );
         },
         .traverse => |index| {
             self._index = index;
@@ -177,6 +177,14 @@ pub fn commitNavigation(self: *Navigation, frame: *Frame) !void {
 
     try self.updateEntries(url, kind, frame, false);
 
+    // A traversal or reload recreates the document of the entry it lands on:
+    // the new frame takes over that document's id, so the other entries of
+    // that document stay same-document with it.
+    switch (kind) {
+        .traverse, .reload => frame._history_document_id = self.getCurrentEntry()._document_id,
+        .push, .replace => {},
+    }
+
     self._activation = NavigationActivation{
         // If we are navigating away from the initial about:blank, we have no from.
         ._from = if (was_initial_entry) null else from_entry,
@@ -195,7 +203,7 @@ pub fn pushEntry(
     should_dispatch: bool,
 ) !*NavigationHistoryEntry {
     const arena = frame._session.arena;
-    const url = try arena.dupeZ(u8, _url);
+    const url = try arena.dupeSentinel(u8, _url, 0);
 
     // truncates our history here.
     const retained_index = self._index + 1;
@@ -214,7 +222,7 @@ pub fn pushEntry(
     // entry's failure skip the others.
     defer for (disposed) |d| {
         d.fireDispose(frame) catch |err| {
-            log.warn(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
+            log.debug(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
         };
     };
 
@@ -223,7 +231,7 @@ pub fn pushEntry(
     const id = self._next_entry_id;
     self._next_entry_id += 1;
 
-    const id_str = try std.fmt.allocPrint(arena.allocator(), "{d}", .{id});
+    const id_str = try arena.allocator().print("{d}", .{id});
 
     const entry = try Factory.chainedWithAllocator(arena.allocator(), .{
         EventTarget{ ._type = .navigation_history_entry },
@@ -233,6 +241,7 @@ pub fn pushEntry(
             ._key = id_str,
             ._url = url,
             ._state = state,
+            ._document_id = frame._history_document_id,
         },
     });
 
@@ -241,14 +250,9 @@ pub fn pushEntry(
     try self._entries.append(arena.allocator(), entry);
     self._index = index;
 
-    if (previous != null and should_dispatch) {
-        if (self._on_currententrychange) |cec| {
-            const event = (try NavigationCurrentEntryChangeEvent.initTrusted(
-                .wrap("currententrychange"),
-                .{ .from = previous.?, .navigationType = @tagName(.push) },
-                frame,
-            )).asEvent();
-            try self.dispatch(cec, event, frame);
+    if (should_dispatch) {
+        if (previous) |p| {
+            try self.fireCurrentEntryChangeEvent(p, .{ .push = state.value }, frame);
         }
     }
 
@@ -263,13 +267,13 @@ pub fn replaceEntry(
     should_dispatch: bool,
 ) !*NavigationHistoryEntry {
     const arena = frame._session.arena;
-    const url = try arena.dupeZ(u8, _url);
+    const url = try arena.dupeSentinel(u8, _url, 0);
 
     const previous = self.getCurrentEntry();
 
     const id = self._next_entry_id;
     self._next_entry_id += 1;
-    const id_str = try std.fmt.allocPrint(arena.allocator(), "{d}", .{id});
+    const id_str = try arena.allocator().print("{d}", .{id});
 
     const entry = try Factory.chainedWithAllocator(arena.allocator(), .{
         EventTarget{ ._type = .navigation_history_entry },
@@ -279,6 +283,7 @@ pub fn replaceEntry(
             ._key = previous._key,
             ._url = url,
             ._state = state,
+            ._document_id = frame._history_document_id,
         },
     });
 
@@ -288,21 +293,67 @@ pub fn replaceEntry(
     // Per spec, dispose fires last, after currententrychange. old_entry is
     // already out of _entries, so fire even if the dispatch below fails.
     defer old_entry.fireDispose(frame) catch |err| {
-        log.warn(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
+        log.debug(.event, "NavigationHistoryEntry.dispose", .{ .err = err });
     };
 
     if (should_dispatch) {
-        if (self._on_currententrychange) |cec| {
-            const event = (try NavigationCurrentEntryChangeEvent.initTrusted(
-                .wrap("currententrychange"),
-                .{ .from = previous, .navigationType = @tagName(.replace) },
-                frame,
-            )).asEvent();
-            try self.dispatch(cec, event, frame);
-        }
+        try self.fireCurrentEntryChangeEvent(previous, .{ .replace = state.value }, frame);
     }
 
     return entry;
+}
+
+fn fireNavigateSuccess(self: *Navigation, frame: *Frame) !void {
+    if (!frame.hasDirectListeners(self.asEventTarget(), "navigatesuccess")) {
+        return;
+    }
+
+    const event = Event.initTrusted(
+        .wrap("navigatesuccess"),
+        null,
+        frame.page,
+    ) catch |err| {
+        log.debug(.event, "Navigation.navigatesuccess", .{ .err = err });
+        return;
+    };
+
+    try self.dispatch(event, frame);
+}
+
+fn fireCurrentEntryChangeEvent(
+    self: *Navigation,
+    previous: *NavigationHistoryEntry,
+    kind: ?NavigationKind,
+    frame: *Frame,
+) !void {
+    if (!frame.hasDirectListeners(self.asEventTarget(), "currententrychange")) {
+        return;
+    }
+
+    const event =
+        NavigationCurrentEntryChangeEvent.initTrusted(
+            .wrap("currententrychange"),
+            .{
+                .from = previous,
+                .navigationType = if (kind) |k| @tagName(k) else null,
+            },
+            frame,
+        ) catch |err| {
+            log.debug(.event, "Navigation.currententrychange", .{ .err = err });
+            return;
+        };
+
+    try self.dispatch(event.asEvent(), frame);
+}
+
+fn resolveFinished(
+    self: *Navigation,
+    resolver: js.PromiseResolver,
+    comptime source: []const u8,
+    frame: *Frame,
+) !void {
+    resolver.resolve(source, {});
+    try self.fireNavigateSuccess(frame);
 }
 
 const NavigateOptions = struct {
@@ -329,44 +380,55 @@ pub fn navigateInner(
     const finished = local.createPromiseResolver();
 
     var new_url = try URL.resolve(arena.allocator(), frame.url, url, .{});
-    const is_same_document = URL.eqlDocument(new_url, frame.url);
+    const is_same_url = URL.eqlDocument(new_url, frame.url);
+    // navigate() stays in the document only for a fragment change, but a
+    // traversal stays in it whenever the entry belongs to it, whatever URL
+    // pushState gave the entry.
+    const is_same_document = switch (kind) {
+        .traverse => |index| self._entries.items[index].sameDocument(frame),
+        else => is_same_url,
+    };
 
     // In case of navigation to the same document, we force an url duplication.
     // Keeping the same url generates a crash during WPT test navigate-history-push-same-url.html.
     // When building a script's src, script's base and frame url overlap.
     if (is_same_document) {
-        new_url = try arena.dupeZ(u8, new_url);
+        new_url = try arena.dupeSentinel(u8, new_url, 0);
     }
 
-    // Captured before the switch overwrites frame.url in the same_document
-    // branches; used to queue the hashchange once below.
+    // Captured before a same-document navigation overwrites frame.url; used
+    // to queue the hashchange once below.
     const old_url = frame.url;
 
     const previous = self.getCurrentEntry();
 
+    if (is_same_document and kind != .reload) {
+        frame.url = new_url;
+
+        frame._session.notification.dispatch(.frame_navigated_within_document, &.{
+            .url = new_url,
+            .frame_id = frame._frame_id,
+            .navigation_type = .fragment,
+        });
+    }
+
     switch (kind) {
         .push => |state| {
             if (is_same_document) {
-                frame.url = new_url;
-
                 committed.resolve("navigation push", {});
                 // todo: Fire navigate event
-                finished.resolve("navigation push", {});
-
                 _ = try self.pushEntry(url, .{ .source = .navigation, .value = state }, frame, true);
+                try self.resolveFinished(finished, "navigation push", frame);
             } else {
                 try frame.scheduleNavigation(url, .{ .reason = .navigation, .kind = kind }, .{ .script = frame });
             }
         },
         .replace => |state| {
             if (is_same_document) {
-                frame.url = new_url;
-
                 committed.resolve("navigation replace", {});
                 // todo: Fire navigate event
-                finished.resolve("navigation replace", {});
-
                 _ = try self.replaceEntry(url, .{ .source = .navigation, .value = state }, frame, true);
+                try self.resolveFinished(finished, "navigation replace", frame);
             } else {
                 try frame.scheduleNavigation(url, .{ .reason = .navigation, .kind = kind }, .{ .script = frame });
             }
@@ -375,11 +437,14 @@ pub fn navigateInner(
             self._index = index;
 
             if (is_same_document) {
-                frame.url = new_url;
+                try frame.window._location._url.setHref(new_url, &frame.js.execution);
+                // `:target` matches off the fragment, which might have just changed.
+                frame.styleChanged();
 
                 committed.resolve("navigation traverse", {});
                 // todo: Fire navigate event
-                finished.resolve("navigation traverse", {});
+                try self.fireCurrentEntryChangeEvent(previous, kind, frame);
+                try self.resolveFinished(finished, "navigation traverse", frame);
             } else {
                 try frame.scheduleNavigation(url, .{ .reason = .navigation, .kind = kind }, .{ .script = frame });
             }
@@ -389,18 +454,8 @@ pub fn navigateInner(
         },
     }
 
-    if (is_same_document and !std.mem.eql(u8, old_url, new_url)) {
+    if (is_same_document and is_same_url and !std.mem.eql(u8, old_url, new_url)) {
         try frame.queueHashChange(old_url, new_url);
-    }
-
-    if (self._on_currententrychange) |cec| {
-        // If we haven't navigated off, let us fire off an a currententrychange.
-        const event = (try NavigationCurrentEntryChangeEvent.initTrusted(
-            .wrap("currententrychange"),
-            .{ .from = previous, .navigationType = @tagName(kind) },
-            frame,
-        )).asEvent();
-        try self.dispatch(cec, event, frame);
     }
 
     _ = try committed.persist();
@@ -436,14 +491,11 @@ pub fn reload(self: *Navigation, _opts: ?ReloadOptions, frame: *Frame) !Navigati
     const entry = self.getCurrentEntry();
     if (opts.state) |state| {
         const previous = entry;
-        entry._state = .{ .source = .navigation, .value = state.toJson(arena) catch return error.DataClone };
-
-        const event = try NavigationCurrentEntryChangeEvent.initTrusted(
-            .wrap("currententrychange"),
-            .{ .from = previous, .navigationType = @tagName(.reload) },
-            frame,
-        );
-        try self.dispatch(.{ .currententrychange = event }, frame);
+        entry._state = .{
+            .source = .navigation,
+            .value = state.toJson(arena.allocator()) catch return error.DataClone,
+        };
+        try self.fireCurrentEntryChangeEvent(previous, .reload, frame);
     }
 
     return self.navigateInner(entry._url, .reload, frame);
@@ -455,7 +507,7 @@ const TraverseToOptions = struct {
 
 pub fn traverseTo(self: *Navigation, key: []const u8, _opts: ?TraverseToOptions, frame: *Frame) !NavigationReturn {
     if (_opts != null) {
-        log.warn(.not_implemented, "Navigation.traverseTo", .{ .has_options = true });
+        log.debug(.not_implemented, "Navigation.traverseTo", .{ .has_options = true });
     }
 
     for (self._entries.items, 0..) |entry, i| {
@@ -480,36 +532,11 @@ fn updateCurrentEntry(self: *Navigation, options: UpdateCurrentEntryOptions, fra
         .value = options.state.toJson(arena.allocator()) catch return error.DataClone,
     };
 
-    if (self._on_currententrychange) |cec| {
-        const event = (try NavigationCurrentEntryChangeEvent.initTrusted(
-            .wrap("currententrychange"),
-            .{ .from = previous, .navigationType = null },
-            frame,
-        )).asEvent();
-        try self.dispatch(cec, event, frame);
-    }
+    try self.fireCurrentEntryChangeEvent(previous, null, frame);
 }
 
-pub fn dispatch(self: *Navigation, func: js.Function.Global, event: *Event, frame: *Frame) !void {
-    return frame._event_manager.dispatchDirect(
-        self.asEventTarget(),
-        event,
-        func,
-        .{ .context = "Navigation" },
-    );
-}
-
-fn getOnCurrentEntryChange(self: *Navigation) ?js.Function.Global {
-    return self._on_currententrychange;
-}
-
-fn setOnCurrentEntryChange(self: *Navigation, listener: ?js.Function) !void {
-    if (self._on_currententrychange) |old| old.release();
-    if (listener) |listen| {
-        self._on_currententrychange = try listen.persistWithThis(self);
-    } else {
-        self._on_currententrychange = null;
-    }
+pub fn dispatch(self: *Navigation, event: *Event, frame: *Frame) !void {
+    return frame.dispatch(self.asEventTarget(), event, .{ .context = "Navigation" });
 }
 
 pub const JsApi = struct {
@@ -517,7 +544,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "Navigation";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -530,14 +556,13 @@ pub const JsApi = struct {
     pub const entries = bridge.function(Navigation.entries, .{});
     pub const forward = bridge.function(Navigation.forward, .{});
     pub const navigate = bridge.function(Navigation.navigate, .{});
+    pub const reload = bridge.function(Navigation.reload, .{});
     pub const traverseTo = bridge.function(Navigation.traverseTo, .{});
     pub const updateCurrentEntry = bridge.function(Navigation.updateCurrentEntry, .{});
 
-    pub const oncurrententrychange = bridge.accessor(
-        Navigation.getOnCurrentEntryChange,
-        Navigation.setOnCurrentEntryChange,
-        .{},
-    );
+    pub const oncurrententrychange = EventTarget.handlerAccessor(Navigation, "currententrychange");
+    pub const onnavigatesuccess = EventTarget.handlerAccessor(Navigation, "navigatesuccess");
+    pub const onnavigateerror = EventTarget.handlerAccessor(Navigation, "navigateerror");
 };
 
 const testing = @import("../../../testing.zig");
@@ -546,10 +571,10 @@ test "Navigation: about:blank commits entry" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    // The test_session is shared; prior tests leak entries into it via
-    // session.navigation. Reset it so we exercise a fresh session-style state.
-    testing.test_session.navigation._entries.clearRetainingCapacity();
-    testing.test_session.navigation._index = 0;
+    // Drop the entry createPage seeds so we exercise an empty stack.
+    const navigation = testing.test_session.navigationFor(frame);
+    navigation._entries.clearRetainingCapacity();
+    navigation._index = 0;
 
     try frame.navigate("about:blank", .{});
     try testing.waitForFrame();
@@ -573,8 +598,9 @@ test "Navigation: reload on empty stack seeds an entry" {
     const frame = try testing.createFrame();
     defer testing.test_session.closeAllPages();
 
-    testing.test_session.navigation._entries.clearRetainingCapacity();
-    testing.test_session.navigation._index = 0;
+    const navigation = testing.test_session.navigationFor(frame);
+    navigation._entries.clearRetainingCapacity();
+    navigation._index = 0;
 
     // Mirrors CDP Page.reload arriving on a fresh session: doReload reads
     // frame.url (default "about:blank") and routes through the synchronous

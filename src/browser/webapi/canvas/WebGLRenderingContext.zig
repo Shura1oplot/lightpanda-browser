@@ -79,15 +79,9 @@ const Extension = union(enum) {
 
     /// Reified enum type from the fields of this union.
     const Kind = blk: {
-        const info = @typeInfo(Extension).@"union";
-        const fields = info.fields;
-        const Tag = std.math.IntFittingRange(0, if (fields.len == 0) 0 else fields.len - 1);
-        var names: [fields.len][:0]const u8 = undefined;
-        for (fields, 0..) |field, i| {
-            names[i] = field.name;
-        }
-
-        break :blk @Enum(Tag, .exhaustive, &names, &std.simd.iota(Tag, fields.len));
+        const names = @typeInfo(Extension).@"union".field_names;
+        const Tag = std.math.IntFittingRange(0, if (names.len == 0) 0 else names.len - 1);
+        break :blk @Enum(Tag, .exhaustive, names, &std.simd.iota(Tag, names.len));
     };
 
     /// Returns the `Extension.Kind` by its name.
@@ -98,9 +92,9 @@ const Extension = union(enum) {
         const kvs = comptime build_kvs: {
             const T = Extension.Kind;
             const EnumKV = struct { []const u8, T };
-            var kvs_array: [@typeInfo(T).@"enum".fields.len]EnumKV = undefined;
-            for (@typeInfo(T).@"enum".fields, 0..) |enumField, i| {
-                kvs_array[i] = .{ enumField.name, @field(T, enumField.name) };
+            var kvs_array: [@typeInfo(T).@"enum".field_names.len]EnumKV = undefined;
+            for (@typeInfo(T).@"enum".field_names, 0..) |field_name, i| {
+                kvs_array[i] = .{ field_name, @field(T, field_name) };
             }
             break :build_kvs kvs_array[0..];
         };
@@ -122,7 +116,6 @@ const Extension = union(enum) {
                 pub const Meta = struct {
                     pub const name = "WEBGL_debug_renderer_info";
 
-                    pub const prototype_chain = bridge.prototypeChain();
                     pub var class_id: bridge.ClassId = undefined;
                 };
 
@@ -142,7 +135,6 @@ const Extension = union(enum) {
                 pub const Meta = struct {
                     pub const name = "WEBGL_lose_context";
 
-                    pub const prototype_chain = bridge.prototypeChain();
                     pub var class_id: bridge.ClassId = undefined;
                 };
 
@@ -180,7 +172,7 @@ fn getExtension(_: *const WebGLRenderingContext, name: []const u8, frame: *Frame
 
 /// Returns a list of all the supported WebGL extensions.
 fn getSupportedExtensions(_: *const WebGLRenderingContext) []const []const u8 {
-    return std.meta.fieldNames(Extension.Kind);
+    return @typeInfo(Extension.Kind).@"enum".field_names;
 }
 
 pub const JsApi = struct {
@@ -189,7 +181,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "WebGLRenderingContext";
 
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

@@ -38,7 +38,7 @@ const String = lp.String;
 const IFrame = Element.Html.IFrame;
 
 pub fn createElementNS(document: *const Node.Document, namespace: Element.Namespace, name: []const u8, attribute_iterator: anytype) !*Node {
-    const from_parser = @TypeOf(attribute_iterator) == Parser.AttributeIterator;
+    const from_parser = @TypeOf(attribute_iterator) == Parser.AttributeIterator or @TypeOf(attribute_iterator) == Parser.RebuiltAttributes;
     const from_clone = @TypeOf(attribute_iterator) == *Element.Attribute.List or @TypeOf(attribute_iterator) == *const Element.Attribute.List;
     const frame = frameOf(document);
 
@@ -79,7 +79,7 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                         Element.Html.Quote,
                         namespace,
                         attribute_iterator,
-                        .{ ._tag_name = comptime .wrap("q"), ._tag = .quote },
+                        .{ ._tag_name = comptime .wrap("q"), ._tag = .q },
                     ),
                     's' => return createHtmlElementT(
                         document,
@@ -402,27 +402,13 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                         attribute_iterator,
                         .{},
                     ),
-                    asUint("base") => {
-                        const n = try createHtmlElementT(
-                            document,
-                            Element.Html.Base,
-                            namespace,
-                            attribute_iterator,
-                            .{},
-                        );
-
-                        // If the frame's base url is not already set, fill it
-                        // with the base tag.
-                        if (document._frame) |realm| {
-                            if (realm.base_url == null) {
-                                if (n.as(Element).getAttributeInterned("href")) |href| {
-                                    realm.base_url = try URL.resolve(realm.arena, realm.url, href, .{});
-                                }
-                            }
-                        }
-
-                        return n;
-                    },
+                    asUint("base") => return createHtmlElementT(
+                        document,
+                        Element.Html.Base,
+                        namespace,
+                        attribute_iterator,
+                        .{},
+                    ),
                     asUint("menu") => return createHtmlElementT(
                         document,
                         Element.Html.Generic,
@@ -562,7 +548,7 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                         Element.Html.Track,
                         namespace,
                         attribute_iterator,
-                        .{ ._kind = comptime .wrap("subtitles"), ._ready_state = .none },
+                        .{},
                     ),
                     else => {},
                 },
@@ -771,7 +757,7 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                     ),
                     asUint("frameset") => {
                         if (comptime from_parser) {
-                            log.warn(.not_implemented, "framset", .{ .note = "<framset>...</frameset> in html is not handled properly" });
+                            log.debug(.not_implemented, "framset", .{ .note = "<framset>...</frameset> in html is not handled properly" });
                         }
                         return createHtmlElementT(
                             document,
@@ -823,10 +809,10 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                 },
                 else => {},
             }
-            const tag_name = try String.init(frame.arena, name, .{});
+            const tag_name = try String.init(frame.page_arena, name, .{});
 
             // Check if this is a custom element (must have hyphen for HTML namespace)
-            const has_hyphen = std.mem.indexOfScalar(u8, name, '-') != null;
+            const has_hyphen = std.mem.findScalar(u8, name, '-') != null;
             if (has_hyphen and namespace == .html) {
                 // A document without a browsing context has no registry: its
                 // elements stay undefined until inserted into a document that
@@ -845,23 +831,25 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                 //
                 // Undefined elements are created in the "undefined" state and
                 // upgraded later, when a matching definition is registered.
-                if (creation != .construct or definition == null) {
+                if (creation == .bare_context or definition == null) {
                     const node = try createHtmlElementT(document, Element.Html.Custom, namespace, attribute_iterator, .{
                         ._tag_name = tag_name,
                         ._definition = definition,
+                        ._upgrade_candidate = creation != .bare_context,
                     });
-                    if (creation == .construct) {
-                        try realm._undefined_custom_elements.append(realm.arena, node.as(Element).is(Element.Html.Custom).?);
+                    if (creation != .bare_context) {
+                        try realm._undefined_custom_elements.append(realm.page_arena, node.as(Element).is(Element.Html.Custom).?);
                     }
                     return node;
                 }
 
-                if (from_clone) {
+                if (from_clone or creation == .upgrade) {
                     const node = try createHtmlElementT(document, Element.Html.Custom, namespace, attribute_iterator, .{
                         ._tag_name = tag_name,
                         ._definition = null,
                     });
-                    try realm._ce_reactions.enqueueUpgrade(realm, node.as(Element).is(Element.Html.Custom).?, definition.?);
+                    const reactions_frame = if (creation == .upgrade) creation.upgrade else realm;
+                    try reactions_frame._ce_reactions.enqueueUpgrade(reactions_frame, node.as(Element).is(Element.Html.Custom).?, definition.?);
                     return node;
                 }
 
@@ -958,12 +946,17 @@ pub fn createElementNS(document: *const Node.Document, namespace: Element.Namesp
                 else => {},
             }
 
-            const lower = std.ascii.lowerString(&frame.buf, name);
-            const tag = std.meta.stringToEnum(Element.Tag, lower) orelse .unknown;
+            // No local_arena: the parser calls this outside of a JS call, where
+            // nothing resets it. A name longer than any Tag can't match one.
+            var lower_buf: [max_tag_len]u8 = undefined;
+            const tag: Element.Tag = if (name.len > lower_buf.len)
+                .unknown
+            else
+                std.meta.stringToEnum(Element.Tag, std.ascii.lowerString(&lower_buf, name)) orelse .unknown;
             return createSvgElementT(document, Element.Svg.Generic, name, attribute_iterator, .{ ._tag = tag });
         },
         else => {
-            const tag_name = try String.init(frame.arena, name, .{});
+            const tag_name = try String.init(frame.page_arena, name, .{});
             return createHtmlElementT(document, Element.Html.Unknown, namespace, attribute_iterator, .{ ._tag_name = tag_name });
         },
     }
@@ -1004,7 +997,7 @@ fn constructForToken(frame: *Frame, definition: *CustomElementDefinition, tag_na
 
     const object = ls.toLocal(definition.constructor).newInstanceThrow() catch |err| {
         if (err != error.ExecutionTerminated) {
-            log.warn(.js, "custom element constructor", .{ .name = name, .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.js, "custom element constructor", .{ .name = name, .err = err, .type = frame._type, .url = frame.url });
             if (try_catch.exceptionValue()) |exc| {
                 // Spec: report the exception
                 frame.window.reportError(exc, frame) catch {};
@@ -1039,7 +1032,7 @@ fn constructForToken(frame: *Frame, definition: *CustomElementDefinition, tag_na
         return element;
     };
 
-    log.warn(.js, "custom element not usable", .{ .name = name, .reason = reason, .type = frame._type, .url = frame.url });
+    log.debug(.js, "custom element not usable", .{ .name = name, .reason = reason, .type = frame._type, .url = frame.url });
     frame.window.reportError(exc, frame) catch {};
     return error.CustomElementConstructionFailed;
 }
@@ -1070,8 +1063,12 @@ fn createHtmlElementT(document: *const Node.Document, comptime E: type, namespac
 
     const node = element.asNode();
     if (@hasDecl(E, "Build") and @hasDecl(E.Build, "created")) {
+        if (comptime (@TypeOf(attribute_iterator) == Parser.AttributeIterator or @TypeOf(attribute_iterator) == Parser.RebuiltAttributes) and @hasDecl(E.Build, "parser_created_on_insert")) {
+            // The element wants its parent, it'll do this work when inserted.
+            return node;
+        }
         @call(.auto, @field(E.Build, "created"), .{ node, frame }) catch |err| {
-            log.err(.frame, "build.created", .{ .tag = node.getNodeName(&frame.buf), .err = err, .type = frame._type, .url = frame.url });
+            log.debug(.frame, "build.created", .{ .tag = node.getNodeName(frame.local_arena), .err = err, .type = frame._type, .url = frame.url });
             return err;
         };
     }
@@ -1113,7 +1110,14 @@ fn populateElementAttributes(frame: *Frame, element: *Element, list: anytype) !v
         // from cloneNode
         try element._attributes.cloneFrom(list, frame);
         element.noteStyleAttribute();
-        return;
+        return noteEventHandlerAttributes(element, frame);
+    }
+
+    if (@TypeOf(list) == Parser.RebuiltAttributes) {
+        // from the parser, rebuilding an element in another document
+        try element._attributes.cloneFrom(list.list, frame);
+        element.noteStyleAttribute();
+        return noteEventHandlerAttributes(element, frame);
     }
 
     // from the parser
@@ -1128,23 +1132,33 @@ fn populateElementAttributes(frame: *Frame, element: *Element, list: anytype) !v
     try attributes.ensureTotalCapacity(count, frame);
     while (list.next()) |attr| {
         const name = try parserAttributeName(frame, attr.name);
-        try attributes.putNew(name, attr.value.slice(), frame);
+        _ = try attributes.putNew(name, attr.value.slice(), frame);
     }
     element.noteStyleAttribute();
+    try noteEventHandlerAttributes(element, frame);
+}
+
+// Register the on* attribute handlers with the event manager
+fn noteEventHandlerAttributes(element: *Element, frame: *Frame) !void {
+    const html = element.is(Element.Html) orelse return;
+    for (element._attributes.entries()) |*entry| {
+        // entry must be by-ref
+        try html.eventHandlerAttributeChanged(entry.name(), entry.value(), frame);
+    }
 }
 
 // Attributes are keyed by qualified name (no namespace model), so a prefixed
 // attribute (`xlink:href` in foreign content, `xml:id` in XML) must keep its
 // prefix — that is what `getAttribute("xlink:href")` and `Attr.name` see in
 // browsers. The joined name only has to outlive putNew, which canonicalizes
-// it into the frame arena. (Not frame.buf: name normalization writes there.)
+// it into the frame arena.
 fn parserAttributeName(frame: *Frame, qname: Parser.QualName) ![]const u8 {
     const local = qname.local.slice();
     const prefix = (qname.prefix.unwrap() orelse return local).slice();
     if (prefix.len == 0) {
         return local;
     }
-    return std.fmt.allocPrint(frame.local_arena, "{s}:{s}", .{ prefix, local });
+    return frame.local_arena.print("{s}:{s}", .{ prefix, local });
 }
 
 // Called when `new MyElement()` is invoked directly in JS (not via the
@@ -1167,12 +1181,16 @@ pub fn constructCustomElement(frame: *Frame, new_target: JS.Function) !*Element 
         return error.IllegalConstructor;
     }
 
-    const tag_name = try String.init(frame.arena, definition.name, .{});
+    const tag_name = try String.init(frame.page_arena, definition.name, .{});
     const node = try createHtmlElementT(frame.document, Element.Html.Custom, .html, null, .{
         ._tag_name = tag_name,
         ._definition = definition,
     });
-    return node.as(Element);
+    const element = node.as(Element);
+    if (definition.form_associated) {
+        try element.is(Element.Html.Custom).?.registerFormAssociated(frame);
+    }
+    return element;
 }
 
 pub fn createTextNode(document: *const Node.Document, text: []const u8) !*Node {
@@ -1195,7 +1213,7 @@ pub fn createComment(document: *const Node.Document, text: []const u8) !*Node {
 
 pub fn createCDATASection(document: *const Node.Document, data: []const u8) !*Node {
     // Validate that the data doesn't contain "]]>"
-    if (std.mem.indexOf(u8, data, "]]>") != null) {
+    if (std.mem.find(u8, data, "]]>") != null) {
         return error.InvalidCharacterError;
     }
 
@@ -1209,10 +1227,10 @@ pub fn createCDATASection(document: *const Node.Document, data: []const u8) !*No
 
 pub fn createProcessingInstruction(document: *const Node.Document, target: []const u8, data: []const u8) !*Node {
     // Validate neither target nor data contain "?>"
-    if (std.mem.indexOf(u8, target, "?>") != null) {
+    if (std.mem.find(u8, target, "?>") != null) {
         return error.InvalidCharacterError;
     }
-    if (std.mem.indexOf(u8, data, "?>") != null) {
+    if (std.mem.find(u8, data, "?>") != null) {
         return error.InvalidCharacterError;
     }
 
@@ -1288,7 +1306,15 @@ fn isXmlNameChar(c: u21) bool {
         (c >= 0x203F and c <= 0x2040);
 }
 
-fn asUint(comptime string: anytype) std.meta.Int(
+const max_tag_len = blk: {
+    var max: usize = 0;
+    for (std.meta.fieldNames(Element.Tag)) |tag_name| {
+        max = @max(max, tag_name.len);
+    }
+    break :blk max;
+};
+
+fn asUint(comptime string: anytype) @Int(
     .unsigned,
     @bitSizeOf(@TypeOf(string.*)) - 8, // (- 8) to exclude sentinel 0
 ) {

@@ -27,14 +27,17 @@ const History = @This();
 
 const ScrollRestoration = enum { auto, manual };
 
+_frame: *Frame,
 _scroll_restoration: ScrollRestoration = .auto,
 
-pub fn getLength(_: *const History, frame: *Frame) u32 {
-    return @intCast(frame._session.navigation._entries.items.len);
+pub fn getLength(self: *const History) u32 {
+    const target = self._frame;
+    return @intCast(target._session.navigationFor(target)._entries.items.len);
 }
 
-pub fn getState(_: *const History, frame: *Frame) !?js.Value {
-    if (frame._session.navigation.getCurrentEntry()._state.value) |state| {
+pub fn getState(self: *const History, frame: *Frame) !?js.Value {
+    const target = self._frame;
+    if (target._session.navigationFor(target).getCurrentEntry()._state.value) |state| {
         const value = try frame.js.local.?.parseJSON(state);
         return value;
     } else return null;
@@ -50,50 +53,54 @@ fn setScrollRestoration(self: *History, str: []const u8) void {
     }
 }
 
-pub fn pushState(_: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8, frame: *Frame) !void {
-    const session = frame._session;
+pub fn pushState(self: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8) !void {
+    // The URL resolves against this history's document, not the caller's.
+    const target = self._frame;
+    const session = target._session;
     const arena = session.arena;
     const url = if (_url) |u|
-        try @import("../URL.zig").resolve(arena.allocator(), frame.url, u, .{})
+        try @import("../URL.zig").resolve(arena.allocator(), target.url, u, .{})
     else
-        try arena.dupeZ(u8, frame.url);
+        try arena.dupeSentinel(u8, target.url, 0);
 
     const json = state.toJson(arena.allocator()) catch return error.DataClone;
-    _ = try session.navigation.pushEntry(url, .{ .source = .history, .value = json }, frame, true);
+    _ = try session.navigationFor(target).pushEntry(url, .{ .source = .history, .value = json }, target, true);
 
-    frame.url = url;
+    target.url = url;
     // setHref == reinitializing.
-    try frame.window._location._url.setHref(url, &frame.js.execution);
+    try target.window._location._url.setHref(url, &target.js.execution);
     // `:target` matches off the fragment, which the new URL can change.
-    frame.styleChanged();
+    target.styleChanged();
 
     session.notification.dispatch(.frame_navigated_within_document, &.{
         .url = url,
-        .frame_id = frame._frame_id,
+        .frame_id = target._frame_id,
         .navigation_type = .historyApi,
     });
 }
 
-fn replaceState(_: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8, frame: *Frame) !void {
-    const session = frame._session;
+fn replaceState(self: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8) !void {
+    // The URL resolves against this history's document, not the caller's.
+    const target = self._frame;
+    const session = target._session;
     const arena = session.arena;
     const url = if (_url) |u|
-        try @import("../URL.zig").resolve(arena.allocator(), frame.url, u, .{})
+        try @import("../URL.zig").resolve(arena.allocator(), target.url, u, .{})
     else
-        try arena.dupeZ(u8, frame.url);
+        try arena.dupeSentinel(u8, target.url, 0);
 
     const json = state.toJson(arena.allocator()) catch return error.DataClone;
-    _ = try session.navigation.replaceEntry(url, .{ .source = .history, .value = json }, frame, true);
+    _ = try session.navigationFor(target).replaceEntry(url, .{ .source = .history, .value = json }, target, true);
 
-    frame.url = url;
+    target.url = url;
     // setHref == reinitializing.
-    try frame.window._location._url.setHref(url, &frame.js.execution);
+    try target.window._location._url.setHref(url, &target.js.execution);
     // `:target` matches off the fragment, which the new URL can change.
-    frame.styleChanged();
+    target.styleChanged();
 
     session.notification.dispatch(.frame_navigated_within_document, &.{
         .url = url,
-        .frame_id = frame._frame_id,
+        .frame_id = target._frame_id,
         .navigation_type = .historyApi,
     });
 }
@@ -101,29 +108,39 @@ fn replaceState(_: *History, state: js.Value, _: ?[]const u8, _url: ?[]const u8,
 fn goInner(delta: i32, frame: *Frame) !void {
     // 0 behaves the same as no argument, both reloading the frame.
 
-    const current = frame._session.navigation._index;
+    const navigation = frame._session.navigationFor(frame);
+    const current = navigation._index;
     const index_s: i64 = @intCast(@as(i64, @intCast(current)) + @as(i64, @intCast(delta)));
-    if (index_s < 0 or index_s > frame._session.navigation._entries.items.len - 1) {
+    if (index_s < 0 or index_s > navigation._entries.items.len - 1) {
         return;
     }
 
     const index = @as(usize, @intCast(index_s));
-    const entry = frame._session.navigation._entries.items[index];
+    const entry = navigation._entries.items[index];
+    // popstate fires on the document that stays; a traversal to another
+    // document replaces this one instead.
+    const same_document = entry.sameDocument(frame);
 
-    if (entry._url) |url| {
-        if (frame.isSameOrigin(url)) {
-            const target = frame.window.asEventTarget();
-            if (frame._event_manager.hasDirectListeners(target, "popstate", frame.window._on_popstate)) {
-                const event = (try PopStateEvent.initTrusted(comptime .wrap("popstate"), .{ .state = entry._state.value }, frame)).asEvent();
-                try frame._event_manager.dispatchDirect(target, event, frame.window._on_popstate, .{ .context = "Pop State" });
-            }
-            // hashchange is queued by navigateInner.
-        }
+    _ = try navigation.navigateInner(entry._url, .{ .traverse = index }, frame);
+
+    if (same_document) {
+        try firePopState(frame, entry._state.value);
+        // hashchange is queued by navigateInner.
     }
-
-    _ = try frame._session.navigation.navigateInner(entry._url, .{ .traverse = index }, frame);
 }
 
+// Fires popstate at the frame's window, synchronously: a same-document
+// traversal or a fragment navigation updating the document for its new
+// history entry. `state` is the entry's serialized state.
+pub fn firePopState(frame: *Frame, state: ?[]const u8) !void {
+    const target = frame.window.asEventTarget();
+    if (frame._event_manager.hasDirectListeners(target, "popstate")) {
+        const event = (try PopStateEvent.initTrusted(comptime .wrap("popstate"), .{ .state = state }, frame)).asEvent();
+        try frame._event_manager.dispatchDirect(target, event, .{ .context = "Pop State" });
+    }
+}
+
+// Traversals still act on the injected frame, not self._frame.
 pub fn back(_: *History, frame: *Frame) !void {
     try goInner(-1, frame);
 }
@@ -142,7 +159,6 @@ pub const JsApi = struct {
     pub const Meta = struct {
         pub const name = "History";
         pub var class_id: bridge.ClassId = 0;
-        pub const prototype_chain = bridge.prototypeChain();
     };
 
     pub const length = bridge.accessor(History.getLength, null, .{});
@@ -159,4 +175,5 @@ const testing = @import("../../testing.zig");
 test "WebApi: History" {
     try testing.htmlRunner("history.html", .{});
     try testing.htmlRunner("history_url_update.html", .{});
+    try testing.htmlRunner("history_traverse.html", .{});
 }

@@ -91,7 +91,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLScriptElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -162,6 +161,5 @@ pub const Build = struct {
 const testing = @import("../../../../testing.zig");
 test "WebApi: Script" {
     testing.silenceLog(&.{.http});
-    testing.expectLog(&.{ .js, .js });
     try testing.htmlRunner("element/html/script", .{});
 }

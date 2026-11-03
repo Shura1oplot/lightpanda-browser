@@ -24,14 +24,14 @@ const uuidv4 = @import("../../id.zig").uuidv4;
 
 const BiDi = @import("BiDi.zig");
 
-pub fn processMessage(cmd: *const BiDi.Command) !void {
+pub fn processMessage(cmd: *BiDi.Command, action: []const u8) !void {
     const command = std.meta.stringToEnum(enum {
         status,
         new,
         end,
         subscribe,
         unsubscribe,
-    }, cmd.action) orelse return error.UnknownCommand;
+    }, action) orelse return error.UnknownCommand;
 
     // The only two commands that work without a session; `new` is what
     // creates one.
@@ -48,7 +48,7 @@ pub fn processMessage(cmd: *const BiDi.Command) !void {
     }
 }
 
-fn status(cmd: *const BiDi.Command) !void {
+fn status(cmd: *BiDi.Command) !void {
     // `ready` reflects whether session.new can succeed on this connection.
     if (cmd.bidi.session_id == null) {
         return cmd.sendResult(.{ .ready = true, .message = "" });
@@ -56,7 +56,7 @@ fn status(cmd: *const BiDi.Command) !void {
     return cmd.sendResult(.{ .ready = false, .message = "session already started" });
 }
 
-fn new(cmd: *const BiDi.Command) !void {
+fn new(cmd: *BiDi.Command) !void {
     const bidi = cmd.bidi;
     if (bidi.session_id != null) {
         return cmd.sendError("session not created", "session already exists");
@@ -87,15 +87,16 @@ pub const Capabilities = struct {
     // when it's null.
     pub fn jsonStringify(self: *const Capabilities, jws: anytype) !void {
         try jws.beginObject();
-        inline for (std.meta.fields(Capabilities)) |field| {
-            const value = @field(self, field.name);
-            if (@typeInfo(field.type) == .optional) {
+        const info = @typeInfo(Capabilities).@"struct";
+        inline for (info.field_names, info.field_types) |field_name, field_type| {
+            const value = @field(self, field_name);
+            if (@typeInfo(field_type) == .optional) {
                 if (value) |v| {
-                    try jws.objectField(field.name);
+                    try jws.objectField(field_name);
                     try jws.write(v);
                 }
             } else {
-                try jws.objectField(field.name);
+                try jws.objectField(field_name);
                 try jws.write(value);
             }
         }
@@ -103,7 +104,7 @@ pub const Capabilities = struct {
     }
 };
 
-fn end(cmd: *const BiDi.Command) !void {
+fn end(cmd: *BiDi.Command) !void {
     try cmd.sendResult(struct {}{});
 
     const bidi = cmd.bidi;
@@ -113,7 +114,7 @@ fn end(cmd: *const BiDi.Command) !void {
 
 // Subscriptions are global (per-context filtering is not supported yet).
 // Event names aren't validated against a known list.
-fn subscribe(cmd: *const BiDi.Command) !void {
+fn subscribe(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         events: []const []const u8,
     });
@@ -135,7 +136,7 @@ fn subscribe(cmd: *const BiDi.Command) !void {
     return cmd.sendResult(.{ .subscription = &sub_id });
 }
 
-fn unsubscribe(cmd: *const BiDi.Command) !void {
+fn unsubscribe(cmd: *BiDi.Command) !void {
     const p = try cmd.params(struct {
         events: []const []const u8 = &.{},
         subscriptions: []const []const u8 = &.{},
@@ -163,9 +164,9 @@ fn matchesAny(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-const platform_name = switch (builtin.os.tag) {
+const platform_name = switch (builtin.target.os.tag) {
     .macos, .ios => "mac",
     .windows => "windows",
     .linux => "linux",
-    else => @tagName(builtin.os.tag),
+    else => @tagName(builtin.target.os.tag),
 };

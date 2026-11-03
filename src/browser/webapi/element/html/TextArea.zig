@@ -16,21 +16,23 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-const lp = @import("lightpanda");
 const std = @import("std");
+const lp = @import("lightpanda");
+
 const js = @import("../../../js/js.zig");
-const Factory = @import("../../../Factory.zig");
 const Frame = @import("../../../Frame.zig");
+const Factory = @import("../../../Factory.zig");
 
 const Node = @import("../../Node.zig");
 const Element = @import("../../Element.zig");
-const HtmlElement = @import("../Html.zig");
-const Form = @import("Form.zig");
 const Selection = @import("../../Selection.zig");
-const Event = @import("../../Event.zig");
-const ValidityState = @import("ValidityState.zig");
+
+const HtmlElement = @import("../Html.zig");
 const reflection = @import("../reflection.zig");
 const text_entry = @import("../text_entry.zig");
+
+const Form = @import("Form.zig");
+const ValidityState = @import("ValidityState.zig");
 
 const TextArea = @This();
 
@@ -40,26 +42,15 @@ _proto_canary: if (lp.IS_DEBUG) *HtmlElement else void = undefined,
 _value: ?[]const u8 = null,
 // Only user edits count for tooLong/tooShort; script and attribute values don't.
 _user_edited: bool = false,
+// The value before the user's first edit since the last change event.
+_value_before_edit: ?[]const u8 = null,
 
 _selection_start: u32 = 0,
 _selection_end: u32 = 0,
 _selection_direction: Selection.SelectionDirection = .none,
 
-_on_selectionchange: ?js.Function.Global = null,
 _custom_validity: ?[]const u8 = null,
 _validity: ?*ValidityState = null,
-
-fn getOnSelectionChange(self: *TextArea) ?js.Function.Global {
-    return self._on_selectionchange;
-}
-
-fn setOnSelectionChange(self: *TextArea, listener: ?js.Function) !void {
-    if (listener) |listen| {
-        self._on_selectionchange = try listen.persistWithThis(self);
-    } else {
-        self._on_selectionchange = null;
-    }
-}
 
 pub fn asElement(self: *TextArea) *Element {
     return Factory.protoOf(self).asElement();
@@ -78,7 +69,8 @@ pub fn getValue(self: *const TextArea) []const u8 {
     return self._value orelse self.getDefaultValue();
 }
 
-pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
+pub fn setValue(self: *TextArea, raw_value: []const u8, frame: *Frame) !void {
+    const value = try normalizeNewlines(raw_value, frame.call_arena);
     const changed = std.mem.eql(u8, self.getValue(), value) == false;
     if (changed == false and self._value != null) {
         // _value itself isn't changing (not to be mixed up with setValue
@@ -87,7 +79,7 @@ pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
         self._user_edited = false;
         return;
     }
-    const owned = try frame.arena.dupe(u8, value);
+    const owned = try frame.page_arena.dupe(u8, value);
     self._value = owned;
     self._user_edited = false;
 
@@ -97,6 +89,34 @@ pub fn setValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
         self._selection_end = @intCast(owned.len);
         self._selection_direction = .none;
     }
+}
+
+// The API value has LF newlines: CRLF and lone CR become LF.
+fn normalizeNewlines(value: []const u8, arena: std.mem.Allocator) ![]const u8 {
+    const first = std.mem.findScalar(u8, value, '\r') orelse return value;
+
+    var result = try arena.alloc(u8, value.len);
+    @memcpy(result[0..first], value[0..first]);
+
+    var i: usize = first;
+    var j: usize = first;
+    while (j < value.len) : (j += 1) {
+        if (value[j] == '\r') {
+            result[i] = '\n';
+            if (j + 1 < value.len and value[j + 1] == '\n') {
+                j += 1;
+            }
+        } else {
+            result[i] = value[j];
+        }
+        i += 1;
+    }
+    return result[0..i];
+}
+
+pub fn reset(self: *TextArea) void {
+    self._value = null;
+    self._user_edited = false;
 }
 
 pub fn setUserValue(self: *TextArea, value: []const u8, frame: *Frame) !void {
@@ -140,13 +160,19 @@ const entry = text_entry.TextEntry(TextArea);
 
 pub const select = entry.select;
 pub const innerInsert = entry.innerInsert;
+pub const acceptsTextEntry = entry.acceptsTextEntry;
+pub const tracksSelection = entry.tracksSelection;
 pub const innerDelete = entry.innerDelete;
 pub const moveCaret = entry.moveCaret;
+pub const caretToEnd = entry.caretToEnd;
+pub const rememberValueBeforeEdit = entry.rememberValueBeforeEdit;
+pub const dispatchChangeIfEdited = entry.dispatchChangeIfEdited;
 pub const CaretMove = entry.CaretMove;
 pub const getSelectionDirection = entry.getSelectionDirection;
 pub const setSelectionStart = entry.setSelectionStart;
 pub const setSelectionEnd = entry.setSelectionEnd;
 pub const setSelectionRange = entry.setSelectionRange;
+pub const setRangeText = entry.setRangeText;
 
 // <textarea> always supports selection; <input> only does for some types.
 pub fn selectionAvailable(_: *const TextArea) bool {
@@ -155,35 +181,15 @@ pub fn selectionAvailable(_: *const TextArea) bool {
 
 // Non-null unlike input
 fn getSelectionStart(self: *const TextArea) u32 {
-    return self._selection_start;
+    return entry.selectionOffsetToJs(self, self._selection_start);
 }
 
 fn getSelectionEnd(self: *const TextArea) u32 {
-    return self._selection_end;
+    return entry.selectionOffsetToJs(self, self._selection_end);
 }
 
-pub fn getForm(self: *TextArea, frame: *Frame) ?*Form {
-    const element = self.asElement();
-
-    // If form attribute exists, ONLY use that (even if it references nothing)
-    if (element.getAttributeSafe(comptime .wrap("form"))) |form_id| {
-        if (frame.getElementByIdFromNode(element.asNode(), form_id)) |form_element| {
-            return form_element.is(Form);
-        }
-        // form attribute present but invalid - no form owner
-        return null;
-    }
-
-    // No form attribute - traverse ancestors looking for a <form>
-    var node = element.asNode()._parent;
-    while (node) |n| {
-        if (n.is(Element.Html.Form)) |form| {
-            return form;
-        }
-        node = n._parent;
-    }
-
-    return null;
+pub fn getForm(self: *TextArea) ?*Form {
+    return Form.ownerOf(self.asElement());
 }
 
 fn getLabels(self: *TextArea, frame: *Frame) !js.Array {
@@ -213,14 +219,8 @@ fn getValidationMessage(self: *const TextArea) []const u8 {
     return "";
 }
 
-pub fn checkValidity(self: *TextArea, frame: *Frame) !bool {
-    if (!self.getWillValidate()) return true;
-    const v = ValidityState{ ._owner = self.asElement() };
-    if (v.getValid(frame)) return true;
-
-    const event = try Event.initTrusted(comptime .wrap("invalid"), .{ .cancelable = true }, frame.page);
-    try frame._event_manager.dispatch(self.asElement().asEventTarget(), event);
-    return false;
+fn checkValidity(self: *TextArea, frame: *Frame) !bool {
+    return ValidityState.checkValidity(self.asElement(), frame);
 }
 
 fn reportValidity(self: *TextArea, frame: *Frame) !bool {
@@ -273,7 +273,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "HTMLTextAreaElement";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
@@ -292,8 +291,22 @@ pub const JsApi = struct {
     pub const checkValidity = bridge.function(TextArea.checkValidity, .{});
     pub const reportValidity = bridge.function(TextArea.reportValidity, .{});
     pub const setCustomValidity = bridge.function(TextArea.setCustomValidity, .{});
-    pub const onselectionchange = bridge.accessor(TextArea.getOnSelectionChange, TextArea.setOnSelectionChange, .{});
-    pub const value = bridge.accessor(TextArea.getValue, TextArea.setValue, .{});
+    pub const @"type" = bridge.property("textarea", .{ .template = false, .readonly = true });
+    pub const value = bridge.accessor(_getApiValue, TextArea.setValue, .{});
+    // _value is already normalized; the default value (text content) may not be.
+    fn _getApiValue(self: *const TextArea, frame: *Frame) ![]const u8 {
+        if (self._value) |v| {
+            return v;
+        }
+        return normalizeNewlines(self.getDefaultValue(), frame.call_arena);
+    }
+
+    pub const textLength = bridge.accessor(struct {
+        fn wrap(self: *const TextArea, frame: *Frame) !u32 {
+            return @intCast(Node.CData.utf16Len(try _getApiValue(self, frame)));
+        }
+    }.wrap, null, .{});
+
     pub const defaultValue = bridge.accessor(TextArea.getDefaultValue, TextArea.setDefaultValue, .{ .ce_reactions = true });
     pub const disabled = reflect.boolean("disabled");
     pub const name = reflect.string("name");
@@ -307,6 +320,7 @@ pub const JsApi = struct {
     pub const selectionEnd = bridge.accessor(TextArea.getSelectionEnd, TextArea.setSelectionEnd, .{});
     pub const selectionDirection = bridge.accessor(TextArea.getSelectionDirection, null, .{});
     pub const setSelectionRange = bridge.function(TextArea.setSelectionRange, .{});
+    pub const setRangeText = bridge.function(TextArea.setRangeText, .{});
 };
 
 pub const Build = struct {

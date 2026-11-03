@@ -122,7 +122,7 @@ fn createDocument(_: *const DOMImplementation, namespace_nullable: js.Nullable([
         if (namespace == .unknown) {
             if (namespace_) |uri| {
                 const duped = try frame.dupeString(uri);
-                try document._page.element_namespace_uris.put(document._page.frame_arena, root.as(Node.Element), duped);
+                try document._page.element_namespace_uris.put(document._page.arena, root.as(Node.Element), duped);
             }
         }
 
@@ -143,7 +143,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "DOMImplementation";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 

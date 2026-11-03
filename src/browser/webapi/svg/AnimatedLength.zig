@@ -194,7 +194,7 @@ pub fn getOrCreate(element: *Element, kind: Kind, frame: *Frame) !*AnimatedLengt
         .kind = kind,
     };
     const page = frame.page;
-    const gop = try page.svg_animated_lengths.getOrPut(page.frame_arena, key);
+    const gop = try page.svg_animated_lengths.getOrPut(page.arena, key);
     if (!gop.found_existing) {
         errdefer _ = page.svg_animated_lengths.remove(key);
         gop.value_ptr.* = try createConfigured(
@@ -254,7 +254,6 @@ pub const JsApi = struct {
 
     pub const Meta = struct {
         pub const name = "SVGAnimatedLength";
-        pub const prototype_chain = bridge.prototypeChain();
         pub var class_id: bridge.ClassId = undefined;
     };
 
