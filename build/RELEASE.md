@@ -76,7 +76,7 @@
 
 6. Файл macOS имеет формат Mach-O arm64, содержит `_curl_easy_impersonate` и прошел проверку подписи `ad-hoc` командой `codesign`. `tools/bin/macos-arm64/lightpanda` совпадает побайтово с установленной командой `~/.local/bin/lightpanda`.
 
-7. На Linux amd64 дополнительно прошли 17 проверок curl TLS, WebSocket и WebCrypto и две проверки HTTP/2. Отдельная проверка CDP, cookies и постороннего Origin на рабочем сервере относится к приемке развертывания; ее результат пока не заявлен.
+7. На Linux amd64 дополнительно прошли 17 проверок curl TLS, WebSocket и WebCrypto и две проверки HTTP/2. Отдельная проверка CDP, cookies и постороннего Origin на Zemlekop завершилась успешно. Подтверждены Chrome 146, запрос того же источника с HTTP `200`, отказ CORS, HTTP `403` для постороннего Origin и сохранение cookies с правами `0600` после перезапуска. Результат: `verification/runtime-update-20261103/server-deploy/cdp-acceptance.json` от корня Zemlekop.
 
 ## Ограничения
 
