@@ -3684,10 +3684,8 @@ test "server: http connections stay ordered by deadline" {
 test "server: unix listener accepts a client and removes owned socket on shutdown" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const absolute_dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
-    defer testing.allocator.free(absolute_dir);
-    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/cdp.sock", .{absolute_dir}, 0);
-    defer testing.allocator.free(path);
+    // Keep the fixture within sockaddr_un's limit even in long checkouts.
+    const path = try testing.tmpPath(&tmp, "cdp.sock");
 
     const server = try Server.init(testing.test_app, .{ .unix = path });
     var live = true;
